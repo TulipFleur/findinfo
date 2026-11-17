@@ -1,0 +1,16 @@
+# secrets
+config/.env
+config/config.json
+config/scope.json
+bin/config.yaml
+# runtime state (state lives in ~/.findinfo by default)
+data/
+runs/
+cache/
+_tmp/
+ksubdomain.yaml
+__pycache__/
+*.pyc
+# build artifacts
+rust/onepass/target/
+bin/*.exe

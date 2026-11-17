@@ -1,0 +1,56 @@
+{
+  "engagements": {},
+  "apis": {
+    "fofa": {
+      "email": "",
+      "key": ""
+    },
+    "quake": {
+      "key": ""
+    },
+    "hunter": {
+      "key": ""
+    },
+    "shodan": {
+      "key": ""
+    },
+    "censys": {
+      "id": "",
+      "secret": ""
+    },
+    "securitytrails": {
+      "key": ""
+    },
+    "virustotal": {
+      "key": ""
+    },
+    "urlscan": {
+      "key": ""
+    },
+    "chaos": {
+      "key": ""
+    },
+    "zoomeye": {
+      "key": ""
+    },
+    "github": {
+      "token": ""
+    }
+  },
+  "http": {
+    "timeout": 25,
+    "user_agent": "Mozilla/5.0 findinfo"
+  },
+  "limits": {
+    "dns_concurrency": 100,
+    "http_concurrency": 50,
+    "per_host_rps": 5,
+    "vhost_threads": 20,
+    "mapping_interval_ms": 1500
+  },
+  "paths": {
+    "resolvers": "",
+    "subwordlist": "",
+    "vhostwordlist": ""
+  }
+}

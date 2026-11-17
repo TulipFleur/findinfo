@@ -1,0 +1,16 @@
+# ENScan_GO 配置模板
+# 用法：复制为 bin/config.yaml 后填入 Cookie
+#   cp bin/config.example.yaml bin/config.yaml
+#
+# Cookie 获取：
+#   aiqicha（爱企查）: 登录 https://aiqicha.baidu.com → F12 → Network → 任意请求的 Cookie 头整体复制
+#   qcc（企查查）、tianyancha（天眼查）、qimai（七麦）: 同理
+#
+# bin/config.yaml 已被 .gitignore 忽略，不会被提交，也不会被 --copy 复制到其他位置。
+# 未填写时 entity 阶段会返回空结果并在 stderr 提示。
+
+cookies:
+  aiqicha: ""
+  qcc: ""
+  tianyancha: ""
+  qimai: ""
