@@ -411,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--engines", default="fofa,quake,hunter")
     i.set_defaults(func=cmd_icp)
 
-    pa = sub.add_parser("passive", help="14-source passive collection via bundled Rust onepass")
+    pa = sub.add_parser("passive", help="15-source passive collection via bundled Rust onepass")
     pa.add_argument("--domain", action="append")
     pa.add_argument("--from-store", action="store_true")
     pa.add_argument("--sources", default="", help="comma separated source ids (see: onepass sources)")

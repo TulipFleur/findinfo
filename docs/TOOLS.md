@@ -416,6 +416,7 @@ python findinfo.py extract --from-run runs/xxx/crawl.jsonl
 
 ```bash
 python findinfo.py assets --kind domain --limit 50
+python findinfo.py assets --kind icp                  # 看 ENScan 存下的备案号
 python findinfo.py assets --min-conf 0.7 --export runs/assets.jsonl
 ```
 
@@ -423,7 +424,7 @@ python findinfo.py assets --min-conf 0.7 --export runs/assets.jsonl
 
 ```json
 {
-  "counts": {"domain": 128, "ip": 64, "url": 318},
+  "counts": {"domain": 128, "ip": 64, "url": 318, "icp": 3},
   "total": 50, "endpoints": 318,
   "rows": [{"kind": "domain", "canonical": "api.example.com", "sources": "crt.sh,dnsx,httpx", "confidence": 0.95, "attrs": {...}}]
 }
