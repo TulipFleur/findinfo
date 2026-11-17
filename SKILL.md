@@ -124,6 +124,8 @@ python findinfo.py assets --export runs/assets.jsonl                  # ④ 导�
 
 **阈值**：`>= 0.7` 才进主图；`0.4~0.7` 标 unverified；主动阶段默认只测 `>= 0.4`，`--min-conf 0.7` 可收紧。
 
+**口径说明**：`onepass` 记录自带按「独立源数」算出的置信度（1 源 ≤0.6 / 2 源 ≥0.7 / 3 源+ ≤0.95）；落库时统一取 `max(既有, 新值)`，因此 onepass 的高置信度不会被本地规则反向拉低，后续 `+dnsx`、`+httpx` 这类真实新增来源再按上表抬升。看到一个 `sources` 字段里是 `onepass:crtsh,rapiddns` 时，别把它当成「1 个来源」——那一条已经按 2 源计过分了。
+
 ## 5. 硬规则（违反即出错）
 
 1. **主动阶段必须有授权**。`probe/ports/vhost/crawl/extract` 会产生流量。
