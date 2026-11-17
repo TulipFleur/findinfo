@@ -1,0 +1,27 @@
+[Unit]
+Description=findinfo asset mapping for %i
+Documentation=file:/opt/findinfo/SKILL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/findinfo
+# 授权范围/密钥放环境文件（不入库、不对所有用户可读）
+EnvironmentFile=-/etc/findinfo.env
+Environment=FINDINFO_HOME=/var/lib/findinfo
+# %i = 种子域名，例：systemctl start 'findinfo@example.com.service'
+ExecStart=/usr/bin/python3 findinfo.py run --domain %i
+User=findinfo
+Group=findinfo
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# 长任务：40 分钟级流程 + 主动阶段，给足超时
+TimeoutStartSec=3h
+# SYN 扫描/裸包需要 CAP_NET_RAW；改为 setcap 后可删这两行
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

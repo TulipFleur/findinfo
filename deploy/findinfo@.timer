@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily passive refresh for %i
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=1800
+Persistent=true
+Unit=findinfo@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,5 +1,5 @@
-[build]
-rustflags = ["-C", "linker=rust-lld"]
-
+# 只在 Windows MSVC 目标上使用 rust-lld：Linux 上 gcc/clang 才是默认 linker，
+# 全局设置会让 cargo 在 Linux 上找不到 rust-lld 而编译失败。
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
+rustflags = ["-C", "linker=rust-lld"]

@@ -6,6 +6,10 @@
 
     cd <本目录>
 
+    # Linux：先装原生二进制（Windows 用内置 bin/*.exe，跳过这步）
+    bash scripts/setup-linux.sh --dry-run   # 看计划
+    bash scripts/setup-linux.sh --cap       # 安装 + 授权 CAP_NET_RAW
+
     # 0) 安装到各客户端（Claude Code / Codex / DSH），只需一次
     python scripts/install.py --status
     python scripts/install.py
@@ -35,6 +39,7 @@
 | SKILL.md | AI 使用说明：何时用、流程、硬规则、故障处理 |
 | docs/TOOLS.md | 每个命令的参数、输出 JSON、示例 |
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
+| docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd/Docker、故障排查 |
 
 ## 内置工具（已全部下载到 bin/，无需联网安装）
 

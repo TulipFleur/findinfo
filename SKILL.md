@@ -165,6 +165,8 @@ findinfo/
 │   ├── katana gau ffuf chaos ksubdomain onepass
 │   └── config.yaml     ← ENScan Cookie 配置
 ├── rust/onepass/       ← onepass 源码（15 源被动聚合，cargo build --release）
+├── Dockerfile          ← Linux 镜像（多阶段编译 onepass/ENScan）
+├── deploy/             ← systemd 模板（findinfo@.service / .timer）
 ├── lib/
 │   ├── core.py         ← 配置/存储/归一化/缓存/限速/scope/执行
 │   ├── tools.py        ← 12 个工具封装（全部返回结构化数据）
@@ -182,6 +184,7 @@ findinfo/
 │   └── vhost.txt       ← 145 条 Host 标签（vhost 用，需 --domain 拼基域）
 └── scripts/
     ├── install.py      ← ★ 跨客户端安装/状态/校验
+    ├── setup-linux.sh  ← ★ Linux 装原生二进制 + setcap + 体检
     ├── build-onepass.sh← 重编 onepass（需 Rust 工具链）
     └── build-enscan.sh ← 重编 ENScan_GO（需 Go 1.23+）
 
@@ -214,7 +217,8 @@ python scripts/install.py --uninstall     # 只删安装器自己创建
 | Codex | `~/.codex/skills/findinfo` |
 | 项目级（可选 `--project <dir>`） | `<dir>/.agents/skills/`、`<dir>/.claude/skills/` |
 
-- 默认 `--link`：客户端目录是指向本目录的链接（Windows 用 junction，无需管理员），改代码即时生效。
+- 默认 `--link`：客户端目录是指向本目录的链接（Windows 用 junction、Linux 用 symlink，都无需管理员），改代码即时生效。
+- **Linux 上还要装工具**：`bash scripts/setup-linux.sh --cap`（Windows 用内置 `bin/*.exe`），详见 `docs/LINUX.md`。
 - 状态目录：`~/.findinfo`（或用 `FINDINFO_HOME` 覆盖），所有客户端共用同一份资产图；用 `--copy` 安装也不会分裂数据。
 - 已存在的非本安装器创建的目录会被拒绝覆盖，除非显式 `--force`。
 
