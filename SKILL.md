@@ -176,6 +176,10 @@ findinfo/
 ├── docs/
 │   ├── API-KEYS.md     ← ★ 哪些需要 key / 申请地址 / 免费额度
 │   └── TOOLS.md        ← 每个命令的详细参数与输出示例
+├── wordlists/          ← 字典（brute / vhost 用，均为裸标签）
+│   ├── sub.txt         ← 174 条高价值前缀（内部系统/中间件，先跑这个）
+│   ├── submin.txt      ← 9990 条 top-10k 全量（mitan submin 归一化去重）
+│   └── vhost.txt       ← 145 条 Host 标签（vhost 用，需 --domain 拼基域）
 └── scripts/
     ├── install.py      ← ★ 跨客户端安装/状态/校验
     ├── build-onepass.sh← 重编 onepass（需 Rust 工具链）
@@ -219,3 +223,39 @@ python scripts/install.py --uninstall     # 只删安装器自己创建
 - 本 skill 的产出 `endpoints` 表 = 漏洞挖掘的**输入**
 - `assets --export` 出来的 JSONL 可直接喂给下一阶段的漏洞挖掘 skill / 自研扫描器（本 skill 只做资产，不含 POC/漏洞检测）
 - 发现问题后回到本 skill 用 `--from-store` 继续扩展
+
+## 10. 多 Agent 协同（可选）
+
+**合并点**：`~/.findinfo/findinfo.db` 是唯一真值。Store 已开 `WAL` + `BEGIN IMMEDIATE` 事务，
+所以多个 agent 进程可以同时写同一张资产图：重复资产只合并 `sources`，不会丢更新。
+实测 4 进程 × 200 次 upsert：801 条资产、共享资产合并出 4 个来源、confidence 0.95、零 `database is locked`。
+
+### 可以并行的阶段（按收益排序）
+
+| 阶段 | 切分单位 | 建议并发 | 说明 |
+|---|---|---|---|
+| `vhost` | **每个候选 IP** | 4~8 | ★最推荐：彼此完全独立、不打第三方 API、唯一写入就是 upsert |
+| `extract` | 每批 JS/URL（**按 host 分**） | 3~6 | 两个 agent 不要打同一个 host（每 host ≤5 req/s 是进程内限速，会叠加） |
+| `crawl` | 每个站点/主机组 | 2~4 | 按 host 切，不要按 URL 切；`--depth 3` 不要加大 |
+| `dns` | 域名分片（每片 ≤5k） | 2~4 | 只有大列表有收益；100 条的列表拆了反而更慢 |
+| `ports` | 每个 IP / 不相交 CIDR | 2~4 | naabu `-rate` 是进程内参数，并发即叠加发包速率 |
+| `certs` / `passive` | 每个种子域 | 2~3 | 打第三方 API：fan-out 直接乘额度消耗，且 `MAPPING_API_INTERVAL_MS` 也是按进程生效 |
+| `brute` | 每个域 | ≤2 | 裸包爆破，并发多了打满网卡、更容易触发 IDS |
+
+### 必须串行（只派一个 agent）
+
+- `entity`：ENScan 并发会被风控封 Cookie，且实体树必须人工确认一次
+- `run`：它是编排器，两个 `run` = 整套流程跑两遍；要并行请改用分阶段命令
+- `ipagg`：依赖 probe 结果已收敛，必须在 probe 之后单独跑
+- `assets` / `--export`、`doctor`、`scope`：全局只读汇总或全局状态
+
+### 协作硬规则
+
+1. **按域名/IP 分片，不要按阶段切同一批目标**。最忌讳：两个 agent 同时对同一域名跑 `passive`。
+2. **不要给每个 agent 单独的 `FINDINFO_HOME`**——那会把资产图拆成多份；共享 `~/.findinfo`。
+3. `steps` 表主键是 `(engagement, step)`：同一个 (engagement, step) 只允许一个 agent 写。
+4. `runs/` 与 `_tmp/` 已按进程唯一化，不会互相覆盖；`config/`（scope/.env）全局共享，**agent 不得自行改写 scope**。
+5. 额度是**按进程**算的：`N 个 agent ≈ N 倍消耗`。打第三方 API 的阶段把 fan-out 压到 2~3，或让不同 agent 用不同 `--engines`/`--sources` 子集。
+6. 阶段依赖用任务板 `blocked_by` 表达：`entity → passive/certs/subs → dns → probe+ipagg → ports/vhost → crawl → extract → 回流`；收敛条件仍是"新增率 <5% 或跑满 5 轮"。
+7. 每个 agent 动手前仍要跑 `python findinfo.py doctor` 与自己那片的 `scope` 校验；scope 是全局授权，不允许任何 agent 放宽。
+

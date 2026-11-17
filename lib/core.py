@@ -1,6 +1,7 @@
 """findinfo core: paths, config, store, normalize, cache, rate-limit, scope, exec helpers."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -558,8 +559,46 @@ class Store:
         self.path = str(path or (DATA / "findinfo.db"))
         self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
+        # Several agents may write into one asset graph at the same time:
+        # WAL keeps readers running during a write, busy_timeout absorbs the
+        # writer lock instead of failing after 30s, and every mutation below
+        # takes a BEGIN IMMEDIATE transaction so a read-modify-write upsert
+        # cannot silently drop a source merged by another process.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.Error:
+            pass
+        self.conn.isolation_level = None      # explicit transactions only
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+
+    @contextlib.contextmanager
+    def _write(self):
+        """BEGIN IMMEDIATE ... COMMIT, with backoff while other agents write."""
+        delay = 0.05
+        last: Exception | None = None
+        for _ in range(10):
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as exc:
+                last = exc
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 1.0)
+        else:
+            raise FindInfoError("database is locked by another findinfo process: " +
+                                str(last))
+        try:
+            yield self.conn
+        except Exception:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
 
     def close(self) -> None:
         try:
@@ -574,37 +613,36 @@ class Store:
         if not canonical:
             return "", False
         ts = now()
-        row = self.conn.execute(
-            "SELECT id, sources, confidence, attrs FROM assets WHERE kind=? AND canonical=?",
-            (kind, canonical)).fetchone()
-        if row is None:
+        with self._write():
+            row = self.conn.execute(
+                "SELECT id, sources, confidence, attrs FROM assets WHERE kind=? AND canonical=?",
+                (kind, canonical)).fetchone()
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO assets(kind,canonical,parent,sources,confidence,passivity,attrs,first_seen,last_seen)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (kind, canonical, parent, source, confidence, passivity,
+                     json.dumps(attrs or {}, ensure_ascii=False), ts, ts))
+                return canonical, True
+            sources = [s for s in (row["sources"] or "").split(",") if s]
+            if source and source not in sources:
+                sources.append(source)
+            conf = max(float(row["confidence"] or 0.4), confidence)
+            if len(sources) >= 2:
+                conf = max(conf, 0.7)
+            if len(sources) >= 3:
+                conf = max(conf, 0.95)
+            attrs_old = {}
+            try:
+                attrs_old = json.loads(row["attrs"] or "{}")
+            except Exception:
+                pass
+            attrs_old.update(attrs or {})
             self.conn.execute(
-                "INSERT INTO assets(kind,canonical,parent,sources,confidence,passivity,attrs,first_seen,last_seen)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
-                (kind, canonical, parent, source, confidence, passivity,
-                 json.dumps(attrs or {}, ensure_ascii=False), ts, ts))
-            self.conn.commit()
-            return canonical, True
-        sources = [s for s in (row["sources"] or "").split(",") if s]
-        if source and source not in sources:
-            sources.append(source)
-        conf = max(float(row["confidence"] or 0.4), confidence)
-        if len(sources) >= 2:
-            conf = max(conf, 0.7)
-        if len(sources) >= 3:
-            conf = max(conf, 0.95)
-        attrs_old = {}
-        try:
-            attrs_old = json.loads(row["attrs"] or "{}")
-        except Exception:
-            pass
-        attrs_old.update(attrs or {})
-        self.conn.execute(
-            "UPDATE assets SET sources=?, confidence=?, attrs=?, last_seen=?,"
-            " parent=COALESCE(parent, ?) WHERE id=?",
-            (",".join(sources), conf, json.dumps(attrs_old, ensure_ascii=False),
-             ts, parent, row["id"]))
-        self.conn.commit()
+                "UPDATE assets SET sources=?, confidence=?, attrs=?, last_seen=?,"
+                " parent=COALESCE(parent, ?) WHERE id=?",
+                (",".join(sources), conf, json.dumps(attrs_old, ensure_ascii=False),
+                 ts, parent, row["id"]))
         return canonical, False
 
     def get_assets(self, kind: str | None = None, min_conf: float = 0.0,
@@ -638,20 +676,19 @@ class Store:
         if isinstance(params, list):
             params = ",".join(sorted(set(params)))
         ts = now()
-        row = self.conn.execute(
-            "SELECT id FROM endpoints WHERE asset=? AND method=? AND path=? AND params=?",
-            (asset, method, path, params)).fetchone()
-        if row:
+        with self._write():
+            row = self.conn.execute(
+                "SELECT id FROM endpoints WHERE asset=? AND method=? AND path=? AND params=?",
+                (asset, method, path, params)).fetchone()
+            if row:
+                self.conn.execute(
+                    "UPDATE endpoints SET status=COALESCE(?,status), title=COALESCE(?,title) WHERE id=?",
+                    (status, title, row["id"]))
+                return False
             self.conn.execute(
-                "UPDATE endpoints SET status=COALESCE(?,status), title=COALESCE(?,title) WHERE id=?",
-                (status, title, row["id"]))
-            self.conn.commit()
-            return False
-        self.conn.execute(
-            "INSERT INTO endpoints(asset,method,path,params,source,status,title,first_seen)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (asset, method, path, params, source, status, title, ts))
-        self.conn.commit()
+                "INSERT INTO endpoints(asset,method,path,params,source,status,title,first_seen)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (asset, method, path, params, source, status, title, ts))
         return True
 
     def get_endpoints(self, asset: str | None = None, limit: int = 100000) -> list[dict]:
@@ -670,32 +707,41 @@ class Store:
 
     def set_step(self, engagement: str, step: str, input_hash: str, status: str,
                  artifact: str | None = None) -> None:
-        self.conn.execute(
-            "INSERT INTO steps(engagement,step,input_hash,status,artifact,updated_at)"
-            " VALUES(?,?,?,?,?,?) ON CONFLICT(engagement,step) DO UPDATE SET"
-            " input_hash=excluded.input_hash, status=excluded.status,"
-            " artifact=excluded.artifact, updated_at=excluded.updated_at",
-            (engagement, step, input_hash, status, artifact, now()))
-        self.conn.commit()
+        with self._write():
+            self.conn.execute(
+                "INSERT INTO steps(engagement,step,input_hash,status,artifact,updated_at)"
+                " VALUES(?,?,?,?,?,?) ON CONFLICT(engagement,step) DO UPDATE SET"
+                " input_hash=excluded.input_hash, status=excluded.status,"
+                " artifact=excluded.artifact, updated_at=excluded.updated_at",
+                (engagement, step, input_hash, status, artifact, now()))
 
     def start_run(self, engagement: str, target: str) -> int:
-        cur = self.conn.execute("INSERT INTO runs(engagement,target,started) VALUES(?,?,?)",
-                                (engagement, target, now()))
-        self.conn.commit()
-        return int(cur.lastrowid)
+        with self._write():
+            cur = self.conn.execute("INSERT INTO runs(engagement,target,started) VALUES(?,?,?)",
+                                    (engagement, target, now()))
+            run_id = int(cur.lastrowid)
+        return run_id
 
     def finish_run(self, run_id: int, summary: dict) -> None:
-        self.conn.execute("UPDATE runs SET finished=?, summary=? WHERE id=?",
-                          (now(), json.dumps(summary, ensure_ascii=False), run_id))
-        self.conn.commit()
+        with self._write():
+            self.conn.execute("UPDATE runs SET finished=?, summary=? WHERE id=?",
+                              (now(), json.dumps(summary, ensure_ascii=False), run_id))
 
 
 def new_run_dir(tag: str) -> Path:
+    """Unique run directory; two agents starting in the same second must not
+    clobber each other's artifacts."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     safe = re.sub(r"[^0-9a-zA-Z_.\-]+", "_", tag)[:40]
-    p = RUNS_DIR / (stamp + "-" + safe)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    for n in range(1, 1000):
+        name = stamp + "-" + safe + ("" if n == 1 else "-" + str(n))
+        p = RUNS_DIR / name
+        try:
+            p.mkdir(parents=True, exist_ok=False)
+            return p
+        except FileExistsError:
+            continue
+    raise FindInfoError("cannot create run dir under " + str(RUNS_DIR))
 
 
 def write_jsonl(path: Path, rows: Iterable[dict]) -> int:

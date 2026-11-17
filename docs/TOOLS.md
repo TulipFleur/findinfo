@@ -196,12 +196,13 @@ python findinfo.py subs --from-store        # 对库内所有 ≥0.7 域名跑
 
     python findinfo.py brute --domain example.com
     python findinfo.py brute --domain example.com --wordlist wordlists/sub.txt --bandwidth 3m
+    python findinfo.py brute --domain example.com --wordlist wordlists/submin.txt --bandwidth 5m
     python findinfo.py brute --domain example.com --wildcard advanced
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | --domain | 必填 | 目标域 |
-| --wordlist | wordlists/sub.txt | 字典（内置 200 个常见前缀） |
+| --wordlist | wordlists/sub.txt | 字典；可写路径，或裸名字 `sub`/`submin`/`vhost`（自动解析到 wordlists/） |
 | --bandwidth | 3m | 发包容忍带宽；越小越低调，建议 2m~5m |
 | --wildcard | basic | 泛解析过滤基础模式，严格场景用 advanced |
 
@@ -216,6 +217,17 @@ python findinfo.py subs --from-store        # 对库内所有 ≥0.7 域名跑
 - 通常需要管理员/root 权限（裸包发送）
 - 会触发 IDS/IPS 告警，仅在授权范围内使用
 - 内置速率上限 25000 pps，实际按 --bandwidth 控制
+
+**内置字典（两级）**
+
+| 文件 | 条数 | 定位 | 典型耗时（单域，3m 带宽） |
+|---|---|---|---|
+| `wordlists/sub.txt` | 174 | **高价值前缀**：内部系统 / 中间件 / 国内常见（k8s、kibana、nacos、consul、harbor、sso、skywalking…），这些词不在通用 top-10k 里 | 10~30s |
+| `wordlists/submin.txt` | 9990 | **top-10k 全量**（mitan 字典归一化：小写、去重、剔除非法标签） | 2~5min |
+| `wordlists/vhost.txt` | 145 | 不是子域字典，是 vhost 用的 Host 标签（需配合 `--domain` 拼基域） | — |
+
+建议顺序：先 `brute --wordlist wordlists/sub.txt`（快，捞内部系统），确认 `--bandwidth` 与泛解析表现正常后，
+再上 `submin.txt` 跑全量。两级字典有 157 条重叠，重复跑由 `Store` 幂等吸收，不会产生重复资产。
 
 与 subs 的分工：subs 找"已存在且被收录"的子域；brute 找"存在但没人收录"的子域。两者互补，先跑 subs 再跑 brute。
 

@@ -7,6 +7,9 @@ bin/config.yaml
 data/
 runs/
 cache/
+# sqlite write-ahead sidecars (multi-agent / WAL mode)
+*.db-wal
+*.db-shm
 _tmp/
 ksubdomain.yaml
 __pycache__/

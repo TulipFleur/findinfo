@@ -775,6 +775,29 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
             "domains": got["domains"][:1000], "ips": got["ips"][:1000]}
 
 
+def resolve_wordlist(wordlist: str) -> Path:
+    """Resolve a wordlist argument.
+
+    Accepts an absolute path, a path relative to the skill root, or a bare
+    name that lives in wordlists/ ("sub" -> wordlists/sub.txt). Agents get the
+    short form; humans can still pass any path they like.
+    """
+    raw = (wordlist or "").strip()
+    if not raw:
+        raise core.FindInfoError("wordlist is empty")
+    wl = Path(raw)
+    if not wl.is_absolute():
+        wl = core.ROOT / raw
+    if wl.exists():
+        return wl
+    for cand in (core.ROOT / "wordlists" / raw,
+                 core.ROOT / "wordlists" / (raw + ".txt")):
+        if cand.exists():
+            return cand
+    raise core.FindInfoError("wordlist not found: " + raw +
+                             " (try sub / submin / vhost)")
+
+
 # ---------------------------------------------------------------- 11. brute force (ksubdomain)
 def t_brute(store, domain: str, wordlist: str | None = None, bandwidth: str = "3m",
             wildcard: str = "basic", timeout: int = 1800) -> dict:
@@ -794,17 +817,13 @@ def t_brute(store, domain: str, wordlist: str | None = None, bandwidth: str = "3
     exe = core.tool("ksubdomain")
     outdir = core.DATA / "_tmp"
     outdir.mkdir(parents=True, exist_ok=True)
-    outfile = outdir / ("ks_" + str(abs(hash(domain)) % 100000) + ".json")
+    outfile = outdir / ("ks_" + str(os.getpid()) + "_" +
+                        str(abs(hash(domain)) % 100000) + ".json")
     cmd = [exe, "enum", "-d", domain, "-b", bandwidth,
            "--wild-filter-mode", wildcard,
            "-o", str(outfile), "--output-type", "json", "--silent"]
     if wordlist:
-        wl = Path(wordlist)
-        if not wl.is_absolute():
-            wl = core.ROOT / wordlist
-        if not wl.exists():
-            raise core.FindInfoError("wordlist not found: " + str(wordlist))
-        cmd[4:4] = ["-f", str(wl)]
+        cmd[4:4] = ["-f", str(resolve_wordlist(wordlist))]
     core.log("ksubdomain: " + " ".join(cmd[1:]))
     rc, out, err = core.run(cmd, timeout=timeout, cwd=str(core.BIN))
 
