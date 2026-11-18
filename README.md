@@ -123,6 +123,56 @@ flowchart TD
     python findinfo.py status --run <run_id>   # 目标/范围/阶段/产物/下一步
     python findinfo.py run --resume <run_id>   # 断点续跑
 
+## 让 Agent 使用这个 Skill
+
+findinfo 是给 AI agent 调用的：装好之后，用一段提示词让 agent 自己去跑完整流程，
+不需要人盯着敲命令。下面两种用法二选一。
+
+### 用法一：一句话（最省事）
+
+直接把下面这段发给 agent，把 `{{TARGET}}` 换成目标域名或企业名即可：
+
+```text
+用 findinfo skill 完整收集 {{TARGET}} 的资产。
+1) 定位 skill 目录 → python findinfo.py doctor（要求 tools_summary.all_in_bin=true）
+   → python findinfo.py runs --active 看有没有在跑的旧任务
+2) 起任务：python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --vhost --crawl --background --rounds 3
+   拿到 run_id（reused=true 说明已有在跑，直接用它的 run_id，不要再起一个）
+3) 等待：python findinfo.py wait --run <run_id> --timeout 30，超时返回 running 只代表本次等待结束，
+   继续等同一个 run_id；不要重启、不要提前宣布完成
+4) 结果：state=completed → python findinfo.py status --run <run_id> 读 result/coverage；
+   失败/中断 → run --resume <run_id> 断点续跑；预算用尽 → 如实说明覆盖不完整
+5) 交付：python findinfo.py report --match {{TARGET}}，
+   最终说明必须写清 结束原因（complete/partial/failed/cancelled）、已执行/失败/未执行阶段、覆盖缺口与产物路径
+```
+
+### 用法二：完整工作流（推荐，交给新会话 agent）
+
+把 [`prompts/AGENT.md`](prompts/AGENT.md) 整份内容作为提示词投给 agent。它比一句话版多了：
+
+- 快速路径 / 全面路径的分阶段命令（先 5 分钟内出第一版，再逐步加深）
+- 结果推进判据：`wait` 超时、`state=failed`、`reused=true` 各自该怎么处理
+- 回流循环规则：什么时候该再跑一轮、什么时候该收口
+- 交付模板：报告该写哪些字段、证据怎么标注
+
+### 装到各客户端
+
+agent 必须先「看得见」这个 skill 才会调用它。一条命令装到所有客户端：
+
+```bash
+python scripts/install.py            # DSH / Claude Code / Codex 一次性建链接 + 注册
+python scripts/install.py --status   # 查每个客户端是否已装
+python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
+```
+
+不同客户端的加载机制不一样（Codex 走 config.toml 注册表、Claude Desktop 只能走 MCP），
+细节和常见坑见 [docs/CLIENTS.md](docs/CLIENTS.md)。
+
+### 使用边界
+
+`--active`、`--vhost`、`--crawl`、`--brute`、`--ports` 这些**主动阶段会真实向目标发包**。
+只对自己有授权的目标启用；纯被动阶段（`onepass`/`certs`/`subs`/`icp`/`dns`）零接触目标。
+
 ## 文档
 
 | 文件 | 内容 |
@@ -139,19 +189,21 @@ flowchart TD
 
 ![report 预览](docs/report-preview.png)
 
-## 内置工具（已全部下载到 bin/，无需联网安装）
+## 内置工具
 
-| 类别 | 工具 |
+全部二进制随仓库分发，开箱即用；Linux 端用 `scripts/setup-linux.sh` 安装。
+
+| 能力 | 工具 |
 |---|---|
-| 企业信息 | ENScan_GO（源码编译，需 Cookie） |
-| 子域 | onepass（Rust，15 源并行，8 源免 key）、subfinder、chaos、uncover（聚合 FOFA/Quake/Hunter/Shodan/Censys） |
-| 爆破 | ksubdomain（无状态裸包，需 Npcap） |
-| 域名 | crt.sh、CertSpotter（内置 HTTP 封装） |
-| DNS | dnsx + 系统解析兜底 + 泛解析过滤 |
-| 存活 | httpx（状态/标题/指纹/IP/CNAME） |
-| 侦察 | cdncheck、naabu |
-| 碰撞 | hostCollision（Go，3 次请求差分，剔除 catch-all 误报） |
-| 内容 | katana、jsleak（正则引擎·纯 Python）+ jsluice（AST 引擎·可选，`go install github.com/BishopFox/jsluice/cmd/jsluice@latest`；缺席时自动回退 jsleak） |
+| 企业锚定 | ENScan_GO（需 Cookie） |
+| 子域发现 | onepass（Rust，15 源）、subfinder、chaos、uncover、ksubdomain |
+| 证书 / DNS | crt.sh、CertSpotter（内置封装）、dnsx |
+| 存活与侦察 | httpx、cdncheck、naabu |
+| 内部服务 | hostCollision（Host 头碰撞） |
+| 内容提取 | katana、jsleak（内置）+ jsluice（可选，`go install` 自备） |
+
+每个命令的详细参数见 [docs/TOOLS.md](docs/TOOLS.md)，工具清单自检用 `python findinfo.py doctor`。
+
 
 ## 核心设计
 
