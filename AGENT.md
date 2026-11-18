@@ -122,7 +122,73 @@ python scripts/agent-record.py \
 
 ---
 
-## 5. 每次会话的最小动作清单
+## 5. Git 提交规则
+
+本节定义**提交什么、怎么提交、怎么推送**。与第 1 节的「重大修改必须留记录」是两件事：记录管**可追溯**，本节管**入库**。
+
+### 5.1 提交前自检（缺一不可）
+
+1. **语法**：`python -m py_compile <改动的 .py 文件>`；改了 `rust/onepass/` 则 `cargo check`。
+2. **测试**：`python -m tests` **必须 0 failed** 才提交。只跑了部分用例的，在记录里写明没跑哪些。
+3. **文档同步**：改了行为就同一次提交更新 `SKILL.md` / `docs/*.md` / `prompts/AGENT.md` 中受影响的部分（见 4.5）。
+4. **看清单**：`git status --short` 逐条确认，再 `git add`。不要盲目 `git add -A`。
+
+### 5.2 必须入库 / 禁止入库
+
+| 必须入库 | 禁止入库（已在 .gitignore） |
+|---|---|
+| 全部源码（findinfo.py、lib/、rust/、scripts/、tests/） | config/.env、config/config.json、bin/config.yaml（key / Cookie） |
+| 文档（SKILL.md、AGENT.md、docs/、prompts/） | data/、runs/、cache/（运行态） |
+| 配置模板（config/*.example.*、各工具 config.yaml 模板） | bin/*.exe、bin/*/、bin/*.gob（二进制与运行态） |
+| wordlists/ | rust/onepass/target/（构建产物） |
+| **agent-records/**（历史记录，见第 7 节） | __pycache__/、*.pyc、*.db-wal、*.db-shm |
+
+**新增文件前先判断**：属于「别人拿到就能用」的（源码、模板、文档、记录）→ 入库；属于「本机跑出来的」（产物、日志、密钥、缓存）→ 补 .gitignore 再继续。
+
+### 5.3 提交信息格式
+
+```
+<type>: <一句话说明>
+```
+
+- type 取值：feat / fix / docs / refactor / test / chore / perf
+- 第一行不超过 72 字符，**英文**，动词开头，不要句号结尾
+- 需要细节时第一行后空一行再写正文（- 列表），但**正文不替代** agent-records/ 记录
+- 一次提交只做一件事：修 bug 与加功能不混在同一个 commit
+
+示例：
+
+```
+fix: suppress console window when killing process tree
+
+- taskkill/wmic calls in lib/core.py and lib/jobs.py missed CREATE_NO_WINDOW
+- verified: pytest tests/test_jobs.py (9 passed)
+```
+
+### 5.4 分支与推送
+
+1. **主干直推**：单人 / 少量 agent 并行时直接提交到 master，不强制 PR。
+2. **并行改同一模块时**：先 `git pull --rebase`，冲突按第 4 节处理；确实无法判定时停下交人工。
+3. **推送**：`git push origin master`。本机直连 GitHub 可能被 TUN 拦截，失败时加代理：
+
+```bash
+git -c http.proxy=http://127.0.0.1:7890 push origin master
+```
+
+4. **凭据**：由 Windows 凭据管理器（`credential.helper=manager`）提供，**禁止**把 token 写进 remote URL、脚本或任何入库文件。
+5. **禁止强推共享分支**：`--force` 只允许在自己的实验分支使用；master 上的 `--force` 需要人工确认。
+
+### 5.5 提交与记录的关系
+
+```
+改代码 → 跑测试 → 写 agent-records 记录 → git add（含记录）→ commit → push
+```
+
+**重大修改的记录必须和代码在同一个提交里**。记录单独一个提交会让 git log 出现「代码已改、记录迟到」的断层，失去溯源意义。
+
+---
+
+## 6. 每次会话的最小动作清单
 
 - [ ] 读本文件
 - [ ] `git status --short` 看当前未提交改动
@@ -130,15 +196,17 @@ python scripts/agent-record.py \
 - [ ] 动手改
 - [ ] 跑 `python -m tests`（必须 0 failed）
 - [ ] 重大修改 → `python scripts/agent-record.py ...` 生成记录
+- [ ] `git status --short` 逐条确认入库内容（禁止项见 5.2）
+- [ ] 提交：`git add` 明确文件 → `git commit -m "type: ..."` → `git push origin master`
 - [ ] 清理临时文件
 
 ---
 
-## 6. 与其它文档的关系
+## 7. 与其它文档的关系
 
 | 文件 | 读者 | 作用 |
 |---|---|---|
-| **`AGENT.md`（本文件）** | **所有 agent** | **协作规则与记录约束** |
+| **`AGENT.md`（本文件）** | **所有 agent** | **协作规则、记录约束、Git 提交规则** |
 | `SKILL.md` | agent + 用户 | 本 skill 怎么用（产品说明） |
 | `prompts/AGENT.md` | findinfo 的**使用者** agent | 资产测绘工作流提示词（与协作无关） |
 | `docs/*.md` | 用户 / 运维 | 部署与排错 |

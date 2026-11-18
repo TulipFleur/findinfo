@@ -20,6 +20,5 @@ bin/*.exe
 # per-platform binaries (bin/windows, bin/linux, bin/darwin) are never tracked
 bin/*/
 
-# runtime binary state & agent session logs
+# runtime binary state (agent-records/ IS tracked — see AGENT.md §7)
 bin/*.gob
-agent-records/
