@@ -32,13 +32,13 @@ python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 
 | 工具 | 仓库 | 资产 |
 |---|---|---|
-| subfinder httpx dnsx naabu tlsx cdncheck uncover katana | projectdiscovery/* | `<tool>_<ver>_linux_amd64.zip` |
+| subfinder httpx dnsx naabu cdncheck uncover katana | projectdiscovery/* | `<tool>_<ver>_linux_amd64.zip` |
 | chaos | projectdiscovery/chaos-client | `chaos-client_<ver>_linux_amd64.zip` |
-| gau、ffuf | lc/gau、ffuf/ffuf | `<tool>_<ver>_linux_amd64.tar.gz` |
 | ksubdomain | knownsec/ksubdomain | `ksubdomain_linux.zip` |
 | hostCollision | alwaystest18/hostCollision | `hostCollision_<ver>_linux_<arch>.tar.gz` |
 | onepass | 本仓库 `rust/onepass` | `cargo build --release` |
 | enscan | 社区镜像 ENScan_GO | `go build` |
+| jsluice（可选） | BishopFox/jsluice | `go install github.com/BishopFox/jsluice/cmd/jsluice@latest`，产物拷到 `bin/linux/`；extract 阶段优先用它做 AST 解析，缺席时回退纯 Python 正则（jsleak），不阻塞 |
 
 ## 2. 装到哪里：bin/linux（固定）
 
@@ -46,8 +46,8 @@ python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 
 ~~~text
 bin/
-├── windows/    ← 16 个 .exe（Windows 预置；doctor 追踪 15 个）
-├── linux/      ← 15 个 ELF（bash scripts/setup-linux.sh 装到这里）
+├── windows/    ← 16 个 .exe（Windows 预置；doctor 追踪 16 个，含可选 jsluice）
+├── linux/      ← ELF（setup-linux.sh 装必需+PD 家族；jsluice 需 go install 自备，见下）
 └── config.example.yaml
 ~~~
 
@@ -193,7 +193,7 @@ bash scripts/setup-linux.sh --check
 ## 9. 卸载
 
 ~~~bash
-rm -f <skill>/bin/linux/{subfinder,httpx,dnsx,naabu,tlsx,cdncheck,uncover,katana,chaos,gau,ffuf,ksubdomain,hostCollision,onepass,enscan}
+rm -f <skill>/bin/linux/{subfinder,httpx,dnsx,naabu,cdncheck,uncover,katana,chaos,ksubdomain,hostCollision,onepass,enscan}
 rm -rf /var/lib/findinfo            # 资产库（~/.findinfo 同理）
 # systemd
 sudo systemctl disable --now 'findinfo@example.com.timer'

@@ -167,7 +167,6 @@ TOOL_LABELS = {
     "ksubdomain": "ksubdomain 爆破",
     "naabu": "naabu 端口",
     "nmap": "nmap 端口",
-    "tlsx": "tlsx 证书",
     "crt.sh": "crt.sh 证书",
     "hackertarget": "HackerTarget",
     "rapiddns": "RapidDNS",
@@ -175,7 +174,6 @@ TOOL_LABELS = {
     "otx": "AlienVault OTX",
     "alienvault": "AlienVault OTX",
     "chaos": "Chaos",
-    "gau": "gau 历史 URL",
     "uncover": "uncover",
     "passive": "被动源",
 }

@@ -2,6 +2,85 @@
 
 给一个企业名或域名，产出一张带来源与置信度的资产图，供后续漏洞挖掘使用。
 
+## 工作流程
+
+findinfo 分为两层：**资产采集流水线**负责发现、验证和扩展资产；**Agent 作业控制流程**负责启动长任务、有界等待、恢复和交付。
+
+### 资产采集流水线
+
+初始发现执行一次；后续验证与扩展按轮次运行，从 DNS 阶段接收新域名和待处理工作。
+
+```mermaid
+flowchart TD
+    A["输入：企业名 / 域名"] --> B{"输入企业名？"}
+    B -->|是| C["entity：实体锚定<br/>企业、备案、初始域名"]
+    B -->|否| D["确定 scope 与种子域名"]
+    C --> D
+
+    subgraph Discover["初始发现"]
+        D --> E["onepass：多来源被动聚合"]
+        E --> F["certs：证书透明度"]
+        F --> G["subs：子域与测绘平台"]
+        G --> H["brute：DNS 字典发现 · 可选"]
+        H --> I["icp：备案反查 · 有备案输入时"]
+    end
+
+    I --> J
+
+    subgraph Round["验证与扩展：按预算执行多轮"]
+        J["dns：解析验证、泛解析过滤"] --> K{"启用主动阶段？"}
+        K -->|是| L["probe：HTTP 存活、指纹、端点"]
+        L --> M["ipagg：共享 IP 聚合、CDN 过滤"]
+        M --> N["ports：端口发现 · 可选"]
+        N --> O["vhost：虚拟主机发现 · 可选"]
+        O --> P["crawl：页面与 JS 爬取 · 可选"]
+        P --> Q["extract：提取域名、IP、接口与发现"]
+        Q --> R{"有新域名或 JS 待处理工作<br/>且预算允许？"}
+        K -->|否| R
+        R -->|是| J
+    end
+
+    R -->|否| S["汇总 result / coverage<br/>完成、部分完成、失败及原因"]
+    S --> T["report / assets<br/>报告与资产导出"]
+```
+
+- `entity` 在输入企业名时执行；`onepass` 可通过 `--no-onepass` 关闭；ICP 反查需要备案输入，且未指定 `--no-icp`。
+- `--brute`、`--ports`、`--vhost`、`--crawl` 按需开启，并隐含启用主动阶段；`extract` 跟随 `crawl`。跳过的可选节点不影响后续阶段执行。
+- 回流从 DNS 开始，前面的初始发现不随轮次重复；轮数、时间预算和能力限制共同决定本次实际覆盖范围。
+- 图中箭头表示执行顺序。资产库保存完整数据，各阶段从库中读取输入，stdout 的展示样本不作为下游的全量输入。
+
+### Agent 长任务控制流程
+
+采集由后台 worker 执行，Agent 保存任务上下文，通过 `wait` 有界等待，再根据状态与覆盖缺口决定继续、恢复或交付。
+
+```mermaid
+flowchart TD
+    A["加载 Skill，理解目标与范围"] --> B["doctor：自检<br/>runs：检查已有作业"]
+    B --> C["run --background：启动或复用作业"]
+    C --> D["保存 task、home、run_id<br/>沿用返回的完整后续命令"]
+    D --> E["wait：有界等待"]
+    E --> F{"作业状态"}
+
+    F -->|仍在运行| E
+    F -->|失败或中断| G["status：读取错误、断点与覆盖缺口"]
+    G --> H{"可以恢复？"}
+    H -->|可以| I["run --resume<br/>必要时调整预算"]
+    I --> E
+    H -->|无法继续| J["交付已有成果与阻塞原因"]
+
+    F -->|执行结束| K["检查 result 与 coverage"]
+    K --> L{"还需要且能够补采？"}
+    L -->|是| I
+    L -->|否| M["生成报告并交付"]
+
+    F -->|用户取消| N["停止执行，保留已有成果"]
+```
+
+- `wait` 超时只表示本次等待窗口结束，不能据此重复启动采集。
+- `state=completed` 表示本次执行结束；仍需检查 `result/coverage`，区分完整完成与部分完成，并说明预算、来源和阶段缺口。
+- 作业状态与断点持久化，便于换会话后查询和恢复。后台进程不会自动唤醒已经结束的 Agent 会话，进程能否持续存活也取决于宿主策略。
+- 交付包括 JSON / Markdown / HTML 报告及按需导出的资产 JSONL，并注明目标、实际范围、统计、主要证据和结束原因。
+
 ## 快速开始
 
     cd <本目录>
@@ -70,9 +149,9 @@
 | 域名 | crt.sh、CertSpotter（内置 HTTP 封装） |
 | DNS | dnsx + 系统解析兜底 + 泛解析过滤 |
 | 存活 | httpx（状态/标题/指纹/IP/CNAME） |
-| 侦察 | cdncheck、naabu、tlsx |
+| 侦察 | cdncheck、naabu |
 | 碰撞 | hostCollision（Go，3 次请求差分，剔除 catch-all 误报） |
-| 内容 | katana、gau、ffuf、jsleak（纯 Python） |
+| 内容 | katana、jsleak（正则引擎·纯 Python）+ jsluice（AST 引擎·可选，`go install github.com/BishopFox/jsluice/cmd/jsluice@latest`；缺席时自动回退 jsleak） |
 
 ## 核心设计
 

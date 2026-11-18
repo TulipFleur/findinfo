@@ -1687,8 +1687,8 @@ def _stale_check(name: str, exe: str) -> dict | None:
 
 
 def doctor() -> dict:
-    names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "tlsx", "cdncheck",
-             "uncover", "katana", "chaos", "gau", "ffuf", "ksubdomain", "onepass",
+    names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "cdncheck",
+             "uncover", "katana", "chaos", "ksubdomain", "onepass",
              "hostCollision", "jsluice"]
     report = {}
     for n in names:

@@ -5,7 +5,7 @@
 #   bash scripts/setup-linux.sh --cap          # 加 raw socket 能力（需要 sudo）
 #   bash scripts/setup-linux.sh --dry-run           # 只解析版本/打印下载地址，不落盘
 #   bash scripts/setup-linux.sh --check             # 只体检已装工具
-#   bash scripts/setup-linux.sh --minimal           # 跳过 gau/ffuf/chaos
+#   bash scripts/setup-linux.sh --minimal           # 跳过 chaos 等可选工具
 #   bash scripts/setup-linux.sh --only httpx,katana
 #
 # 安装位置固定为 <skill>/bin/linux（core.tool() 只查这个目录，不回退 PATH）。
@@ -13,7 +13,7 @@
 #
 # 退出码：0 必需工具全部就位 / 1 有必需工具缺失或安装失败（详见输出）。
 # 必需（核心被动+主动链路）：subfinder httpx dnsx naabu katana onepass
-# 可选：tlsx cdncheck chaos gau ffuf ksubdomain hostCollision enscan uncover
+# 可选：cdncheck chaos ksubdomain hostCollision enscan uncover
 # 每次成功安装会记录版本到 $PREFIX/.installed-versions（工具 → tag），
 # doctor 再按二进制实探版本，二者都可追溯。
 set -uo pipefail
@@ -93,7 +93,7 @@ is_required() { case " $REQUIRED_TOOLS " in *" $1 "*) return 0 ;; *) return 1 ;;
 if [ "$CHECK" -eq 1 ]; then
   printf '%-12s %-10s %-8s %-12s %s\n' TOOL STATUS SOURCE VERSION PATH
   miss_req=0; miss_opt=0
-  for t in subfinder httpx dnsx naabu tlsx cdncheck uncover katana chaos gau ffuf ksubdomain hostCollision onepass enscan; do
+  for t in subfinder httpx dnsx naabu cdncheck uncover katana chaos ksubdomain hostCollision onepass enscan; do
     ver=""
     p="$PREFIX/$t"
     [ -x "$p" ] || p="$PREFIX/$t.exe"
@@ -128,13 +128,10 @@ if [ "$WITH_OPTIONAL" -eq 1 ]; then
 httpx|projectdiscovery/httpx|httpx_{ver}_linux_${ARCH}.zip|httpx
 dnsx|projectdiscovery/dnsx|dnsx_{ver}_linux_${ARCH}.zip|dnsx
 naabu|projectdiscovery/naabu|naabu_{ver}_linux_${ARCH}.zip|naabu
-tlsx|projectdiscovery/tlsx|tlsx_{ver}_linux_${ARCH}.zip|tlsx
 cdncheck|projectdiscovery/cdncheck|cdncheck_{ver}_linux_${ARCH}.zip|cdncheck
 uncover|projectdiscovery/uncover|uncover_{ver}_linux_${ARCH}.zip|uncover
 katana|projectdiscovery/katana|katana_{ver}_linux_${ARCH}.zip|katana
 chaos|projectdiscovery/chaos-client|chaos-client_{ver}_linux_${ARCH}.zip|chaos
-gau|lc/gau|gau_{ver}_linux_${ARCH}.tar.gz|gau
-ffuf|ffuf/ffuf|ffuf_{ver}_linux_${ARCH}.tar.gz|ffuf
 ksubdomain|knownsec/ksubdomain|ksubdomain_linux.zip|ksubdomain
 hostCollision|alwaystest18/hostCollision|hostCollision_{ver}_linux_${ARCH}.tar.gz|hostCollision"
 else
@@ -142,7 +139,6 @@ else
 httpx|projectdiscovery/httpx|httpx_{ver}_linux_${ARCH}.zip|httpx
 dnsx|projectdiscovery/dnsx|dnsx_{ver}_linux_${ARCH}.zip|dnsx
 naabu|projectdiscovery/naabu|naabu_{ver}_linux_${ARCH}.zip|naabu
-tlsx|projectdiscovery/tlsx|tlsx_{ver}_linux_${ARCH}.zip|tlsx
 cdncheck|projectdiscovery/cdncheck|cdncheck_{ver}_linux_${ARCH}.zip|cdncheck
 uncover|projectdiscovery/uncover|uncover_{ver}_linux_${ARCH}.zip|uncover
 katana|projectdiscovery/katana|katana_{ver}_linux_${ARCH}.zip|katana
