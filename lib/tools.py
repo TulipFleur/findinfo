@@ -1269,62 +1269,6 @@ def extract_from_text(text: str, root_domains: list[str]) -> dict:
     return {"domains": _uniq(domains), "ips": _uniq(ips)}
 
 
-def js_scan(body: str) -> dict:
-    """Extract from JS with jsluice (AST) when available, else the regex engine.
-
-    jsluice parses the source with tree-sitter and reports where a URL is
-    actually *used* (document.location, fetch, axios, window.open, ...), so it
-    recovers parameters that a regex cannot see:
-        "/login?redirect=" + redirect + "&method=oauth"
-        regex -> /login?redirect=        (method lost)
-        jsluice -> /login?redirect=EXPR&method=oauth   queryParams=[redirect,method]
-    It also returns structured method/queryParams/bodyParams. The regex engine
-    stays as the fallback so a missing binary degrades coverage instead of
-    failing the stage.
-    """
-    from . import jsleak
-    fallback = jsleak.extract(body, [])
-    if not core.has_tool("jsluice"):
-        return fallback
-    tmp = core.DATA / "_tmp"
-    try:
-        tmp.mkdir(parents=True, exist_ok=True)
-        path = tmp / ("js_" + str(os.getpid()) + "_" + uuid.uuid4().hex[:8] + ".js")
-        path.write_text(body, encoding="utf-8", errors="replace")
-    except Exception:
-        return fallback
-    try:
-        rc, out, err = core.run([core.tool("jsluice"), "urls", str(path)], timeout=60)
-        rows = core.parse_jsonl(out) if rc == 0 else []
-    finally:
-        try:
-            path.unlink()
-        except Exception:
-            pass
-    if rc != 0 or not rows:
-        return fallback
-    paths, meta = [], {}
-    for r in rows:
-        u = str(r.get("url") or "")
-        if not u:
-            continue
-        if r.get("type") == "stringLiteral":
-            # keep the literal too: it is often the plain path the AST row also
-            # reports with an EXPR placeholder
-            pass
-        paths.append(u)
-        meta.setdefault(u, {
-            "method": (r.get("method") or "GET").upper() if r.get("method") else "",
-            "query": r.get("queryParams") or [],
-            "body": r.get("bodyParams") or [],
-            "type": r.get("type") or "",
-        })
-    merged = dict(fallback)
-    merged["api_paths"] = _uniq(paths + list(fallback.get("api_paths") or []))[:300]
-    merged["path_meta"] = meta
-    merged["engine"] = "jsluice"
-    return merged
-
 
 def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
               timeout: int = 0, fetch_limit: int = 40) -> dict:
@@ -1689,7 +1633,7 @@ def _stale_check(name: str, exe: str) -> dict | None:
 def doctor() -> dict:
     names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "cdncheck",
              "uncover", "katana", "chaos", "ksubdomain", "onepass",
-             "hostCollision", "jsluice"]
+             "hostCollision"]
     report = {}
     for n in names:
         try:

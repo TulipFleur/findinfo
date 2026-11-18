@@ -90,36 +90,3 @@ def test_extract_from_text_canon_gate():
     assert "www.example.com.au" in got["domains"]
 
 
-def test_jsluice_recovers_params_a_regex_misses():
-    """The AST engine must beat the regex engine on concatenated URLs."""
-    core = fresh_core()
-    from lib import tools
-
-    # This is the canonical case from the jsluice README: a naive regex sees
-    # only "/login?redirect=" and loses the ?method= parameter entirely.
-    body = ('const login = (redirect) => {'
-            '  document.location = "/login?redirect=" + redirect + "&method=oauth";'
-            '};')
-    if not core.has_tool("jsluice"):
-        # the fallback must still work, just with lower recall
-        r = tools.js_scan(body)
-        assert r["api_paths"], "the regex fallback must still extract something"
-        return
-    r = tools.js_scan(body)
-    assert r.get("engine") == "jsluice", r.get("engine")
-    joined = " ".join(r["api_paths"])
-    assert "method=oauth" in joined or "method" in joined, (
-        "jsluice did not recover the concatenated query parameter: " + joined)
-    meta = r.get("path_meta") or {}
-    any_two_params = any(len((m or {}).get("query") or []) >= 2 for m in meta.values())
-    assert any_two_params, (
-        "expected a row with both redirect and method query params, got " + repr(meta))
-
-
-def test_js_scan_marks_the_engine_it_used():
-    """Callers must be able to tell which extractor produced the paths."""
-    core = fresh_core()
-    from lib import tools
-    r = tools.js_scan('fetch("/api/x?id=" + y)')
-    assert r.get("engine") in ("jsluice", None), r.get("engine")
-    assert r["api_paths"], "no paths extracted at all"

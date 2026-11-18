@@ -49,9 +49,9 @@ def _check_loop_names():
     return set(m.group(1).split())
 
 
-# jsluice ships no release binary: docs/TOOLS.md tells the user to go install
-# it themselves, so it is in the doctor list but never in the download table.
-USER_PROVIDED = {"jsluice"}
+# Every tool doctor tracks either ships a release binary (download table) or is
+# built from source here. No user-provided binaries are tracked any more.
+USER_PROVIDED = frozenset()
 
 # onepass is built from rust/ and enscan from go source, so neither appears in
 # the release-download table; both have dedicated build steps instead.
@@ -66,7 +66,7 @@ def test_doctor_list_is_reasonable():
 
 def test_download_table_matches_doctor_list():
     # Everything doctor tracks that ships a release binary must be downloadable.
-    # jsluice is user-provided (no release); onepass/enscan are built from source.
+    # onepass (rust) and enscan (go) are compiled here, not downloaded.
     download = _download_names()
     doctor = set(_doctor_names())
     expected = doctor - USER_PROVIDED - BUILT_FROM_SOURCE

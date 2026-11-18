@@ -392,17 +392,7 @@ python findinfo.py extract --from-store        # 回流：直接用库里的 URL
 `--from-store` 直接用库里 `kind=url` 的资产（回流循环里用它，不必关心 runs 目录路径）。
 每次最多抓 40 个 JS/JSON/map 文件，扫描文本有 4 MB 预算（防内存爆）。
 
-**双引擎**：默认优先用 **jsluice**（tree-sitter AST 解析）——它能恢复正则看不到的
-参数拼接（`"/login?redirect=" + redirect` 这种，AST 行里 queryParams=[redirect]），
-返回里每条记录带 `engine: "jsluice"`；**没有 jsluice 二进制时自动回退纯 Python 正则**
-（`lib/jsleak.py`，覆盖略低但零依赖）。jsluice 不随 setup-linux.sh 安装，需要 AST 级
-提取时自备：
-
-```bash
-go install github.com/BishopFox/jsluice/cmd/jsluice@latest   # 需 go >= 1.21
-cp "$(go env GOPATH)/bin/jsluice" bin/linux/                  # 或 bin/windows/jsluice.exe
-python findinfo.py doctor                                     # 确认 jsluice 出现在 tools 里
-```
+**引擎**：纯 Python 正则（`lib/jsleak.py`）提取 API 路径、域名、IP、密钥和 sourcemap，零依赖、任何平台可跑。
 
 **输出**
 

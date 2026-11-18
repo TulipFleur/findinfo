@@ -410,15 +410,15 @@ findinfo/
 ├── findinfo.py         ← CLI 入口（23 个子命令）
 ├── prompts/AGENT.md    ← ★ 新会话工作流提示词（含交付模板）
 ├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
-│   ├── windows/        ← 13 个 .exe（Windows 预置；doctor 追踪 13 个，含可选 jsluice）
-│   ├── linux/          ← ELF（scripts/setup-linux.sh 装必需+PD 家族；jsluice 用 go install 自备）
+│   ├── windows/        ← 12 个 .exe（Windows 预置；doctor 追踪 12 个）
+│   ├── linux/          ← ELF（scripts/setup-linux.sh 安装）
 │   └── config.example.yaml  ← ENScan Cookie 模板 → 复制成 bin/config.yaml
 ├── rust/onepass/       ← onepass 源码（15 源被动聚合，cargo build --release）
 ├── deploy/             ← systemd 模板（findinfo@.service / .timer）
 ├── lib/
 │   ├── core.py         ← 配置/存储/归一化/缓存/限速/执行
 │   ├── tools.py        ← 13 个阶段实现（全部返回结构化数据）
-│   ├── jsleak.py       ← JS 泄露提取·正则引擎（jsluice 缺席时的回退路径）
+│   ├── jsleak.py       ← JS 泄露提取·正则引擎（零依赖）
 │   └── report.py       ← 两种最终输出（json 给 AI / html+md 给人）+ 来源标注 + 优先级评分
 ├── config/
 │   ├── .env.example    ← ★ API Key 存档模板

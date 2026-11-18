@@ -235,7 +235,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 | 证书 / DNS | crt.sh、CertSpotter（内置封装）、dnsx |
 | 存活与侦察 | httpx、cdncheck、naabu |
 | 内部服务 | hostCollision（Host 头碰撞） |
-| 内容提取 | katana、jsleak（内置）+ jsluice（可选，`go install` 自备） |
+| 内容提取 | katana、jsleak（内置正则引擎，零依赖） |
 
 每个命令的详细参数见 [docs/TOOLS.md](docs/TOOLS.md)，工具清单自检用 `python findinfo.py doctor`。
 

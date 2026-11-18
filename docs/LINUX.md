@@ -38,7 +38,6 @@ python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 | hostCollision | alwaystest18/hostCollision | `hostCollision_<ver>_linux_<arch>.tar.gz` |
 | onepass | 本仓库 `rust/onepass` | `cargo build --release` |
 | enscan | 社区镜像 ENScan_GO | `go build` |
-| jsluice（可选） | BishopFox/jsluice | `go install github.com/BishopFox/jsluice/cmd/jsluice@latest`，产物拷到 `bin/linux/`；extract 阶段优先用它做 AST 解析，缺席时回退纯 Python 正则（jsleak），不阻塞 |
 
 ## 2. 装到哪里：bin/linux（固定）
 
@@ -46,8 +45,8 @@ python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 
 ~~~text
 bin/
-├── windows/    ← 13 个 .exe（Windows 预置；doctor 追踪 13 个，含可选 jsluice）
-├── linux/      ← ELF（setup-linux.sh 装必需+PD 家族；jsluice 需 go install 自备，见下）
+├── windows/    ← 12 个 .exe（Windows 预置；doctor 追踪 12 个）
+├── linux/      ← ELF（setup-linux.sh 安装）
 └── config.example.yaml
 ~~~
 
