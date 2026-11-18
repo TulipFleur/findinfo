@@ -283,6 +283,21 @@ def read_spec(ref) -> dict:
         return {"run_id": rd.name}
 
 
+def start_lock(key: str, timeout: float = 30.0):
+    """Cross-process critical section for "check dedupe, then create the job".
+
+    Two agents submitting the same target at the same time both call
+    find_inflight() before either has written job.json, so both see "no
+    inflight job" and both spawn a worker. The lock is per dedupe key, so
+    unrelated targets do not serialise against each other.
+
+    Reuses the O_CREAT|O_EXCL primitive from _Lock; a stale lock older than
+    the timeout is stolen so a crashed process cannot wedge submissions.
+    """
+    safe = "".join(ch if ch.isalnum() else "_" for ch in (key or "nokey"))[:32]
+    return _Lock(core.HOME / ("start-" + safe + ".lock"), timeout=timeout)
+
+
 def dedupe_key(payload: dict) -> str:
     import hashlib
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
@@ -318,6 +333,56 @@ def find_inflight(key: str) -> Path | None:
 
 
 # ---------------------------------------------------------------- worker
+def _kill_children() -> None:
+    """Terminate every descendant of this worker, leaving the worker alive.
+
+    os._exit() on the timer thread leaves orphaned tool processes behind: a
+    naabu/katana child keeps scanning (and consuming quota) after the job has
+    already been reported as timed out. Walk the tree and kill bottom-up.
+    """
+    me = os.getpid()
+    try:
+        import psutil  # optional; stdlib fallback below
+        victims = []
+        for p in psutil.Process(me).children(recursive=True):
+            victims.append(p)
+        for p in reversed(victims):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        return
+    except Exception:
+        pass
+    # stdlib fallback (Windows: taskkill the children only; POSIX: walk /proc)
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["wmic", "process", "where",
+                                  "ParentProcessId=%d" % me,
+                                  "get", "ProcessId"],
+                                 capture_output=True, text=True, timeout=15,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+            for tok in out.stdout.split():
+                if tok.isdigit() and int(tok) != me:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", tok],
+                                   capture_output=True, timeout=10,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        except Exception:
+            pass
+    else:
+        try:
+            for pid in [p for p in os.listdir("/proc") if p.isdigit()]:
+                try:
+                    with open("/proc/%s/stat" % pid) as fh:
+                        fields = fh.read().split()
+                    if len(fields) > 3 and int(fields[3]) == me:
+                        os.kill(int(pid), 15)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+
 def _worker_flags() -> int:
     if os.name == "nt":
         DETACHED_PROCESS = 0x00000008
@@ -408,10 +473,43 @@ def worker_main(ref) -> int:
     timer = None
     if timeout > 0:
         def _timeout():
+            # A hard deadline must actually stop the work. The old path wrote
+            # state=failed and called os._exit(124) immediately: the collector
+            # child processes kept running (still scanning, still spending
+            # quota) and status kept showing the previous attempt's
+            # result.status=complete / coverage.complete=true next to a failed
+            # job. Kill the tree first, then overwrite the result for THIS
+            # attempt, then leave.
             try:
-                update_state(rd, state="failed", exit_code=124,
-                             last_error={"type": "task_timeout",
-                                         "message": "task timeout after " + str(int(timeout)) + "s"})
+                # Order matters: kill_tree() on our own pid group would take
+                # this process down before the state write. Persist first, then
+                # terminate the children, then exit.
+                try:
+                    summary = _last_summary(rd, int(spec.get("attempt") or 1))
+                except Exception:
+                    summary = None
+                upd = {"state": "failed", "exit_code": 124,
+                       "finished_ts": now_ts(), "finished": core.now(),
+                       "stage_state": "failed",
+                       "last_error": {"type": "task_timeout",
+                                      "message": "task timeout after " +
+                                                 str(int(timeout)) + "s"}}
+                if summary is None or (summary.get("result") or {}).get("status") != "failed":
+                    # No summary of our own (or one that still claims success):
+                    # never let the previous attempt's success stand.
+                    upd["result"] = {"status": "failed",
+                                     "reason": "task_timeout",
+                                     "attempt": int(spec.get("attempt") or 1),
+                                     "message": "hard deadline hit at " +
+                                                str(int(timeout)) + "s"}
+                    upd["coverage"] = {"complete": False,
+                                       "reason": "task_timeout",
+                                       "attempt": int(spec.get("attempt") or 1)}
+                update_state(rd, **upd)
+                try:
+                    _kill_children()
+                except Exception:
+                    pass
             finally:
                 os._exit(124)
         timer = threading.Timer(timeout, _timeout)
@@ -610,7 +708,8 @@ def kill_tree(pid) -> None:
         return
     if os.name == "nt":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                       capture_output=True, timeout=20)
+                       capture_output=True, timeout=20,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
         return
     import signal
     for sig in (signal.SIGTERM, signal.SIGKILL):

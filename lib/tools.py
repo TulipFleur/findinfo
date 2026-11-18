@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import uuid
 import re
 import socket
 import tempfile
@@ -857,6 +858,12 @@ def t_ipagg(store, ips: list[str] | None = None, timeout: int = 0,
         else:
             ips = [a["canonical"] for a in store.get_assets(kind="ip")]
     ips = _uniq([core.canon_ip(i) for i in ips if core.canon_ip(i)])
+    if not ips and scope:
+        # No IP rows directly under this scope, but asset_links may know about
+        # IPs observed through another domain. Returning early here skipped the
+        # very fallback added for that case.
+        ips = _uniq(core.canon_ip(i) for i in store.assets_linked_to("ip", scope)
+                    if core.canon_ip(i))
     if not ips:
         return {"ips": [], "candidates": [], "count_candidates": 0, "scope": scope}
     cdn_ips: dict[str, Any] = {}
@@ -1262,6 +1269,63 @@ def extract_from_text(text: str, root_domains: list[str]) -> dict:
     return {"domains": _uniq(domains), "ips": _uniq(ips)}
 
 
+def js_scan(body: str) -> dict:
+    """Extract from JS with jsluice (AST) when available, else the regex engine.
+
+    jsluice parses the source with tree-sitter and reports where a URL is
+    actually *used* (document.location, fetch, axios, window.open, ...), so it
+    recovers parameters that a regex cannot see:
+        "/login?redirect=" + redirect + "&method=oauth"
+        regex -> /login?redirect=        (method lost)
+        jsluice -> /login?redirect=EXPR&method=oauth   queryParams=[redirect,method]
+    It also returns structured method/queryParams/bodyParams. The regex engine
+    stays as the fallback so a missing binary degrades coverage instead of
+    failing the stage.
+    """
+    from . import jsleak
+    fallback = jsleak.extract(body, [])
+    if not core.has_tool("jsluice"):
+        return fallback
+    tmp = core.DATA / "_tmp"
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+        path = tmp / ("js_" + str(os.getpid()) + "_" + uuid.uuid4().hex[:8] + ".js")
+        path.write_text(body, encoding="utf-8", errors="replace")
+    except Exception:
+        return fallback
+    try:
+        rc, out, err = core.run([core.tool("jsluice"), "urls", str(path)], timeout=60)
+        rows = core.parse_jsonl(out) if rc == 0 else []
+    finally:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    if rc != 0 or not rows:
+        return fallback
+    paths, meta = [], {}
+    for r in rows:
+        u = str(r.get("url") or "")
+        if not u:
+            continue
+        if r.get("type") == "stringLiteral":
+            # keep the literal too: it is often the plain path the AST row also
+            # reports with an EXPR placeholder
+            pass
+        paths.append(u)
+        meta.setdefault(u, {
+            "method": (r.get("method") or "GET").upper() if r.get("method") else "",
+            "query": r.get("queryParams") or [],
+            "body": r.get("bodyParams") or [],
+            "type": r.get("type") or "",
+        })
+    merged = dict(fallback)
+    merged["api_paths"] = _uniq(paths + list(fallback.get("api_paths") or []))[:300]
+    merged["path_meta"] = meta
+    merged["engine"] = "jsluice"
+    return merged
+
+
 def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
               timeout: int = 0, fetch_limit: int = 40) -> dict:
     """Extract leaked domains/IPs/paths/secrets from crawl output and fetched JS.
@@ -1303,9 +1367,11 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
     # because "nothing new" while 1+ bundles had simply never been attempted.
     store.js_enqueue(candidates)
     before = store.js_stats()
-    candidates = store.js_claim(fetch_limit)
+    # Claim only from THIS work set: the queue is shared, and fetching another
+    # target's bundles would widen the active scope.
+    candidates = store.js_claim(fetch_limit, allow_urls=candidates)
     api_paths: list[str] = []                 # host unknown (extracted from crawl text)
-    api_hits: list[tuple[str, str]] = []      # (host, path) from a fetched bundle
+    api_hits: list[tuple[str, str, str]] = []  # (host, path, method) from a bundle
     secrets: dict = {}
 
     def fetch_and_scan(u: str) -> dict | None:
@@ -1334,7 +1400,13 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
             api_paths.extend(h["api_paths"])
             host = core.split_url(h.get("_url") or "")[0]
             if host:
-                api_hits.extend((host, p) for p in h["api_paths"])
+                meta = h.get("path_meta") or {}
+                for p in h["api_paths"]:
+                    # keep the verb the AST reported (POST/PUT/DELETE matter far
+                    # more than GET when triaging); regex-only runs stay GET
+                    verb = ((meta.get(p) or {}).get("method") or "GET").upper()
+                    api_hits.append((host, p, verb if verb in
+                                     ("GET", "POST", "PUT", "DELETE", "PATCH") else "GET"))
             for k, v in h["secrets"].items():
                 secrets.setdefault(k, []).extend(v)
     # hostname validity gate: jsleak's regex accepts any alpha TLD shape, so
@@ -1347,13 +1419,14 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
     for p in api_paths:
         store.upsert_endpoint("leak", "GET", core.path_template(p), [], source="jsleak")
     # paths found inside a fetched bundle belong to that bundle's host
-    seen_ep: set[tuple[str, str]] = set()
-    for host, p in api_hits:
+    seen_ep: set[tuple[str, str, str]] = set()
+    for host, p, verb in api_hits:
         tpl = core.path_template(p)
-        if (host, tpl) in seen_ep:
+        key = (host, tpl, verb)
+        if key in seen_ep:
             continue
-        seen_ep.add((host, tpl))
-        store.upsert_endpoint(host, "GET", tpl, [], source="jsleak")
+        seen_ep.add(key)
+        store.upsert_endpoint(host, verb, tpl, [], source="jsleak")
     for d in got["domains"]:
         store.upsert_asset("domain", d, source="leak-extract", confidence=0.4,
                            passivity="passive")
@@ -1589,7 +1662,7 @@ VERSION_ARGS = ["-version", "--version", "-V", "-h"]
 def doctor() -> dict:
     names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "tlsx", "cdncheck",
              "uncover", "katana", "chaos", "gau", "ffuf", "ksubdomain", "onepass",
-             "hostCollision"]
+             "hostCollision", "jsluice"]
     report = {}
     for n in names:
         try:

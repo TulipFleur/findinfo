@@ -355,6 +355,24 @@ def cmd_report(args) -> None:
         raise core.FindInfoError(
             "no valid domain in --match: " + ",".join(args.match) +
             " (a garbage scope must fail loudly, not degrade to a full-library report)")
+    # A report must read the SAME library the run wrote to. core.Store() has
+    # already resolved HOME/TASK from the environment at import time, so if the
+    # caller quoted --run from another task, this process would open the wrong
+    # database and cheerfully produce an empty report (rc=0). Refuse loudly and
+    # say what to pass instead.
+    if args.run and not os.environ.get("FINDINFO_TASK", ""):
+        try:
+            _spec = jobs.read_spec(args.run)
+        except Exception:
+            _spec = {}
+        _want = str(_spec.get("task") or "")
+        if _want:
+            raise core.FindInfoError(
+                "run " + str(args.run) + " belongs to task '" + _want +
+                "'; re-run with: python findinfo.py --task " + _want +
+                " report --run " + str(args.run) +
+                " (without it this process reads the shared library and "
+                "would report an empty scope)")
     match = list(args.match or [])
     if not match and args.run:
         # Fall back to the run's own scope: a run started with two seeds
@@ -672,7 +690,8 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
         # Keep the failure class in the same vocabulary as success paths so
         # coverage can be derived (a timeout is not the same as a hard failure).
         _err = str(exc)
-        _oc = core.OUTCOME_TIMEOUT if "timeout" in _err.lower() or "rc=124" in _err             else core.OUTCOME_FAILED
+        _is_timeout = ("timeout" in _err.lower()) or ("rc=124" in _err)
+        _oc = core.OUTCOME_TIMEOUT if _is_timeout else core.OUTCOME_FAILED
         entry = {"stage": name, "failed": True, "error": _err[:300],
                  "elapsed": round(time.time() - t0, 1),
                  "outcome": _oc, "status": "failed (timeout)" if _oc == core.OUTCOME_TIMEOUT
@@ -693,16 +712,24 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
                       error="unexpected failure")
         raise
     beat.stop()
-    store.set_step(ENGAGEMENT, name, ih, "done")
     entry = {"stage": name, "elapsed": round(time.time() - t0, 1)}
     entry.update(entry_fn(res) or {})
     # Stage status comes from ONE vocabulary (see core.OUTCOME_*), so result,
     # coverage and next_steps can be derived instead of re-interpreted.
     entry.setdefault("outcome", core.OUTCOME_OK)
-    entry["status"] = ("succeeded" if entry.get("outcome") in
-                       (core.OUTCOME_OK, core.OUTCOME_EMPTY)
-                       else ("budget" if entry.get("outcome") == core.OUTCOME_BUDGET
-                             else "partial"))
+    _oc = entry.get("outcome")
+    entry["status"] = ("succeeded" if _oc in (core.OUTCOME_OK, core.OUTCOME_EMPTY)
+                       else ("budget" if _oc == core.OUTCOME_BUDGET else "partial"))
+    # The checkpoint decides whether a re-run may SKIP this stage. Writing
+    # "done" for a partial stage meant a later run skipped it forever, so the
+    # half-collected part could never be completed -- the agent saw a green
+    # checkpoint on work that explicitly reported itself as incomplete.
+    # Partial/budget runs therefore checkpoint as "partial": still usable
+    # (downstream stages read the store, not the checkpoint), but re-runnable.
+    _cp = ("done" if entry["status"] == "succeeded"
+           else "partial" if entry["status"] in ("partial", "budget")
+           else "failed")
+    store.set_step(ENGAGEMENT, name, ih, _cp)
     summary["stages"].append(entry)
     _write_status(run_dir, stage=name, stage_state="done", elapsed=entry["elapsed"],
                   stage_index=len(summary["stages"]),
@@ -763,7 +790,10 @@ def _plan_stages(args, active) -> list:
     plan += ["certs", "subs"]
     if active and getattr(args, "brute", False):
         plan.append("brute")
-    if not getattr(args, "no_icp", False):
+    # icp needs codes harvested from --name/ENScan. With a bare --domain there
+    # is nothing to reverse-look-up, so planning it guarantees a phantom gap in
+    # every domain-only run ("icp未执行") that no retry can ever close.
+    if not getattr(args, "no_icp", False) and getattr(args, "name", ""):
         plan.append("icp")
     return plan + _round_plan(args, active)
 
@@ -958,6 +988,24 @@ def _mark_explicit(args, argv: list[str]) -> None:
                 seen.add(attr)
     setattr(args, "_explicit", seen)
 
+def _remove_argv_flag(argv: list[str], flag: str) -> list[str]:
+    """Remove a flag and the value that belongs to it, positionally."""
+    out: list[str] = []
+    skip = 0
+    for i, a in enumerate(argv):
+        if skip:
+            skip -= 1
+            continue
+        if a == flag:
+            if i + 1 < len(argv):
+                skip = 1
+            continue
+        if a.startswith(flag + "="):
+            continue
+        out.append(a)
+    return out
+
+
 def _merge_resume_argv(argv: list[str], args) -> list[str]:
     """Apply the budget flags the caller explicitly typed; keep the rest.
 
@@ -977,10 +1025,12 @@ def _merge_resume_argv(argv: list[str], args) -> list[str]:
             continue
         val = getattr(args, attr, None)
         if val in (None, "", 0, 0.0):
-            # An explicit 0 means "remove this ceiling", which is different
-            # from "not given": strip the flag rather than storing "0" twice.
-            out = [a for i, a in enumerate(out)
-                   if a != flag and _argv_value(out, flag) != a]
+            # An explicit 0 means "remove this ceiling". Remove ONLY this flag
+            # and its value, by position. The previous filter compared VALUES
+            # against the flag's first value, so `--time-budget 0` deleted every
+            # element equal to "60" -- including the unrelated
+            # `--tool-timeout 60` sitting later in the same argv.
+            out = _remove_argv_flag(out, flag)
             continue
         out = _set_argv_value(out, flag, cast(val))
     if "force_stage" in explicit and getattr(args, "force_stage", False):
@@ -1026,9 +1076,22 @@ def _followup(sub: str, rd: Path, *extra: str) -> str:
 
 
 def _start_background(args) -> int:
-    """Start the collection in a detached worker and return its run id at once."""
+    """Start the collection in a detached worker and return its run id at once.
+
+    The dedupe check and the creation of a run dir must be ONE critical section.
+    Two identical submissions arriving together both passed find_inflight()
+    before either wrote a job.json, and both started a worker: a duplicate
+    collection, double quota, two graphs. A cross-process file lock (the same
+    O_CREAT|O_EXCL primitive jobs._Lock uses for status.json) closes the window.
+    """
     payload = _dedupe_payload(args)
     key = jobs.dedupe_key(payload)
+    lock = jobs.start_lock(key)
+    with lock:
+        return _start_background_locked(args, payload, key)
+
+
+def _start_background_locked(args, payload, key) -> int:
     inflight = jobs.find_inflight(key)
     if inflight is not None:
         st = jobs.derive(jobs.read_state(inflight))
@@ -1113,16 +1176,30 @@ def _resume_run(args) -> int:
         if val is not None:
             budget[key] = cast(float(val)) if key != "rounds" else cast(val)
     spec["budget"] = budget
-    if _argv_value(argv, "--task-timeout") is not None:
-        spec["task_timeout"] = float(_argv_value(argv, "--task-timeout"))
+    # task_timeout lives at the top level (that is what worker_main reads), so
+    # it must be updated -- and CLEARED when the caller passed --task-timeout 0.
+    # Leaving the old value behind meant "remove the ceiling" silently kept it.
+    explicit = set(getattr(args, "_explicit", ()) or ())
+    if "task_timeout" in explicit:
+        _tt = _argv_value(argv, "--task-timeout")
+        spec["task_timeout"] = float(_tt) if _tt is not None else 0.0
     spec["attempt"] = int(spec.get("attempt") or 1) + 1
     jobs.write_spec(rd, **spec)
     try:
         (rd / "cancel").unlink()
     except OSError:
         pass
+    # Clear the PREVIOUS attempt's verdict before the worker starts. Without
+    # this, `status` during the resume shows attempt N-1's result.status while
+    # state=queued/running -- an agent reading it would report a finished run.
     jobs.update_state(rd, state="queued", stage="resume", stage_state="queued",
-                      attempt=spec["attempt"], last_error=None, pid=None)
+                      attempt=spec["attempt"], last_error=None, pid=None,
+                      result={"status": "running", "reason": "resume_started",
+                              "attempt": spec["attempt"],
+                              "note": "attempt in progress; previous attempt's "
+                                      "summary remains in summary.jsonl"},
+                      coverage={"complete": False, "reason": "resume_started",
+                                "attempt": spec["attempt"]})
     try:
         pid = jobs.spawn(rd)
     except Exception as exc:
@@ -1187,7 +1264,10 @@ def _not_run_stages(planned: list, stages: list) -> list:
     for name in planned:
         if name in _INFORMATIONAL_STAGES:
             continue
-        if _state(name) in ("absent", "failed"):
+        # A stage that RAN and failed is reported through failed_stages. Listing
+        # it here as well made an agent see the same stage twice under two
+        # different headings and "not_run" stopped meaning "never attempted".
+        if _state(name) == "absent":
             gaps.append(name)
     return sorted(set(gaps))
 
@@ -1582,11 +1662,26 @@ def _run_pipeline(args) -> int:
                             store.get_assets(kind="url", min_conf=0.4, match=scope)
                             if a["canonical"].startswith("http")]
                     ex = tools.t_extract(store, [], urls=urls, timeout=tool_timeout)
+                    # Keep the deliverable findings in the summary too: the run
+                    # result is what an agent reads (and what lands in
+                    # summary.jsonl), and dropping them here meant the redacted
+                    # secrets / api paths existed only in a transient stdout
+                    # line nobody could see afterwards.
+                    summary.setdefault("extract_findings", {})
+                    summary["extract_findings"].update({
+                        "api_paths": ex.get("api_paths", [])[:200],
+                        "api_hosts": ex.get("api_hosts", 0),
+                        "secrets": ex.get("secrets") or {},
+                        "domains": ex.get("domains", [])[:200],
+                        "ips": ex.get("ips", [])[:200],
+                    })
                     return {"new_domains": ex["count_domains"],
                             "new_ips": ex["count_ips"],
                             "fetched": ex["fetched"],
                             "js_pending": ex.get("js_pending", 0),
                             "js_discovered": ex.get("js_discovered", 0),
+                            "api_hosts": ex.get("api_hosts", 0),
+                            "secrets_found": sum(len(v) for v in (ex.get("secrets") or {}).values()),
                             "outcome": ex.get("outcome") or core.OUTCOME_OK}
                 _stage(store, run_dir, summary, "extract", {"scope": scope, "round": round_no},
                        args, _extract,
@@ -1612,8 +1707,20 @@ def _run_pipeline(args) -> int:
             run_round(round_no)
             after = len(scoped_domains(0.4))
             new_domains = max(0, after - before)
-            if new_domains == 0:
+            # "No new domains" is NOT convergence while JS work is queued: the
+            # bundles whose extraction would surface new domains have simply
+            # not been fetched yet. Observed live: 41 candidates, budget 40,
+            # one pending -- and the run still declared itself complete.
+            try:
+                _q = store.js_stats()
+            except Exception:
+                _q = {}
+            js_pending = int(_q.get("pending") or 0) + int(_q.get("failed") or 0)
+            if new_domains == 0 and js_pending == 0:
                 stop_reason = "no_new_assets"
+            elif new_domains == 0 and js_pending > 0:
+                # The queue has work left: keep going while rounds/budget allow.
+                stop_reason = "" if round_no < rounds else "js_pending"
             elif round_no >= rounds:
                 stop_reason = "max_rounds"
             elif time_budget and (time.monotonic() - t_start) > time_budget:
@@ -1667,7 +1774,12 @@ def _run_pipeline(args) -> int:
             # infer "did this run?" from a mix of elapsed/skipped/reason fields.
             "stage_states": {
                 s_["stage"]: (
-                    "succeeded" if "elapsed" in s_ and not s_.get("failed")
+                    "succeeded" if ("elapsed" in s_ and not s_.get("failed")
+                                    and s_.get("outcome") in (None, core.OUTCOME_OK,
+                                                              core.OUTCOME_EMPTY))
+                    else "partial" if ("elapsed" in s_ and not s_.get("failed")
+                                       and s_.get("outcome") in (core.OUTCOME_PARTIAL,
+                                                                 core.OUTCOME_BUDGET))
                     else "failed" if s_.get("failed")
                     else ("no_input" if "no_hosts" in str(s_.get("reason") or "")
                           or "no_input" in str(s_.get("reason") or "")
@@ -1694,6 +1806,15 @@ def _run_pipeline(args) -> int:
             status, reason, rc = "partial", "round_budget_exhausted", 5
         elif unavailable["blocking"]:
             status, reason, rc = "partial", "required_capability_missing", 5
+        elif int((coverage.get("js_queue") or {}).get("pending") or 0) > 0:
+            # Unfinished queue = unfinished collection. This check lives at the
+            # FINAL decision, not only at the round stop, so a run that ends on
+            # max_rounds with a full queue cannot claim "complete".
+            status, reason, rc = "partial", "js_queue_pending", 5
+        elif int((coverage.get("js_queue") or {}).get("failed") or 0) > 0:
+            status, reason, rc = "partial", "js_queue_failed", 5
+        elif stop_reason == "js_pending":
+            status, reason, rc = "partial", "js_pending", 5
         else:
             status, reason, rc = "complete", (stop_reason or "all_stages_done"), 0
         coverage["complete"] = status == "complete"

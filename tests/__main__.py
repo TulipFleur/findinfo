@@ -35,6 +35,7 @@ MODULES = [
     "tests.test_outcome_and_evidence",
     "tests.test_coverage_states",
     "tests.test_docs_flow",
+    "tests.test_integration_e2e",
 ]
 
 

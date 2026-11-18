@@ -50,19 +50,29 @@ def test_no_input_is_reported_separately_not_as_a_gap():
         "probe with nothing to probe is no_input, not a missing stage"
 
 
-def test_failed_stage_still_counts_as_a_gap():
+def test_failed_stage_is_reported_once_not_as_a_gap():
+    """A stage that ran and failed belongs to failed_stages only.
+
+    Listing it in not_run_stages too made one failure appear under two
+    headings, and "not_run" stopped meaning "never attempted".
+    """
     fi = _fi()
     stages = [{"stage": "dns", "failed": True, "elapsed": 1.0}]
-    assert fi._not_run_stages(["dns"], stages) == ["dns"]
+    assert fi._not_run_stages(["dns"], stages) == [],         "a failed stage must not be double-counted as not-run"
+    # a stage that never appears is still a gap
+    assert fi._not_run_stages(["dns", "certs"], stages) == ["certs"]
 
 
-def test_no_icp_removes_the_stage_from_the_plan():
-    """A disabled stage must not be planned, so it cannot become a fake gap."""
+def test_icp_is_planned_only_when_it_can_run():
+    """icp needs ICP codes from --name; planning it for a bare domain creates a
+    gap no retry can ever close ("icp not run" forever)."""
     fi = _fi()
-    with_icp = fi._plan_stages(_args(no_icp=False), active=False)
-    without = fi._plan_stages(_args(no_icp=True), active=False)
-    assert "icp" in with_icp, with_icp
-    assert "icp" not in without, "an explicitly disabled stage must not be planned"
+    named = fi._plan_stages(_args(no_icp=False, name="某公司"), active=False)
+    domain_only = fi._plan_stages(_args(no_icp=False, name=""), active=False)
+    disabled = fi._plan_stages(_args(no_icp=True, name="某公司"), active=False)
+    assert "icp" in named, named
+    assert "icp" not in domain_only,         "a domain-only run has no ICP codes, so icp is not a real stage: %r" % (domain_only,)
+    assert "icp" not in disabled, "an explicitly disabled stage must not be planned"
 
 
 def test_no_onepass_removes_the_stage_from_the_plan():

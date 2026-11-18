@@ -502,7 +502,8 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
         else:
             import signal
             try:
@@ -1512,15 +1513,30 @@ class Store:
                 n += cur.rowcount or 0
         return n
 
-    def js_claim(self, limit: int) -> list[str]:
-        """Oldest pending first, then retryable failures; never re-claim done."""
+    def js_claim(self, limit: int, allow_urls: list[str] | None = None,
+                 scope: list[str] | None = None) -> list[str]:
+        """Oldest pending first, then retryable failures; never re-claim done.
+
+        The queue is shared across targets. Claiming globally meant a run for
+        example.com fetched and scanned bundles queued by a previous, unrelated
+        target -- widening the active scope without anybody asking. Callers
+        pass the exact work set (`allow_urls`) or a `scope`; only matching rows
+        are claimable.
+        """
         if limit <= 0:
             return []
         rows = self.conn.execute(
             "SELECT url FROM js_queue WHERE state IN ('pending','failed')"
             " ORDER BY CASE state WHEN 'pending' THEN 0 ELSE 1 END,"
-            " updated_at, url LIMIT ?", (limit,)).fetchall()
-        return [r["url"] for r in rows]
+            " updated_at, url").fetchall()
+        urls = [r["url"] for r in rows]
+        if allow_urls is not None:
+            allow = set(allow_urls)
+            urls = [u for u in urls if u in allow]
+        if scope:
+            sc = canon_scope(scope)
+            urls = [u for u in urls if in_scope(split_url(u)[0] or "", sc)]
+        return urls[:limit]
 
     def js_finish(self, url: str, ok: bool, error: str = "") -> None:
         ts = now()
@@ -1530,11 +1546,21 @@ class Store:
                 " updated_at=? WHERE url=?",
                 ("done" if ok else "failed", (error or "")[:300], ts, url))
 
-    def js_stats(self) -> dict:
-        """Everything an agent needs to decide "keep going or stop"."""
-        row = self.conn.execute(
-            "SELECT state, COUNT(*) c FROM js_queue GROUP BY state").fetchall()
-        by = {r["state"]: r["c"] for r in row}
+    def js_stats(self, scope: list[str] | None = None) -> dict:
+        """Everything an agent needs to decide "keep going or stop".
+
+        `scope` restricts the counts to bundles under those domains, so another
+        target's leftovers cannot make this run look unfinished (or hide work
+        that really is this run's).
+        """
+        rows = self.conn.execute("SELECT url, state FROM js_queue").fetchall()
+        sc = canon_scope(scope or [])
+        if sc:
+            rows = [r for r in rows
+                    if in_scope(split_url(r["url"])[0] or "", sc)]
+        by: dict[str, int] = {}
+        for r in rows:
+            by[r["state"]] = by.get(r["state"], 0) + 1
         return {"discovered": sum(by.values()),
                 "succeeded": by.get("done", 0),
                 "failed": by.get("failed", 0),
