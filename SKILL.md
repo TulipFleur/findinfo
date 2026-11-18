@@ -551,8 +551,13 @@ python findinfo.py assets --export runs/assets.jsonl        # 全量导出
 ## 11. 回归验证（全部为模拟采集器，不碰真实目标、不耗配额）
 
 ```bash
-python -m tests          # 全套（Windows 与 WSL Kali 均已通过）
+pip install pytest       # 一次性：部分用例用 pytest 的 raises/monkeypatch/tmp_path
+python -m tests          # 全套（Windows 与 WSL Kali 均已通过，Python >= 3.10）
 ```
+
+> `tests/` 是**开发期自检**，不在运行时链路上（`findinfo.py`、`lib/`、`scripts/` 都不 import 它），
+> `install.py --copy` 也不会把它装到客户端目录。消费者无需安装 pytest；没有 pytest 时
+> `test_tool_resolution.py` / `test_tool_inventory.py` 会导入失败，其余用例照常运行。
 
 | 验收项 | 用例 | 方式 |
 |---|---|---|

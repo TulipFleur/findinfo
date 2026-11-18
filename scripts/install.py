@@ -354,8 +354,11 @@ def _install_one(kind: str, dst: Path, mode: str, force: bool, dry: bool) -> dic
     #   Linux shipped zero binaries and nothing ran
     cur_platform = "windows" if os.name == "nt" else "linux"
     other_platforms = {"windows", "linux"} - {cur_platform}
+    # tests/ is a developer self-check harness: neither findinfo.py nor lib/
+    # imports it, so a consumer install does not need the test files or their
+    # pytest dependency.
     ignore = ["data", "cache", "runs", "_tmp", "__pycache__", "*.pyc", ".git",
-              ".env", "config.yaml", "target", *sorted(other_platforms)]
+              ".env", "config.yaml", "target", "tests", *sorted(other_platforms)]
     shutil.copytree(SOURCE, dst, ignore=shutil.ignore_patterns(*ignore))
     (dst / MARKER).write_text(json.dumps(
         {"skill": SKILL_NAME, "source": str(SOURCE), "mode": "copy",
