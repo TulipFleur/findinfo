@@ -1,6 +1,6 @@
 ---
 name: findinfo
-description: 资产测绘与信息收集流水线。从企业/品牌名或域名出发，完成"实体锚定(ENScan 股权/备案/域名) → 子域全量收集(证书透明/测绘平台/多源) → 存活探测与 CDN 剔除 → Host 头碰撞发现内部服务 → 页面与 JS 泄露回流"，产出带来源与置信度的资产图(assets)和端点表(endpoints)。当用户要求「信息收集/资产测绘/攻击面梳理/子域枚举/备案反查/内部服务发现/资产测绘流水线」，或给出一个公司名/域名要求"看看有哪些资产"时使用。新会话工作流直接看 prompts/AGENT.md（快速路径→全面路径→回流收敛→交付模板）。
+description: 资产测绘与信息收集流水线。从企业/品牌名或域名出发，完成"实体锚定(ENScan 股权/备案/域名) → 子域全量收集(证书透明/测绘平台/多源) → 存活探测与 CDN 剔除 → Host 头碰撞发现内部服务 → 页面与 JS 泄露回流"，产出带来源与置信度的资产图(assets)和端点表(endpoints)。当用户要求「信息收集/资产测绘/攻击面梳理/子域枚举/备案反查/内部服务发现/资产测绘流水线」，或给出一个公司名/域名要求"看看有哪些资产"时使用。新会话工作流直接看 prompts/AGENT.txt（快速路径→全面路径→回流收敛→交付模板）。
 license: MIT
 ---
 
@@ -47,7 +47,7 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 （典型坑：Kali 自带 `python3-httpx` 占了 `/usr/bin/httpx`），此时 `doctor` 也会给 `suspect`/`hint`。
 修法：`bash scripts/setup-linux.sh`（装到 `<skill>/bin/linux`；Windows 直接用内置 `bin/windows/*.exe`）。
 
-> 新会话接手时，最省事的方式是直接采用 `prompts/AGENT.md`（完整工作流提示词：定位 skill → 快速出结果 → 加深 → 回流收敛 → 交付模板）。
+> 新会话接手时，最省事的方式是直接采用 `prompts/AGENT.txt`（完整工作流提示词：定位 skill → 快速出结果 → 加深 → 回流收敛 → 交付模板）。
 
 ## 1. 何时用 / 何时不用
 
@@ -408,7 +408,7 @@ jq -r '.hosts[] | select(.priority=="high") | "\(.host)\t\(.score)\t\(.reasons|j
 findinfo/
 ├── SKILL.md            ← 本文件（AI 读这个决定怎么用）
 ├── findinfo.py         ← CLI 入口（23 个子命令）
-├── prompts/AGENT.md    ← ★ 新会话工作流提示词（含交付模板）
+├── prompts/AGENT.txt    ← ★ 复制即用的提示词模板（人工复制，不参与自动加载）
 ├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
 │   ├── windows/        ← 12 个 .exe（Windows 预置；doctor 追踪 12 个）
 │   ├── linux/          ← ELF（scripts/setup-linux.sh 安装）

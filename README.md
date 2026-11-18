@@ -148,7 +148,7 @@ findinfo 是给 AI agent 调用的：装好之后，用一段提示词让 agent 
 
 ### 用法二：完整工作流（推荐，交给新会话 agent）
 
-把 [`prompts/AGENT.md`](prompts/AGENT.md) 整份内容作为提示词投给 agent。它比一句话版多了：
+把 [`prompts/AGENT.txt`](prompts/AGENT.txt) 整份内容作为提示词投给 agent。它比一句话版多了：
 
 - 快速路径 / 全面路径的分阶段命令（先 5 分钟内出第一版，再逐步加深）
 - 结果推进判据：`wait` 超时、`state=failed`、`reused=true` 各自该怎么处理
@@ -218,7 +218,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
 | docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd、故障排查 |
 | docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex / Claude Desktop）加载机制与坑 |
-| prompts/AGENT.md | **给新会话 agent 的完整工作流提示词**（复制即用，含收敛判据） |
+| prompts/AGENT.txt | **复制给 agent 的完整工作流提示词模板**（人工复制粘贴，不参与自动加载） |
 
 最终交付长这样（`findinfo.py report` 产出的 html 看板，可打印成 PDF）：
 

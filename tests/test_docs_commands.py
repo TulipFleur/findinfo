@@ -10,7 +10,7 @@ from pathlib import Path
 import tests.util  # noqa: F401
 from tests.util import import_findinfo
 
-DOCS = ["SKILL.md", "README.md", "docs/TOOLS.md", "prompts/AGENT.md"]
+DOCS = ["SKILL.md", "README.md", "docs/TOOLS.md", "prompts/AGENT.txt"]
 CMD_RE = re.compile(r"^\s*(?:\$\s*)?python findinfo\.py (?:--task \S+ )?([a-z_]+)(.*)$")
 FLAG_RE = re.compile(r"(?<![-\w])(--[a-z][a-z0-9-]*)")
 
@@ -80,7 +80,7 @@ def test_documented_commands_and_flags_exist():
 def test_no_shell_background_in_standard_flow():
     """The Agent flow must not need nohup/&/bash wrappers for long tasks."""
     root = Path(__file__).resolve().parent.parent
-    for doc in ("SKILL.md", "prompts/AGENT.md", "README.md"):
+    for doc in ("SKILL.md", "prompts/AGENT.txt", "README.md"):
         text = (root / doc).read_text(encoding="utf-8")
         assert "nohup python findinfo.py" not in text, doc + " still tells the agent to use nohup"
         assert "findinfo.py run" in text, doc + " must show the python run entry point"

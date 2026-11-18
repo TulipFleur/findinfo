@@ -109,7 +109,7 @@ def test_docs_put_task_before_the_subcommand():
     `findinfo.py` and `--task` must place --task immediately after the program.
     """
     bad = []
-    for doc in ("SKILL.md", "README.md", "docs/TOOLS.md", "prompts/AGENT.md"):
+    for doc in ("SKILL.md", "README.md", "docs/TOOLS.md", "prompts/AGENT.txt"):
         p = ROOT / doc
         if not p.exists():
             continue
@@ -130,7 +130,7 @@ def test_docs_continuation_lines_carry_no_task():
     mistaken for one.
     """
     bad = []
-    for doc in ("SKILL.md", "docs/TOOLS.md", "prompts/AGENT.md"):
+    for doc in ("SKILL.md", "docs/TOOLS.md", "prompts/AGENT.txt"):
         p = ROOT / doc
         if not p.exists():
             continue
