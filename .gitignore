@@ -20,5 +20,8 @@ bin/*.exe
 # per-platform binaries (bin/windows, bin/linux, bin/darwin) are never tracked
 bin/*/
 
-# runtime binary state (agent-records/ IS tracked — see AGENT.md §7)
+# runtime binary state
 bin/*.gob
+# per-session agent collaboration logs: local development record, not
+# part of the shipped skill
+agent-records/
