@@ -1,0 +1,1161 @@
+"""Final deliverables: one collection pass, two audiences.
+
+    report.json      machine digest for the agent (bounded, stable schema)
+    report.md        bridge digest (chat / wiki / terminal, greppable)
+    report.html      human dashboard (self-contained, inline SVG, printable)
+
+Why scoping matters here: the asset graph is shared across engagements by
+design (multi-agent merge), and a crawl is allowed to follow links it finds, so
+a query without a scope suffix will happily render another target's hosts as
+findings. Every read below is therefore scoped; out-of-scope rows are counted
+but never presented as findings.
+
+Why the report carries "gaps": a deliverable that only lists what was found
+reads as complete when it is not. Stages that never ran, benchmark DNS
+answers, and crawl pollution are part of the result.
+"""
+from __future__ import annotations
+
+import html as _html
+import ipaddress
+import json
+import re
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+from . import core
+
+SCHEMA = "findinfo.report/1"
+
+# ---------------------------------------------------------------- rules
+# 198.18.0.0/15 is the benchmark range Clash/TUN fake-ip DNS hands out. An
+# answer in this range means "the resolver is a proxy", not "the host is there".
+BENCHMARK_NETS = [ipaddress.ip_network("198.18.0.0/15")]
+PRIVATE_NETS = [ipaddress.ip_network(n) for n in
+                ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+
+SENSITIVE_PATHS = [
+    (r"(^|/)\.git(/|$)", "git 仓库暴露", "high"),
+    (r"(^|/)\.svn(/|$)", "svn 仓库暴露", "high"),
+    (r"(^|/)\.hg(/|$)", "mercurial 仓库暴露", "medium"),
+    (r"(^|/)\.env(\b|$)", "环境变量文件", "high"),
+    (r"(^|/)\.ds_store$", "目录索引残留", "low"),
+    (r"swagger|openapi|api-docs|swagger-ui", "API 文档入口", "medium"),
+    (r"actuator|/druid|jolokia|/metrics\b|heapdump|threaddump", "运维端点", "high"),
+    (r"phpinfo|/server-status|/server-info|/trace\b", "信息泄露页", "medium"),
+    (r"(backup|\.bak|\.sql|\.zip|\.tar\.gz|\.tgz|\.7z|\.rar|\.dump|\.old)(\?|$)",
+     "备份/归档文件", "high"),
+    (r"(^|/)(admin|manage|manager|console|dashboard|backend|system)(/|$)", "管理入口", "medium"),
+    (r"(^|/)(login|signin|sso|oauth|cas|auth)(/|$)", "认证入口", "low"),
+    (r"upload|fileupload|attach", "文件上传点", "medium"),
+    (r"(^|/)(export|download|print)(/|$)", "导出/下载点", "low"),
+    (r"graphql|/api/v[0-9]|/rest/|/internal/", "API 接口", "low"),
+]
+SENSITIVE_PATHS = [(re.compile(p, re.I), label, sev) for p, label, sev in SENSITIVE_PATHS]
+
+PARAM_RULES = [
+    (r"^(url|uri|redirect|redirect_uri|next|return|returnurl|callback|target|dest|"
+     r"destination|goto|jump|to|out|link|src|image|domain|host)$",
+     "跳转类参数（SSRF / 开放重定向）", "medium"),
+    (r"^(file|filename|path|dir|folder|page|template|include|require|load|read|"
+     r"doc|document|download|attach)$",
+     "路径类参数（任意文件读取）", "high"),
+    (r"^(cmd|exec|command|shell|run|system|code|eval|func|method|function|class)$",
+     "命令类参数（命令执行）", "high"),
+    (r"^(id|uid|userid|user_id|account|orderid|order_id|no|num|key|token|sn|pid|sid)$",
+     "标识类参数（越权 / IDOR）", "medium"),
+    (r"^(sql|query|where|order|sort|filter|search|keyword|q)$",
+     "查询类参数（注入面）", "low"),
+    (r"^(xml|data|json|payload|body|content|html|text)$",
+     "内容类参数（XXE / 存储型）", "low"),
+]
+PARAM_RULES = [(re.compile(p, re.I), label, sev) for p, label, sev in PARAM_RULES]
+
+# Products that are interesting on their own: they either expose admin surfaces
+# or have a long history of unauthenticated RCE / info leak.
+TECH_INTEREST = {
+    "weblogic": "WebLogic", "jboss": "JBoss", "tomcat": "Tomcat", "shiro": "Shiro",
+    "struts": "Struts2", "thinkphp": "ThinkPHP", "spring": "Spring",
+    "jenkins": "Jenkins", "gitlab": "GitLab", "confluence": "Confluence",
+    "zabbix": "Zabbix", "nacos": "Nacos", "apollo": "Apollo", "kibana": "Kibana",
+    "grafana": "Grafana", "elasticsearch": "Elasticsearch", "solr": "Solr",
+    "rabbitmq": "RabbitMQ", "minio": "MinIO", "harbor": "Harbor", "druid": "Druid",
+    "swagger": "Swagger", "jupyter": "Jupyter", "airflow": "Airflow",
+    "superset": "Superset", "hadoop": "Hadoop", "yarn": "YARN", "hue": "Hue",
+    "consul": "Consul", "etcd": "etcd", "rancher": "Rancher", "portainer": "Portainer",
+    "php": "PHP", "asp.net": "ASP.NET", "iis": "IIS",
+}
+
+ADMIN_WORDS = ("后台", "管理", "登录", "运维", "监控", "控制", "平台", "系统", "门户",
+               "admin", "manage", "console", "login", "dashboard", "portal", "system")
+
+
+# ---------------------------------------------------------------- helpers
+def _uniq(seq):
+    out, seen = [], set()
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _as_int(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def _ip_kind(ip):
+    """benchmark (fake-ip DNS) / private (real intranet leak) / public."""
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return "unknown"
+    for net in BENCHMARK_NETS:
+        if addr in net:
+            return "benchmark"
+    for net in PRIVATE_NETS:
+        if addr in net:
+            return "private"
+    return "public"
+
+
+def _scope_suffixes(match):
+    return [d for d in (core.canon_domain(m) for m in (match or [])) if d]
+
+
+def _in_scope(host, suffixes):
+    if not suffixes:
+        return True
+    h = (host or "").lower().strip(".")
+    return any(h == s or h.endswith("." + s) for s in suffixes)
+
+
+# Which binary produced an asset. The store keeps raw source ids
+# ("onepass:crt.sh", "fofa-gateway", "vhost"); tokens are normalized through
+# core.split_source_token (alias- and order-independent), and provenance is
+# resolved to a label here for display only.
+TOOL_LABELS = {
+    "onepass": "onepass 被动聚合",
+    "subfinder": "subfinder",
+    "dnsx": "dnsx 解析",
+    "httpx": "httpx 存活",
+    "katana": "katana 爬虫",
+    "crawl": "katana 爬虫",
+    "fofa-gateway": "FOFA 测绘",
+    "icp-gateway": "ICP 备案",
+    "icp": "ICP 备案",
+    "icp-seed": "ICP 反查种子",
+    "enscan": "ENScan 股权/备案",
+    "vhost": "hostCollision 碰撞",
+    "leak-extract": "jsleak 页面/JS 抽取",
+    "jsleak": "jsleak 页面/JS 抽取",
+    "system-dns": "系统 DNS",
+    "ksubdomain": "ksubdomain 爆破",
+    "naabu": "naabu 端口",
+    "nmap": "nmap 端口",
+    "tlsx": "tlsx 证书",
+    "crt.sh": "crt.sh 证书",
+    "hackertarget": "HackerTarget",
+    "rapiddns": "RapidDNS",
+    "subdomain_center": "SubdomainCenter",
+    "otx": "AlienVault OTX",
+    "alienvault": "AlienVault OTX",
+    "chaos": "Chaos",
+    "gau": "gau 历史 URL",
+    "uncover": "uncover",
+    "passive": "被动源",
+}
+
+
+def _tool_label(tool):
+    return TOOL_LABELS.get((tool or "").lower(), tool or "?")
+
+
+def _provenance(raw):
+    """Resolve a raw sources cell into (labels, upstream ids).
+
+    Normalization lives in core (split_source_token + upstream_id), so the
+    store and this report agree on what counts as an independent source:
+    'onepass:crt.sh,subfinder,crt.sh' has ONE crt.sh upstream however it was
+    wrapped, ordered or re-run.
+    """
+    labels, upstreams = [], []
+    for tok in (raw or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        tool, detail = core.split_source_token(tok)
+        if not tool:
+            continue
+        up = core.upstream_id(tool, detail)
+        label = _tool_label(tool)
+        if detail:
+            label = label + "/" + _tool_label(core.upstream_id(tool, detail))
+        if label not in labels:
+            labels.append(label)
+        if up and up not in upstreams:
+            upstreams.append(up)
+    return labels, upstreams
+
+
+def _buckets(values, edges, labels):
+    counts = [0] * len(labels)
+    for v in values:
+        for i, e in enumerate(edges):
+            if v <= e:
+                counts[i] += 1
+                break
+        else:
+            counts[-1] += 1
+    return list(zip(labels, counts))
+
+
+def _now_label():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------- collect
+def _asset_in_scope(a: dict, suffixes: list[str]) -> bool:
+    """Scope test per asset KIND, not one rule for everything.
+
+    domain: hostname suffix on canonical.
+    url:    parse the hostname out of the canonical URL first.
+    ip:     the trusted attribution in this model is assets.parent (the
+            in-scope domain that resolved to it). A shared IP is therefore
+            reported as attributed-to-scope, never as exclusively owned --
+            out-of-scope hosts on the same IP simply do not appear.
+    Empty suffixes = whole shared library (caller warns about it).
+    """
+    if not suffixes:
+        return True
+    kind = a.get("kind")
+    if kind == "ip":
+        return _in_scope(a.get("parent") or "", suffixes)
+    if kind == "url":
+        host = core.split_url(a.get("canonical") or "")[0] or ""
+        return _in_scope(host, suffixes)
+    return _in_scope(a.get("canonical") or "", suffixes)
+
+
+def collect(store, match=None, min_conf=0.4, limit=300, ep_limit=400,
+            ep_scan=60000, engagement="default") -> dict:
+    """Read the asset graph once and shape it into a report digest."""
+    if match and not _scope_suffixes(match):
+        # an explicit scope that canon_domain rejects is an ERROR, never a
+        # silent fallback to the whole shared library
+        raise core.FindInfoError(
+            "no valid domain in match list: " + ",".join(str(m) for m in match))
+    suffixes = _scope_suffixes(match)
+    scope_auto = False
+    target_label = ""
+    if not suffixes:
+        # Fall back to the last run's target so an agent can call report
+        # without repeating the seeds; the DB itself has no notion of a target.
+        try:
+            row = store.conn.execute(
+                "SELECT target FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+            if row and row["target"]:
+                target_label = str(row["target"])
+                suffixes = _scope_suffixes(target_label.split(","))
+                scope_auto = bool(suffixes)
+        except Exception:
+            pass
+
+    all_counts = store.count_assets()
+    kept, dropped = [], 0
+    for a in store.get_assets(kind=None, min_conf=min_conf, limit=10 ** 9):
+        if _asset_in_scope(a, suffixes):
+            kept.append(a)
+        else:
+            dropped += 1
+
+    domains, ips, urls = [], [], []
+    for a in kept:
+        kind = a.get("kind")
+        if kind == "domain":
+            domains.append(a)
+        elif kind == "ip":
+            ips.append(a)
+        elif kind == "url":
+            urls.append(a)
+
+    # -- endpoints: the table is shared across engagements too, filter first
+    try:
+        ep_rows = store.get_endpoints(limit=ep_scan)
+    except Exception:
+        ep_rows = []
+    ep_scoped, ep_noise, ep_unattributed = [], 0, 0
+    for e in ep_rows:
+        host = (e.get("asset") or "").strip()
+        if not host or host == "leak":
+            ep_unattributed += 1
+            continue
+        if _in_scope(host, suffixes):
+            ep_scoped.append(e)
+        else:
+            ep_noise += 1
+
+    by_host = {}
+    for e in ep_scoped:
+        by_host.setdefault(e["asset"], []).append(e)
+
+    signals = []
+    hosts = []
+    tech_counter = Counter()
+    port_counter = Counter()
+    status_counter = Counter()
+    source_counter = Counter()
+    passivity_counter = Counter()
+    confidence_values = []
+    ip_groups = {}
+    fake_ip_count = 0
+
+    for a in domains:
+        host = a.get("canonical") or ""
+        attrs = a.get("attrs") or {}
+        status = _as_int(attrs.get("status"))
+        tech = _as_list(attrs.get("tech"))
+        title = (attrs.get("title") or "").strip()
+        ip = (attrs.get("ip") or "").strip()
+        port = _as_int(attrs.get("port"))
+        cdn = attrs.get("cdn")
+        provenance, upstreams = _provenance(a.get("sources"))
+        sources = sorted(core.source_tools(a.get("sources") or ""))
+        conf = float(a.get("confidence") or 0)
+        passivity = a.get("passivity") or ""
+        via = attrs.get("via") or ""
+        internal = via in ("hostCollision", "curl-diff") or "vhost" in sources
+
+        # Count each asset once per *upstream origin*: onepass relays 15
+        # upstreams into the same column, crt.sh is reachable both directly
+        # and through onepass -- counting wrappers would fake corroboration.
+        for t in upstreams:
+            source_counter[t] += 1
+        if passivity:
+            passivity_counter[passivity] += 1
+        confidence_values.append(conf)
+        for t in tech:
+            tech_counter[t] += 1
+        if port:
+            port_counter[port] += 1
+        if status is not None:
+            status_counter[str(status)] += 1
+        ip_kind = _ip_kind(ip) if ip else ""
+        if ip_kind == "benchmark":
+            fake_ip_count += 1
+        elif ip_kind in ("public", "private"):
+            ip_groups.setdefault(ip, []).append(host)
+
+        eps = by_host.get(host, [])
+        params = sorted({p for e in eps for p in _as_list(e.get("params"))})
+        reasons = []
+        score = 0
+
+        if internal:
+            score += 50
+            reasons.append("Host 头碰撞发现（" + (via or "vhost") + "）")
+            signals.append({"severity": "high", "kind": "internal_service",
+                            "host": host,
+                            "detail": "未出现在公开 DNS 的内部服务，IP=" + (ip or "?")})
+        if status in (401, 403):
+            score += 12
+            reasons.append("访问受限(" + str(status) + ")，存在但需凭据")
+        elif status in (200, 201):
+            score += 5
+        elif status in (500, 502, 503):
+            reasons.append("服务异常(" + str(status) + ")，可能泄露堆栈")
+
+        low_title = title.lower()
+        if any(w in low_title for w in ADMIN_WORDS):
+            score += 20
+            reasons.append("标题指向管理/登录入口")
+            if status in (200, 301, 302):
+                signals.append({"severity": "medium", "kind": "admin_panel", "host": host,
+                                "detail": "疑似管理或认证页面：" + (title[:60] or "(空标题)")})
+
+        for t in tech:
+            low = t.lower()
+            for probe, label in TECH_INTEREST.items():
+                if probe in low:
+                    score += 8
+                    reasons.append("指纹：" + label)
+                    break
+
+        sensitive = []
+        for e in eps:
+            path = e.get("path") or ""
+            for rx, label, sev in SENSITIVE_PATHS:
+                if rx.search(path):
+                    sensitive.append({"path": path[:120], "label": label, "severity": sev})
+                    score += 25 if sev == "high" else 10
+                    signals.append({"severity": sev, "kind": "sensitive_path", "host": host,
+                                    "detail": label + " -> " + path[:120]})
+                    break
+
+        if params:
+            score += 6
+            reasons.append(str(len(params)) + " 个参数：" + ", ".join(params[:5]))
+            for p in params:
+                for rx, label, sev in PARAM_RULES:
+                    if rx.match(p):
+                        signals.append({"severity": sev, "kind": "param_surface",
+                                        "host": host,
+                                        "detail": label + " -> " + p})
+                        score += 8 if sev == "high" else 3
+                        break
+
+        if port and port not in (80, 443):
+            score += 6
+            reasons.append("非标准端口 " + str(port))
+        if cdn:
+            score -= 8
+            reasons.append("CDN 前置 " + str(cdn))
+
+        # A host with hundreds of sensitive endpoints would otherwise score in
+        # the hundreds and drown the ranking; the cap keeps the column readable
+        # while "reasons" still carries every contributing signal.
+        score = min(score, 99)
+        if score >= 45:
+            priority = "high"
+        elif score >= 18:
+            priority = "medium"
+        elif score >= 1:
+            priority = "low"
+        else:
+            priority = "info"
+
+        hosts.append({
+            "host": host, "status": status, "title": title[:120], "tech": tech[:12],
+            "ip": ip, "port": port, "ip_kind": ip_kind, "cdn": cdn,
+            "webserver": (attrs.get("webserver") or "")[:40],
+            "url": attrs.get("url") or "",
+            "sources": _uniq(sources)[:8],
+            "provenance": provenance[:8], "discovered_by": upstreams[:8],
+            "confidence": round(conf, 2),
+            "passivity": passivity, "internal": bool(internal),
+            "parent": a.get("parent") or "",
+            "endpoints": len(eps), "params": params[:12], "sensitive": sensitive[:6],
+            "score": score, "priority": priority, "reasons": _uniq(reasons)[:6],
+            "first_seen": a.get("first_seen") or "",
+        })
+
+    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    hosts.sort(key=lambda h: (0 if h["internal"] else 1, order[h["priority"]],
+                              -h["score"], h["host"]))
+
+    # -- endpoints worth a human look (deduped by host + path + params)
+    ep_records, seen_ep = [], set()
+    for e in ep_scoped:
+        host = e["asset"]
+        path = e.get("path") or "/"
+        params = _as_list(e.get("params"))
+        status = _as_int(e.get("status"))
+        why = []
+        for rx, label, sev in SENSITIVE_PATHS:
+            if rx.search(path):
+                why.append(label)
+                break
+        for p in params:
+            for rx, label, sev in PARAM_RULES:
+                if rx.match(p):
+                    why.append(label.split("（")[0])
+                    break
+        if not why and not params:
+            continue
+        key = (host, path, ",".join(params))
+        if key in seen_ep:
+            continue
+        seen_ep.add(key)
+        ep_records.append({
+            "host": host, "method": e.get("method") or "GET", "path": path[:160],
+            "params": params[:10], "status": status,
+            "title": (e.get("title") or "")[:80], "source": e.get("source") or "",
+            "provenance": _tool_label(e.get("source") or ""),
+            "why": _uniq(why)[:3] or ["带参数"],
+        })
+    ep_records.sort(key=lambda r: (0 if r["status"] in (401, 403, 500) else 1,
+                                   -len(r["params"]), r["host"], r["path"]))
+    ep_total_interesting = len(ep_records)
+    ep_records = ep_records[:ep_limit]
+
+    # -- leak evidence: internal addresses and names found in pages / JS
+    leak_domains = sorted({a["canonical"] for a in domains
+                           if "leak-extract" in core.source_tools(a.get("sources") or "")})
+    leak_ips = sorted({a["canonical"] for a in ips
+                       if "leak-extract" in core.source_tools(a.get("sources") or "")})
+    internal_ips = [ip for ip in ip_groups if _ip_kind(ip) == "private"]
+
+    # -- which stages actually ran (checkpoints live in steps)
+    stages = []
+    try:
+        for row in store.conn.execute(
+                "SELECT step,status,updated_at FROM steps WHERE engagement=? ORDER BY step",
+                (engagement,)):
+            stages.append({"step": row["step"], "status": row["status"],
+                           "updated_at": row["updated_at"]})
+    except Exception:
+        pass
+
+    # -- environment / data-quality warnings (part of the result, not noise)
+    warnings = []
+    # A passive-only collection has no liveness/tech data at all. Reporting
+    # "live: 0" without saying why would read as "nothing is up", which is a
+    # different (and false) conclusion.
+    ran = {s["step"] for s in stages}
+    if "probe" not in ran and hosts:
+        warnings.append("未执行存活探测（probe）：本次范围内 " + str(len(hosts)) +
+                        " 个域名尚无状态/标题/指纹，live=0 表示未探测而不是全部不可用。")
+    if "crawl" not in ran and hosts:
+        warnings.append("未执行爬取（crawl/extract）：端点表与泄露情报为空不代表站点没有接口。")
+    if fake_ip_count:
+        warnings.append(
+            "检测到 " + str(fake_ip_count) + " 个域名解析到 198.18.0.0/15（Clash/TUN fake-IP）。"
+            "该环境下存活判定与共享 IP 聚合不可信，vhost 需真实 IP 才能跑。")
+    if ep_noise:
+        warnings.append("端点库中 " + str(ep_noise) + " 条记录不属于目标域"
+                        "（爬虫越界或跨项目残留），已隔离不计入结论。")
+    if dropped:
+        warnings.append("资产库中 " + str(dropped) + " 条资产不在目标范围内"
+                        "（共享库或其它项目），已隔离。")
+    if urls:
+        warnings.append("URL 资产 " + str(len(urls)) + " 条，仅用于 JS / 端点回流，未逐条访问。")
+    if not suffixes:
+        warnings.append("未能确定目标域，报告覆盖整库，可能混入其它项目数据；请用 --match 限定。")
+    # a display budget cut is NOT "collection complete": say it explicitly
+    if len(hosts) > limit:
+        warnings.append("主机仅展示前 " + str(limit) + " / 共 " + str(len(hosts)) +
+                        " 台（--limit 调整）；完整数据在资产库（assets --kind domain）。")
+    if ep_total_interesting > len(ep_records):
+        warnings.append("端点仅展示前 " + str(len(ep_records)) + " / 共 " +
+                        str(ep_total_interesting) + " 条（--ep-limit 调整）。")
+
+    # -- next steps: each line is a concrete command or decision
+    next_steps = []
+    if not suffixes:
+        next_steps.append("用 report --match <主域> 重新生成，避免共享库混入其它项目资产。")
+    if fake_ip_count:
+        next_steps.append("关闭 TUN / 换直连出口后重跑 dns 与 probe；或取测绘平台返回的真实 IP 跑 "
+                          "vhost --ip <真实IP> --domain <主域> --wordlist vhost。")
+    if not leak_ips and not internal_ips:
+        next_steps.append("对存活站点补 extract --from-store --domain <主域>，"
+                          "从 JS 中捞内部 IP 与接口。")
+    if ep_total_interesting:
+        top_hosts = _uniq([r["host"] for r in ep_records])[:5]
+        next_steps.append("带参数端点优先复核：" + ", ".join(top_hosts) +
+                          "（先只做只读回显类验证）。")
+    if any(h["status"] in (401, 403) for h in hosts):
+        next_steps.append("401/403 主机需要凭据或白名单才能深入，列入待人工确认，不要盲目爆破。")
+    if not any(h["internal"] for h in hosts):
+        next_steps.append("尚无内部服务命中：确认存在真实共享 IP 后再跑 "
+                          "vhost --ip <IP> --domain <主域> --wordlist vhost。")
+    # only SUCCEEDED checkpoints count as executed: a failed stage is not
+    # "done" merely because a steps row exists
+    done_steps = {x["step"] for x in stages if x.get("status") == "done"}
+    failed_steps = [x["step"] for x in stages if x.get("status") == "failed"]
+    missing = [s for s in ("entity", "onepass", "certs", "subs", "dns", "probe", "ipagg",
+                           "ports", "vhost", "crawl", "extract") if s not in done_steps]
+    if missing:
+        next_steps.append("未执行阶段：" + ", ".join(missing) + "（按需补齐，主动阶段需授权）。")
+    if failed_steps:
+        next_steps.append("阶段失败（重跑 run 会自动重试）：" + ", ".join(failed_steps) + "。")
+    next_steps.append("交付后用 clean --keep <主域> 清理共享库，避免下个项目继承本次资产。")
+
+    # -- chart series (rendered by build_html, kept here so both outputs agree)
+    status_pairs = sorted(status_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+    tech_pairs = tech_counter.most_common(12)
+    tool_pairs = [[_tool_label(k), v] for k, v in source_counter.most_common(12)]
+    source_pairs = source_counter.most_common(10)
+    port_pairs = [[str(k), v] for k, v in port_counter.most_common(8)]
+    conf_pairs = _buckets(confidence_values, [0.4, 0.7, 0.9, 4.0],
+                          ["<0.40", "0.40-0.70", "0.70-0.90", ">=0.90"])
+    ip_pairs = sorted(((ip, len(v)) for ip, v in ip_groups.items()),
+                      key=lambda kv: (-kv[1], kv[0]))[:10]
+
+    counts = {
+        "domains_in_scope": len(domains),
+        "domains_dropped": dropped,
+        "live": sum(1 for h in hosts if h["status"] is not None),
+        "interesting": sum(1 for h in hosts if h["priority"] in ("high", "medium")),
+        "internal_services": sum(1 for h in hosts if h["internal"]),
+        "ips_in_scope": len(ips),
+        "real_ips": len(ip_groups),
+        "fake_ips": fake_ip_count,
+        "urls": len(urls),
+        "endpoints_in_scope": len(ep_scoped),
+        "endpoints_interesting": ep_total_interesting,
+        "endpoints_noise": ep_noise,
+        "endpoints_unattributed": ep_unattributed,
+        "leak_domains": len(leak_domains),
+        "leak_ips": len(leak_ips),
+        "stages_failed": len(failed_steps),
+    }
+
+    return {
+        "schema": SCHEMA,
+        "generated_at": core.now(),
+        "scope": {"match": suffixes, "auto": scope_auto, "target": target_label,
+                  "engagement": engagement},
+        "counts": counts,
+        "assets_total": all_counts,
+        "environment": {"platform": core.PLATFORM, "warnings": warnings},
+        "hosts": hosts[:limit],
+        "hosts_total": len(hosts),
+        "internal_services": [h for h in hosts if h["internal"]][:limit],
+        "endpoints": ep_records,
+        "signals": signals[:200],
+        "leaks": {"domains": leak_domains[:200], "ips": leak_ips[:200],
+                  "private_ips": internal_ips[:50]},
+        "ip_groups": [{"ip": ip, "hosts": sorted(hs)[:20], "hosts_count": len(hs)}
+                      for ip, hs in sorted(ip_groups.items(),
+                                           key=lambda kv: (-len(kv[1]), kv[0]))[:30]],
+        "provenance": {
+            "sources": dict(source_counter.most_common(20)),
+            "passivity": dict(passivity_counter),
+            "confidence": dict(conf_pairs),
+        },
+        "stages": stages,
+        "next_steps": next_steps,
+        "charts": {"status": status_pairs, "tech": tech_pairs, "sources": source_pairs,
+                   "tools": tool_pairs,
+                   "ports": port_pairs, "confidence": conf_pairs, "ip_share": ip_pairs},
+        "truncated": {"hosts": len(hosts) > limit,
+                      "endpoints": ep_total_interesting > len(ep_records)},
+    }
+
+
+# ---------------------------------------------------------------- markdown
+def _md_escape(text):
+    return str(text or "").replace("|", "\\|").replace("\n", " ")
+
+
+def _md_cell(value, dash="-"):
+    text = _md_escape(value)
+    return text if text else dash
+
+
+def build_md(data) -> str:
+    c = data["counts"]
+    scope = data["scope"]
+    out = []
+    scope_txt = ", ".join(scope["match"]) if scope["match"] else "(未限定：整库)"
+    auto = "（自动取自最近一次 run.target）" if scope["auto"] else ""
+    out.append("# 资产测绘报告 · " + scope_txt)
+    out.append("")
+    out.append("- 生成时间：" + data["generated_at"])
+    out.append("- 目标范围：" + scope_txt + auto)
+    out.append("- 引擎/平台：" + str(data["environment"].get("platform") or ""))
+    out.append("- schema：`" + data["schema"] + "`（同目录 report.json 为机器可读版）")
+    out.append("")
+
+    out.append("## 1. 总览")
+    out.append("")
+    out.append("| 指标 | 数值 | 说明 |")
+    out.append("| --- | --- | --- |")
+    out.append("| 范围内域名 | " + str(c["domains_in_scope"]) + " | 已按目标域过滤 |")
+    out.append("| 存活主机 | " + str(c["live"]) + " | 有 HTTP 状态码 |")
+    out.append("| 高/中优先 | " + str(c["interesting"]) + " | 综合评分结果，见第 3 节 |")
+    out.append("| 内部服务 | " + str(c["internal_services"]) + " | Host 头碰撞命中 |")
+    out.append("| 端点（范围内） | " + str(c["endpoints_in_scope"]) + " | 待复核 "
+               + str(c["endpoints_interesting"]) + " 条 |")
+    out.append("| 泄露情报 | " + str(c["leak_domains"]) + " 域名 / " + str(c["leak_ips"])
+               + " IP | 来自页面与 JS |")
+    out.append("| 已隔离噪声 | 资产 " + str(c["domains_dropped"]) + " / 端点 "
+               + str(c["endpoints_noise"]) + " | 不属于本项目，未计入 |")
+    out.append("")
+
+    warnings = data["environment"].get("warnings") or []
+    if warnings:
+        out.append("## 2. 范围与环境告警")
+        out.append("")
+        for w in warnings:
+            out.append("- " + w)
+        out.append("")
+
+    hosts = data["hosts"]
+    out.append("## 3. 高价值主机（前 " + str(min(len(hosts), 40)) + " / 共 "
+               + str(data["hosts_total"]) + "）")
+    out.append("")
+    if hosts:
+        out.append("| 优先 | 主机 | 状态 | 标题 | 指纹 | 来源 | 评分 | 依据 |")
+        out.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for h in hosts[:40]:
+            out.append("| " + " | ".join([
+                h["priority"],
+                "`" + h["host"] + "`",
+                str(h["status"]) if h["status"] is not None else "-",
+                _md_cell(h["title"])[:48],
+                _md_cell(", ".join(h["tech"][:4])),
+                ", ".join(h["provenance"][:4]) or "-",
+                str(h["score"]),
+                _md_cell("；".join(h["reasons"][:3]))[:110],
+            ]) + " |")
+    else:
+        out.append("_无范围内主机。_")
+    out.append("")
+
+    internal = data["internal_services"]
+    if internal:
+        out.append("## 4. 内部服务（Host 头碰撞）")
+        out.append("")
+        out.append("| 主机 | IP | 状态 | 标题 | 来源 |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for h in internal:
+            out.append("| " + " | ".join([
+                "`" + h["host"] + "`", _md_cell(h["ip"]),
+                str(h["status"]) if h["status"] is not None else "-",
+                _md_cell(h["title"])[:40], _md_cell(", ".join(h["sources"][:3])),
+            ]) + " |")
+        out.append("")
+    else:
+        # Keep the numbering complete and say WHY it is empty. Silently
+        # skipping the section made the report jump 3 -> 5, so a reader could
+        # not tell "no internal services found" from "this stage never ran".
+        out.append("## 4. 内部服务（Host 头碰撞）")
+        out.append("")
+        ran = {s.get("step") for s in (data.get("stages") or []) if isinstance(s, dict)}
+        if "vhost" in ran:
+            out.append("_范围内未发现内部服务。_")
+        else:
+            out.append("_未执行 vhost（Host 头碰撞）阶段：内部服务为空不代表没有内部系统。_")
+        out.append("")
+
+    eps = data["endpoints"]
+    out.append("## 5. 待复核端点（" + str(len(eps)) + " / 共 "
+               + str(c["endpoints_interesting"]) + "）")
+    out.append("")
+    if eps:
+        out.append("| 主机 | 方法 | 路径 | 参数 | 状态 | 关注点 |")
+        out.append("| --- | --- | --- | --- | --- | --- |")
+        for e in eps[:40]:
+            out.append("| " + " | ".join([
+                "`" + e["host"] + "`", e["method"],
+                "`" + _md_escape(e["path"])[:80] + "`",
+                _md_cell(", ".join(e["params"][:5])),
+                str(e["status"]) if e["status"] is not None else "-",
+                _md_cell("；".join(e["why"])),
+            ]) + " |")
+    else:
+        out.append("_无带参数或敏感路径端点。_")
+    out.append("")
+
+    leaks = data["leaks"]
+    out.append("## 6. 泄露情报")
+    out.append("")
+    if leaks["domains"] or leaks["ips"] or leaks["private_ips"]:
+        if leaks["domains"]:
+            out.append("- 泄露域名（" + str(len(leaks["domains"])) + "）："
+                       + ", ".join(leaks["domains"][:40]))
+        if leaks["ips"]:
+            out.append("- 泄露公网 IP（" + str(len(leaks["ips"])) + "）："
+                       + ", ".join(leaks["ips"][:40]))
+        if leaks["private_ips"]:
+            out.append("- 内网 IP（" + str(len(leaks["private_ips"])) + "）："
+                       + ", ".join(leaks["private_ips"][:40]))
+        out.append("")
+    else:
+        out.append("_未发现泄露域名/IP"
+                   + ("" if "extract" in {x.get("step") for x in (
+                       data.get("stages") or []) if isinstance(x, dict)}
+                      else "；且未执行 extract（内容/JS 提取）阶段")
+                   + "。_")
+        out.append("")
+
+    prov = data["provenance"]
+    out.append("## 7. 来源与可信度")
+    out.append("")
+    if prov.get("sources"):
+        out.append("| 工具 | 覆盖资产数 |")
+        out.append("| --- | --- |")
+        for k, v in data["charts"].get("tools") or []:
+            out.append("| " + str(k) + " | " + str(v) + " |")
+        out.append("")
+        if prov.get("passivity"):
+            out.append("- 被动/主动：" + ", ".join(
+                str(k) + "=" + str(v) for k, v in prov["passivity"].items()))
+        if prov.get("confidence"):
+            out.append("- 置信度分布：" + ", ".join(
+                str(k) + "=" + str(v) for k, v in prov["confidence"].items()))
+        out.append("")
+    else:
+        out.append("_资产来源信息为空（资产库中没有范围内记录）。_")
+        out.append("")
+
+    stages = data["stages"]
+    out.append("## 8. 阶段执行记录")
+    out.append("")
+    if stages:
+        out.append("| 阶段 | 状态 | 更新时间 |")
+        out.append("| --- | --- | --- |")
+        for s in stages:
+            out.append("| " + s["step"] + " | " + str(s["status"]) + " | "
+                       + str(s["updated_at"]) + " |")
+        out.append("")
+    else:
+        out.append("_资产库中没有阶段记录（本次报告直接读库生成，未经 run 编排）。_")
+        out.append("")
+
+    steps = data["next_steps"] or []
+    out.append("## 9. 下一步")
+    out.append("")
+    for i, s in enumerate(steps, 1):
+        out.append(str(i) + ". " + s)
+    if not steps:
+        out.append("_无。_")
+    out.append("")
+
+    out.append("---")
+    out.append("")
+    out.append("同目录另有 report.html（可视化看板，可直接转发/打印）与 report.json"
+               "（给 Agent 的机器可读版，" + str(data["schema"]) + "）。")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- html helpers
+_CSS = """
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1d2029;--line:#2a2f3a;--fg:#e6e9ef;
+--dim:#9aa3b2;--hi:#ff5c5c;--md:#ffb454;--lo:#5bc0eb;--ok:#3ddc97;--accent:#7c9cff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+header{padding:28px 32px 18px;border-bottom:1px solid var(--line);
+background:linear-gradient(180deg,#191d26,#0f1115)}
+h1{margin:0 0 6px;font-size:22px;letter-spacing:.3px}
+.meta{color:var(--dim);font-size:12.5px}
+.meta b{color:var(--fg);font-weight:600}
+main{padding:24px 32px 60px;max-width:1280px;margin:0 auto}
+section{margin:0 0 30px}
+h2{font-size:15px;margin:0 0 12px;color:var(--accent);letter-spacing:.4px}
+h2 span{color:var(--dim);font-weight:400;font-size:12.5px;margin-left:8px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .n{font-size:26px;font-weight:700;line-height:1.1}
+.card .k{color:var(--dim);font-size:12px;margin-top:4px}
+.card.hi .n{color:var(--hi)} .card.md .n{color:var(--md)}
+.card.ok .n{color:var(--ok)} .card.lo .n{color:var(--lo)}
+.banner{background:#2a1d1d;border:1px solid #5a2b2b;border-left:3px solid var(--hi);
+border-radius:8px;padding:12px 16px;margin:0 0 10px;font-size:13px}
+.banner.info{background:#1a2230;border-color:#2c3d55;border-left-color:var(--lo)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.panel h3{margin:0 0 10px;font-size:13px;color:var(--dim);font-weight:600}
+.bars{margin:0}
+.bar{display:grid;grid-template-columns:112px 1fr 40px;gap:8px;align-items:center;
+margin:5px 0;font-size:12.5px}
+.bar .lab{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .track{background:#12151b;border-radius:4px;height:14px;overflow:hidden}
+.bar .fill{height:100%;border-radius:4px;background:linear-gradient(90deg,#3d5afe,#7c9cff)}
+.bar .val{text-align:right;color:var(--fg);font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;color:var(--dim);font-weight:600;padding:7px 10px;
+border-bottom:1px solid var(--line);white-space:nowrap;background:var(--panel2)}
+td{padding:7px 10px;border-bottom:1px solid #21242d;vertical-align:top}
+tr:hover td{background:#1a1e26}
+.host{font-family:ui-monospace,Consolas,monospace;color:#cfe0ff;word-break:break-all}
+.mono{font-family:ui-monospace,Consolas,monospace;color:#a8b6cc;word-break:break-all}
+.tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+border:1px solid var(--line);color:var(--dim);margin:1px 3px 1px 0;white-space:nowrap}
+.tag.src{color:#9ad0ff;border-color:#2a4763;background:#132030}
+.tag.tch{color:#c8b6ff;border-color:#3b3355;background:#1c1830}
+.pri{display:inline-block;min-width:52px;text-align:center;padding:1px 8px;border-radius:5px;
+font-size:11px;font-weight:700}
+.pri.high{background:#3a1414;color:#ff8080;border:1px solid #6b2020}
+.pri.medium{background:#3a2a10;color:#ffc46b;border:1px solid #6b4a1a}
+.pri.low{background:#12283a;color:#7fd4ff;border:1px solid #1f4a68}
+.pri.info{background:#1c1f27;color:#8d97a8;border:1px solid #2a2f3a}
+.st{font-variant-numeric:tabular-nums;font-weight:600}
+.st.s2{color:var(--ok)} .st.s3{color:var(--md)} .st.s4{color:#ff8a8a} .st.s5{color:#ff6b6b}
+ol.steps{margin:0;padding-left:20px;color:#cdd6e4}
+ol.steps li{margin:5px 0}
+footer{border-top:1px solid var(--line);margin-top:30px;padding-top:14px;
+color:var(--dim);font-size:12px}
+.empty{color:var(--dim);font-style:italic;padding:10px 0}
+@media print{body{background:#fff;color:#111}header,main{background:#fff}
+.panel,.card{background:#fff;border-color:#ddd}.bars .fill{background:#4a63d8}
+th{background:#f2f4f8;color:#555}td{border-color:#e5e5e5}.tag{color:#555;border-color:#ddd}
+.host{color:#123}.mono{color:#333}h2{color:#2b3fa0}}
+"""
+
+
+def _esc(value, limit=None):
+    text = _html.escape(str(value if value is not None else ""), quote=True)
+    if limit and len(text) > limit:
+        text = text[:limit] + "..."
+    return text
+
+
+def _status_class(status):
+    if status is None:
+        return ""
+    if 200 <= status < 300:
+        return "s2"
+    if 300 <= status < 400:
+        return "s3"
+    if 400 <= status < 500:
+        return "s4"
+    return "s5"
+
+
+def _bars(pairs, limit=12):
+    """Horizontal bar chart; pairs is [(label, value)]."""
+    pairs = [(str(k), int(v)) for k, v in list(pairs)[:limit]]
+    if not pairs:
+        return '<div class="empty">无数据</div>'
+    top = max(v for _, v in pairs) or 1
+    rows = []
+    for label, value in pairs:
+        pct = max(2, int(round(value * 100.0 / top)))
+        rows.append(
+            '<div class="bar"><div class="lab" title="' + _esc(label) + '">' + _esc(label, 24)
+            + '</div><div class="track"><div class="fill" style="width:' + str(pct)
+            + '%"></div></div><div class="val">' + str(value) + "</div></div>")
+    return '<div class="bars">' + "".join(rows) + "</div>"
+
+
+def _kpi(value, label, kind=""):
+    return ('<div class="card ' + kind + '"><div class="n">' + _esc(value)
+            + '</div><div class="k">' + _esc(label) + "</div></div>")
+
+
+def _host_rows(hosts, limit=60):
+    if not hosts:
+        return '<tr><td colspan="8" class="empty">无范围内主机</td></tr>'
+    rows = []
+    for h in hosts[:limit]:
+        tags = "".join('<span class="tag tch">' + _esc(t, 24) + "</span>"
+                       for t in h["tech"][:6])
+        srcs = "".join('<span class="tag src">' + _esc(s, 28) + "</span>"
+                       for s in h["provenance"][:5])
+        if h["internal"]:
+            srcs = '<span class="tag src" style="color:#ff9d9d;border-color:#6b2020">内部服务</span>' + srcs
+        reasons = "；".join(_esc(r, 70) for r in h["reasons"][:3])
+        rows.append(
+            "<tr><td><span class=\"pri " + h["priority"] + '">' + _esc(h["priority"])
+            + "</span></td>"
+            + '<td><span class="host">' + _esc(h["host"]) + "</span>"
+            + ('<br><span class="meta">' + _esc(h["ip"]) + "</span>" if h["ip"] else "")
+            + '</td><td><span class="st ' + _status_class(h["status"]) + '">'
+            + _esc(h["status"] if h["status"] is not None else "-") + "</span></td>"
+            + "<td>" + _esc(h["title"], 60) + "</td>"
+            + "<td>" + (tags or '<span class="meta">-</span>') + "</td>"
+            + "<td>" + (srcs or '<span class="meta">-</span>') + "</td>"
+            + '<td><span class="st">' + str(h["score"]) + "</span></td>"
+            + '<td class="meta">' + (reasons or "-") + "</td></tr>")
+    return "".join(rows)
+
+
+def _endpoint_rows(eps, limit=60):
+    if not eps:
+        return '<tr><td colspan="6" class="empty">无带参数或敏感路径端点</td></tr>'
+    rows = []
+    for e in eps[:limit]:
+        rows.append(
+            '<tr><td><span class="host">' + _esc(e["host"]) + "</span></td>"
+            + "<td>" + _esc(e["method"]) + "</td>"
+            + '<td class="mono">' + _esc(e["path"], 90) + "</td>"
+            + '<td class="mono">' + _esc(", ".join(e["params"][:5]), 60) + "</td>"
+            + '<td><span class="st ' + _status_class(e["status"]) + '">'
+            + _esc(e["status"] if e["status"] is not None else "-") + "</span></td>"
+            + '<td><span class="tag src">' + _esc(e["provenance"])
+            + "</span> " + _esc("；".join(e["why"]), 60) + "</td></tr>")
+    return "".join(rows)
+
+
+def build_html(data) -> str:
+    c = data["counts"]
+    scope = data["scope"]
+    scope_txt = ", ".join(scope["match"]) if scope["match"] else "未限定（整库）"
+    if scope["auto"]:
+        scope_txt += "（自动取自最近 run）"
+    parts = []
+    parts.append('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">')
+    parts.append('<meta name="viewport" content="width=device-width,initial-scale=1">')
+    parts.append("<title>资产测绘报告 · " + _esc(scope_txt) + "</title>")
+    parts.append("<style>" + _CSS + "</style></head><body>")
+
+    parts.append("<header><h1>资产测绘报告</h1>")
+    parts.append('<div class="meta">目标范围 <b>' + _esc(scope_txt) + "</b>"
+                 + " · 生成时间 <b>" + _esc(data["generated_at"]) + "</b>"
+                 + " · 平台 <b>" + _esc(data["environment"].get("platform") or "-")
+                 + "</b> · schema <b>" + _esc(data["schema"]) + "</b></div></header>")
+
+    parts.append("<main>")
+    parts.append('<section><div class="cards">'
+                 + _kpi(c["domains_in_scope"], "范围内域名")
+                 + _kpi(c["live"], "存活主机", "ok")
+                 + _kpi(c["interesting"], "高/中优先", "md")
+                 + _kpi(c["internal_services"], "内部服务", "hi")
+                 + _kpi(c["endpoints_interesting"], "待复核端点", "lo")
+                 + _kpi(c["leak_domains"] + c["leak_ips"], "泄露情报")
+                 + "</div></section>")
+
+    warnings = data["environment"].get("warnings") or []
+    if warnings:
+        parts.append("<section><h2>范围与环境告警<span>这些会直接影响结论可信度</span></h2>")
+        for w in warnings:
+            parts.append('<div class="banner info">' + _esc(w) + "</div>")
+        parts.append("</section>")
+
+    charts = data["charts"]
+    parts.append("<section><h2>分布概览<span>状态 / 指纹 / 工具来源 / 置信度 / IP 共享</span></h2>")
+    parts.append('<div class="grid2">')
+    parts.append('<div class="panel"><h3>HTTP 状态分布</h3>' + _bars(charts.get("status") or []) + "</div>")
+    parts.append('<div class="panel"><h3>工具来源（每资产计一次）</h3>' + _bars(charts.get("tools") or []) + "</div>")
+    parts.append('<div class="panel"><h3>指纹/技术栈 Top</h3>' + _bars(charts.get("tech") or []) + "</div>")
+    parts.append('<div class="panel"><h3>置信度分桶</h3>' + _bars(charts.get("confidence") or []) + "</div>")
+    parts.append('<div class="panel"><h3>共享 IP Top（同 IP 主机数）</h3>' + _bars(charts.get("ip_share") or []) + "</div>")
+    parts.append('<div class="panel"><h3>端口分布</h3>' + _bars(charts.get("ports") or []) + "</div>")
+    parts.append("</div></section>")
+
+    hosts = data["hosts"]
+    parts.append("<section><h2>高价值主机<span>前 " + str(min(len(hosts), 60)) + " / 共 "
+                 + str(data["hosts_total"]) + "，内部服务优先</span></h2>")
+    parts.append('<div class="panel"><table><thead><tr><th>优先</th><th>主机</th>'
+                 "<th>状态</th><th>标题</th><th>指纹</th><th>来源</th><th>评分</th>"
+                 "<th>判定依据</th></tr></thead><tbody>" + _host_rows(hosts) + "</tbody></table></div>")
+    parts.append("</section>")
+
+    internal = data["internal_services"]
+    if internal:
+        parts.append("<section><h2>内部服务（Host 头碰撞）<span>未出现在公开 DNS 中</span></h2>")
+        parts.append('<div class="panel"><table><thead><tr><th>主机</th><th>IP</th><th>状态</th>'
+                     "<th>标题</th><th>来源</th></tr></thead><tbody>")
+        for h in internal[:40]:
+            parts.append('<tr><td><span class="host">' + _esc(h["host"]) + "</span></td>"
+                         + '<td class="mono">' + _esc(h["ip"]) + "</td>"
+                         + '<td><span class="st ' + _status_class(h["status"]) + '">'
+                         + _esc(h["status"] if h["status"] is not None else "-") + "</span></td>"
+                         + "<td>" + _esc(h["title"], 50) + "</td>"
+                         + "<td>" + "".join('<span class="tag src">' + _esc(s, 26) + "</span>"
+                                            for s in h["provenance"][:4]) + "</td></tr>")
+        parts.append("</tbody></table></div></section>")
+
+    eps = data["endpoints"]
+    parts.append("<section><h2>待复核端点<span>" + str(len(eps)) + " / 共 "
+                 + str(c["endpoints_interesting"]) + "，按关注度排序</span></h2>")
+    parts.append('<div class="panel"><table><thead><tr><th>主机</th><th>方法</th><th>路径</th>'
+                 "<th>参数</th><th>状态</th><th>来源 / 关注点</th></tr></thead><tbody>"
+                 + _endpoint_rows(eps) + "</tbody></table></div></section>")
+
+    leaks = data["leaks"]
+    if leaks["domains"] or leaks["ips"] or leaks["private_ips"]:
+        parts.append("<section><h2>泄露情报<span>来自页面与 JS 抽取</span></h2>")
+        parts.append('<div class="grid2">')
+        parts.append('<div class="panel"><h3>泄露域名（' + str(len(leaks["domains"]))
+                     + "）</h3><div>" + "".join('<span class="tag">' + _esc(d) + "</span>"
+                                                for d in leaks["domains"][:60]) + "</div></div>")
+        parts.append('<div class="panel"><h3>内网 IP（' + str(len(leaks["private_ips"]))
+                     + "）</h3><div>" + "".join('<span class="tag">' + _esc(ip) + "</span>"
+                                                for ip in leaks["private_ips"][:60]) + "</div></div>")
+        parts.append("</div></section>")
+
+    ip_groups = data["ip_groups"]
+    if ip_groups:
+        parts.append("<section><h2>共享 IP 聚类<span>同 IP 多主机通常指向同一个后端集群</span></h2>")
+        parts.append('<div class="panel"><table><thead><tr><th>IP</th><th>主机数</th>'
+                     "<th>主机</th></tr></thead><tbody>")
+        for g in ip_groups[:20]:
+            parts.append('<tr><td class="mono">' + _esc(g["ip"]) + "</td><td>" + str(g["hosts_count"])
+                         + '</td><td class="mono">' + _esc(", ".join(g["hosts"][:8]), 120)
+                         + "</td></tr>")
+        parts.append("</tbody></table></div></section>")
+
+    stages = data["stages"]
+    if stages:
+        parts.append("<section><h2>阶段执行记录<span>来自 steps 检查点</span></h2>")
+        parts.append('<div class="panel"><table><thead><tr><th>阶段</th><th>状态</th>'
+                     "<th>更新时间</th></tr></thead><tbody>")
+        for s in stages:
+            parts.append("<tr><td>" + _esc(s["step"]) + '</td><td><span class="tag">'
+                         + _esc(s["status"]) + '</span></td><td class="mono">'
+                         + _esc(s["updated_at"]) + "</td></tr>")
+        parts.append("</tbody></table></div></section>")
+
+    steps = data["next_steps"] or []
+    if steps:
+        parts.append("<section><h2>下一步<span>按缺口生成，可直接执行</span></h2>")
+        parts.append('<div class="panel"><ol class="steps">'
+                     + "".join("<li>" + _esc(s) + "</li>" for s in steps) + "</ol></div></section>")
+
+    parts.append('<footer>本页由 findinfo report 生成，单文件自包含（无外部 JS/CSS/字体），'
+                 "可直接归档、打印或转发。同目录 report.json 为给 Agent 的机器可读版，"
+                 "report.md 为文字摘要版。资产采用共享库 + 范围过滤：本次已隔离 "
+                 + str(c["domains_dropped"]) + " 条资产、"
+                 + str(c["endpoints_noise"]) + " 条端点。</footer>")
+    parts.append("</main></body></html>")
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------- write
+def write_bundle(data, out_dir=None, slug=None, json_limit=None) -> dict:
+    """Write report.json + report.md + report.html; returns the paths.
+
+    json_limit caps the machine digest (hosts/endpoints arrays) so an agent can
+    always read it whole; the html/md keep the fuller human view.
+    """
+    c = data["counts"]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not slug:
+        match = data["scope"].get("match") or []
+        slug = match[0].replace(".", "-") if match else "all"
+    base = Path(out_dir) if out_dir else (Path(core.DATA) / "reports" / (stamp + "-" + slug))
+    base.mkdir(parents=True, exist_ok=True)
+
+    digest = data
+    if json_limit and (len(data["hosts"]) > json_limit or len(data["endpoints"]) > json_limit):
+        digest = dict(data)
+        digest["hosts"] = data["hosts"][:json_limit]
+        digest["endpoints"] = data["endpoints"][:json_limit]
+        digest["internal_services"] = data["internal_services"][:json_limit]
+        digest["signals"] = data["signals"][:json_limit]
+        digest["truncated"] = dict(data.get("truncated") or {})
+        digest["truncated"]["by_json_limit"] = json_limit
+
+    paths = {}
+    p = base / "report.json"
+    # Compact, not indented: this file is read by an agent (or jq), and the
+    # pretty form roughly doubles the bytes for no readability gain at 100 KB.
+    p.write_text(json.dumps(digest, ensure_ascii=False, separators=(",", ":")),
+                 encoding="utf-8")
+    paths["json"] = str(p)
+    p = base / "report.md"
+    p.write_text(build_md(data), encoding="utf-8")
+    paths["md"] = str(p)
+    p = base / "report.html"
+    p.write_text(build_html(data), encoding="utf-8")
+    paths["html"] = str(p)
+    paths["dir"] = str(base)
+
+    # A "latest" pointer is what both audiences actually open. A symlink needs
+    # developer mode / admin on Windows, so fall back to a plain text pointer
+    # instead of silently leaving nothing behind.
+    reports = Path(core.DATA) / "reports"
+    latest = reports / "latest"
+    try:
+        if latest.is_symlink():
+            latest.unlink()
+        if latest.exists():
+            raise OSError("latest is a real directory, not a pointer")
+        latest.symlink_to(base, target_is_directory=True)
+        paths["latest"] = str(latest)
+    except (OSError, NotImplementedError):
+        try:
+            ptr = reports / "latest.txt"
+            ptr.write_text(str(base), encoding="utf-8")
+            paths["latest"] = str(ptr)
+        except OSError:
+            pass
+    return paths

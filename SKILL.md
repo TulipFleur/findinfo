@@ -42,7 +42,7 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 `-p/--print` 只回显将要执行的命令（不执行），适合先确认参数；`-m steps` 把被动阶段拆开跑（`passive→certs→subs→icp→dns`），主动阶段仍交给 `run`（带断点/心跳）。
 数据写入用户级目录（默认 `~/.findinfo`），与 skill 代码目录分离；`doctor` 的 `root`/`home`/`db` 字段可确认实际位置。
 **工具必须在 skill 目录内**：`doctor` 的 `tools_summary` 会直接回答这件事——
-`all_in_bin: true` 表示 15 个工具全部解析到 `<skill>/bin`，没有任何一个从 `PATH` 借来。
+`all_in_bin: true` 表示 16 个工具全部解析到 `<skill>/bin`，没有任何一个从 `PATH` 借来。
 每个工具条目还带 `source: bundle|path`；出现 `path` 就说明会依赖别处的同名二进制
 （典型坑：Kali 自带 `python3-httpx` 占了 `/usr/bin/httpx`），此时 `doctor` 也会给 `suspect`/`hint`。
 修法：`bash scripts/setup-linux.sh --prefix <skill>/bin`（Windows 直接用内置 `bin/*.exe`）。
@@ -92,7 +92,7 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 ### B. 自检（10 秒，决定能力边界）
 
 ```bash
-python findinfo.py doctor          # 15 个工具是否都在 bin/ + 哪些 key 可用
+python findinfo.py doctor          # 16 个工具是否都在 bin/ + 哪些 key 可用
 python findinfo.py runs --active   # 是否已有在跑的任务（先看，别重复起）
 ```
 

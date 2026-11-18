@@ -2,6 +2,9 @@
 .gitignore
 bin/*.exe
 bin/*.dll
+bin/windows/
+bin/linux/
+bin/darwin/
 rust/onepass/target
 data/
 cache/

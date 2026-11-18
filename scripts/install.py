@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -119,6 +120,176 @@ def _client_present(kind: str, project: str | None) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- codex config
+# Codex (CLI 0.166+) does NOT scan ~/.codex/skills: it reads explicit
+# [[skills.config]] entries from ~/.codex/config.toml. Installing only a link
+# there leaves the skill invisible to Codex, so registration is part of install.
+def _codex_home() -> Path:
+    env = os.environ.get("CODEX_HOME")
+    return Path(env).expanduser() if env else (_home() / ".codex")
+
+
+def _codex_config() -> Path:
+    return _codex_home() / "config.toml"
+
+
+def _toml_str(s: str) -> str:
+    """Prefer a TOML literal string so Windows backslashes stay literal."""
+    if "'" not in s:
+        return "'" + s + "'"
+    return json.dumps(s)
+
+
+def _codex_entry_path() -> str:
+    return str((SOURCE / "SKILL.md").resolve())
+
+
+def _read_text_keep_eol(p: Path) -> tuple[str, str]:
+    """Read a config file and remember its line ending (CRLF vs LF).
+
+    Rewriting a CRLF config as LF makes the whole file show up in diffs and
+    can upset tools that compare it byte-wise, so the original EOL is reused.
+    """
+    raw = p.read_bytes()
+    text = raw.decode("utf-8", "replace")
+    eol = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n"), eol
+
+
+def _write_text_keep_eol(p: Path, text_lf: str, eol: str) -> None:
+    data = text_lf.replace("\r\n", "\n")
+    if eol == "\r\n":
+        data = data.replace("\n", "\r\n")
+    p.write_text(data, encoding="utf-8", newline="")
+
+
+def _codex_state() -> dict:
+    """Is findinfo registered in Codex's config, and are skills even included?"""
+    cfg = _codex_config()
+    info = {"config": str(cfg), "exists": cfg.exists(), "registered": False,
+            "include_instructions": None}
+    if not cfg.exists():
+        return info
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return info
+    want = _codex_entry_path()
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("path") and "=" in s:
+            val = s.split("=", 1)[1].strip().strip("'\"")
+            if val.lower() == want.lower():
+                info["registered"] = True
+    m = re.search(r"(?m)^include_instructions\s*=\s*(true|false)", text)
+    if m:
+        info["include_instructions"] = (m.group(1) == "true")
+    return info
+
+
+def codex_register(dry: bool = False) -> dict:
+    cfg = _codex_config()
+    st = _codex_state()
+    if st["registered"]:
+        return {"action": "unchanged", **st}
+    # Codex's schema requires BOTH fields; a path-only entry fails with
+    # "invalid data" (missing field) and the whole config stops loading.
+    block = ("[[skills.config]]\npath = " + _toml_str(_codex_entry_path()) +
+             "\nenabled = true\n")
+    try:
+        if cfg.exists():
+            text, eol = _read_text_keep_eol(cfg)
+        else:
+            text, eol = "", "\n"
+    except OSError as exc:
+        return {"action": "error", "reason": repr(exc), **st}
+    # keep the two skills.config entries next to each other: insert before [skills]
+    lines = text.splitlines()
+    idx = next((i for i, ln in enumerate(lines)
+                if ln.strip() == "[skills]"), None)
+    if idx is None:
+        new_text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + block
+    else:
+        new_text = "\n".join(lines[:idx]) + "\n" + block + "\n" + "\n".join(lines[idx:]) + "\n"
+    if dry:
+        return {"action": "would-register", **st}
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    if cfg.exists():
+        shutil.copy2(cfg, cfg.with_suffix(cfg.suffix + ".findinfo.bak"))
+    _write_text_keep_eol(cfg, new_text, eol)
+    return {"action": "registered", **_codex_state()}
+
+
+def codex_set_instructions(enabled: bool, dry: bool = False) -> dict:
+    """Flip [skills].include_instructions in Codex's config.
+
+    This is a GLOBAL switch: with false, Codex registers the skill but does not
+    put its instructions into context, so the agent cannot actually use it.
+    Only the user should decide to change it, hence an explicit flag.
+    """
+    cfg = _codex_config()
+    if not cfg.exists():
+        return {"action": "no-config", "config": str(cfg)}
+    text, eol = _read_text_keep_eol(cfg)
+    want = "true" if enabled else "false"
+    if re.search(r"(?m)^include_instructions\s*=\s*" + want + r"\s*$", text):
+        return {"action": "unchanged", "include_instructions": enabled}
+    if re.search(r"(?m)^include_instructions\s*=", text):
+        text = re.sub(r"(?m)^include_instructions\s*=\s*(true|false)\s*$",
+                      "include_instructions = " + want, text)
+    elif re.search(r"(?m)^\[skills\]\s*$", text):
+        text = re.sub(r"(?m)^\[skills\]\s*$", "[skills]\ninclude_instructions = " + want, text)
+    else:
+        text = text.rstrip("\n") + "\n\n[skills]\ninclude_instructions = " + want + "\n"
+    if dry:
+        return {"action": "would-set", "include_instructions": enabled}
+    shutil.copy2(cfg, cfg.with_suffix(cfg.suffix + ".findinfo.bak"))
+    _write_text_keep_eol(cfg, text, eol)
+    return {"action": "set", "include_instructions": enabled}
+
+
+def codex_unregister(dry: bool = False) -> dict:
+    cfg = _codex_config()
+    st = _codex_state()
+    if not st["registered"]:
+        return {"action": "unchanged", **st}
+    want = _codex_entry_path().lower()
+    text, eol = _read_text_keep_eol(cfg)
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        s = ln.strip()
+        if s.startswith("path") and "=" in s:
+            val = s.split("=", 1)[1].strip().strip("'\"")
+            if val.lower() == want:
+                # drop the whole entry: [[skills.config]] + path + enabled + blank
+                while out and not out[-1].strip():
+                    out.pop()
+                if out and out[-1].strip() == "[[skills.config]]":
+                    out.pop()
+                i += 1
+                while i < len(lines):
+                    nxt = lines[i].strip()
+                    if not nxt:
+                        i += 1
+                        continue
+                    if nxt.startswith(("enabled", "name", "description")):
+                        i += 1
+                        continue
+                    break
+                continue
+        out.append(ln)
+        i += 1
+    if dry:
+        return {"action": "would-unregister", **st}
+    if cfg.exists():
+        shutil.copy2(cfg, cfg.with_suffix(cfg.suffix + ".findinfo.bak"))
+    _write_text_keep_eol(cfg, "\n".join(out).rstrip("\n") + "\n", eol)
+    return {"action": "unregistered", **_codex_state()}
+
+
 # ---------------------------------------------------------------- commands
 def cmd_status(project: str | None) -> int:
     rows = []
@@ -133,7 +304,11 @@ def cmd_status(project: str | None) -> int:
         ok = state != "missing" and (dst / "SKILL.md").exists() and (dst / "findinfo.py").exists()
         rows.append({"client": kind, "path": str(dst), "state": state,
                      "resolved": resolved, "usable": ok})
-    print(json.dumps({"source": str(SOURCE), "targets": rows}, ensure_ascii=False, indent=2))
+    out = {"source": str(SOURCE), "targets": rows, "codex_config": _codex_state()}
+    if out["codex_config"].get("include_instructions") is False:
+        out["codex_config"]["warning"] = ("[skills].include_instructions = false，"
+                                          "Codex 不会把 skill 说明注入上下文")
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -171,14 +346,25 @@ def _install_one(kind: str, dst: Path, mode: str, force: bool, dry: bool) -> dic
         result["link_type"] = link_type
         return result
 
-    # never copy secret-bearing files into a shared/project location
-    shutil.copytree(SOURCE, dst, ignore=shutil.ignore_patterns(
-        "data", "cache", "runs", "_tmp", "__pycache__", "*.pyc", ".git",
-        ".env", "config.yaml"))
+    # copy mode: a self-contained skill directory.
+    # - secrets (.env, bin/config.yaml) are never copied to a shared location
+    # - rust build artifacts (target/) can be gigabytes and are rebuildable
+    # - OTHER platforms' bin dirs are excluded, but THIS platform's binaries
+    #   are included -- the old pattern list named all three, so a copy on
+    #   Linux shipped zero binaries and nothing ran
+    cur_platform = {"windows": "windows", "linux": "linux", "darwin": "darwin"}[
+        sys.platform if sys.platform in ("windows", "linux", "darwin")
+        else ("darwin" if sys.platform == "darwin" else "linux")]
+    other_platforms = {"windows", "linux", "darwin"} - {cur_platform}
+    ignore = ["data", "cache", "runs", "_tmp", "__pycache__", "*.pyc", ".git",
+              ".env", "config.yaml", "target", *sorted(other_platforms)]
+    shutil.copytree(SOURCE, dst, ignore=shutil.ignore_patterns(*ignore))
     (dst / MARKER).write_text(json.dumps(
-        {"skill": SKILL_NAME, "source": str(SOURCE), "mode": "copy"},
+        {"skill": SKILL_NAME, "source": str(SOURCE), "mode": "copy",
+         "bin_platform_included": cur_platform},
         ensure_ascii=False, indent=2), encoding="utf-8")
     result["action"] = "copied"
+    result["bin_platform_included"] = cur_platform
     return result
 
 
@@ -195,9 +381,15 @@ def cmd_install(project: str | None, targets_wanted: list[str], mode: str,
             continue
         results.append(_install_one(kind, dst, mode, force, dry))
 
+    # Codex 只认 config.toml 里的 [[skills.config]]，链接不够
+    codex_reg = None
+    if any(k in ("codex", "project-codex") for k in all_targets) and _selected("codex", targets_wanted, project):
+        codex_reg = codex_register(dry=dry)
+
     refused = [r for r in results if r.get("action") == "refused"]
     print(json.dumps({"source": str(SOURCE), "mode": mode, "dry_run": dry,
-                      "results": results}, ensure_ascii=False, indent=2))
+                      "results": results, "codex_config": codex_reg},
+                     ensure_ascii=False, indent=2))
     if refused:
         print("refused: " + ", ".join(r["client"] for r in refused), file=sys.stderr)
         return 3
@@ -220,7 +412,11 @@ def cmd_uninstall(project: str | None, wanted: list[str], dry: bool) -> int:
         if not dry:
             _remove_link(dst)
         removed.append({"client": kind, "path": str(dst), "action": "removed"})
-    print(json.dumps({"results": removed}, ensure_ascii=False, indent=2))
+    codex_reg = None
+    if _selected("codex", wanted, project):
+        codex_reg = codex_unregister(dry=dry)
+    print(json.dumps({"results": removed, "codex_config": codex_reg},
+                     ensure_ascii=False, indent=2))
     return 0
 
 
@@ -246,6 +442,12 @@ def cmd_verify(project: str | None) -> int:
             checks.append({"client": kind, "ok": False,
                            "reason": "doctor did not return JSON: " + repr(exc),
                            "stdout": proc.stdout[-300:], "stderr": proc.stderr[-300:]})
+    # Codex 的可用性取决于 config.toml 里的注册，不是目录是否存在
+    cs = _codex_state()
+    codex_ok = (not cs["exists"]) or cs["registered"]
+    checks.append({"client": "codex-config", "ok": codex_ok,
+                   "config": cs["config"], "registered": cs["registered"],
+                   "include_instructions": cs["include_instructions"]})
     print(json.dumps({"checks": checks}, ensure_ascii=False, indent=2))
     return 0 if all(c["ok"] for c in checks) else 1
 
@@ -257,23 +459,35 @@ def main(argv: list[str]) -> int:
                     help="comma list: agents,claude,codex,project-agents,project-claude")
     ap.add_argument("--project", default="", help="project dir for project-level install")
     ap.add_argument("--mode", choices=["link", "copy"], default="link")
+    ap.add_argument("--copy", action="store_true",
+                    help="shorthand for --mode copy (docstring mentioned it; "
+                         "the flag did not exist)")
     ap.add_argument("--force", action="store_true", help="replace a non-managed directory")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--enable-instructions", action="store_true",
+                    help="Codex: set [skills].include_instructions = true "
+                         "(global switch; without it Codex registers but does not "
+                         "read skill instructions)")
     args = ap.parse_args(argv)
 
     wanted = [t.strip() for t in args.targets.split(",") if t.strip()]
     project = args.project or None
+    mode = "copy" if args.copy else args.mode
 
     if args.status:
         return cmd_status(project)
     if args.verify:
         return cmd_verify(project)
+    if args.enable_instructions:
+        res = codex_set_instructions(True, dry=args.dry_run)
+        print(json.dumps({"codex_config": res}, ensure_ascii=False, indent=2))
+        return 0
     if args.uninstall:
         return cmd_uninstall(project, wanted, args.dry_run)
-    return cmd_install(project, wanted, args.mode, args.force, args.dry_run)
+    return cmd_install(project, wanted, mode, args.force, args.dry_run)
 
 
 if __name__ == "__main__":

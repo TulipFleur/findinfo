@@ -11,9 +11,29 @@ from __future__ import annotations
 
 import re
 
-DOMAIN = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|cn|net|org|io|co|cc|top|xyz|info|biz|vip|site|shop|cloud|tech|dev|app|me|tv|link|online|store|work|ltd|group|asia|us|hk|tw|jp|kr|sg))\b", re.I)
+# Generic alpha TLD: an explicit whitelist (com|cn|net|...) both missed real
+# multi-label suffixes (.com.au) and TRUNCATED matches -- "service.example.com.au"
+# was captured as "service.example.com". Consumers must still validate with a
+# hostname gate (core.canon_domain); this regex only shapes the token.
+# Boundaries are character classes, not \b: \b never fires between a Chinese
+# char and a letter (both are \w in unicode mode), so 域名example.com获取 was
+# invisible. Excluding "." at the END prevents mid-hostname truncation
+# (example.com.evil.io must not be captured as example.com.evil).
+DOMAIN = re.compile(
+    r"(?<![A-Za-z0-9.\-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24})"
+    r"(?![A-Za-z0-9.\-])", re.I)
 IPV4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
-API_PATH = re.compile(r"""["'\`](/[a-zA-Z0-9_\-./{}\$:]{2,120}?(?:api|v\d|internal|admin|auth|user|order|pay|upload|download|graphql|rest|gateway)[a-zA-Z0-9_\-./{}\$:]{0,80})["'\`]""", re.I)
+# A path is any quoted string starting with "/" that contains an API-ish
+# segment. The keyword may sit at the VERY START of the path (/api/login,
+# /admin, /graphql, /v1/health) -- the old regex required >=2 chars before it
+# and silently dropped exactly those. "/v\d" is anchored with a leading slash
+# so "version numbers" inside words (/avatar1) do not match.
+_API_KEYWORD = (r"api|internal|admin|auth|login|logout|sso|oauth|token|user|"
+                 r"order|pay|upload|download|graphql|rest|gateway|health|"
+                 r"console|dashboard|manage")
+API_PATH = re.compile(
+    r"""["'\`](/[\w\-./{}$:]*(?:""" + _API_KEYWORD + r"""|/v\d)[\w\-./{}$:]*)["'\`]""",
+    re.I)
 SOURCEMAP = re.compile(r"//[#@]\s*sourceMappingURL=([^\s]+)")
 SECRETS = {
     "aws_ak": re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),

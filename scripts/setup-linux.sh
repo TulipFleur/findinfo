@@ -9,10 +9,17 @@
 #   bash scripts/setup-linux.sh --only httpx,katana
 #
 # 卸载：删掉 --prefix 下这些文件即可，脚本不写其他地方。
+#
+# 退出码：0 必需工具全部就位 / 1 有必需工具缺失或安装失败（详见输出）。
+# 必需（核心被动+主动链路）：subfinder httpx dnsx naabu katana onepass
+# 可选：tlsx cdncheck chaos gau ffuf ksubdomain hostCollision enscan uncover
+# 每次成功安装会记录版本到 $PREFIX/.installed-versions（工具 → tag），
+# doctor 再按二进制实探版本，二者都可追溯。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PREFIX="${ROOT}/bin"
+# 与 core.py 的平台布局一致：bin/linux、bin/windows、bin/darwin
+PREFIX="${ROOT}/bin/linux"
 ARCH=""
 DRY=0
 CHECK=0
@@ -79,16 +86,50 @@ for c in python3 python; do
 done
 [ -n "$PY" ] || warn "没有 python 解释器，无法解析 GitHub API（安装: apt install -y python3）"
 
+# 必需 vs 可选：核心链路跑不起来才叫失败，缺可选工具只是提示
+REQUIRED_TOOLS="subfinder httpx dnsx naabu katana onepass"
+is_required() { case " $REQUIRED_TOOLS " in *" $1 "*) return 0 ;; *) return 1 ;; esac }
+
 if [ "$CHECK" -eq 1 ]; then
-  printf '%-12s %-10s %s\n' TOOL STATUS PATH
-  miss=0
-  for t in subfinder httpx dnsx naabu tlsx cdncheck uncover katana chaos gau ffuf ksubdomain onepass enscan; do
+  printf '%-12s %-10s %-8s %-12s %s\n' TOOL STATUS SOURCE VERSION PATH
+  miss_req=0; miss_opt=0
+  for t in subfinder httpx dnsx naabu tlsx cdncheck uncover katana chaos gau ffuf ksubdomain hostCollision onepass enscan; do
+    ver=""
     p="$PREFIX/$t"
     [ -x "$p" ] || p="$PREFIX/$t.exe"
-    if [ -x "$p" ]; then printf '%-12s %-10s %s\n' "$t" ok "$p";
-    elif command -v "$t" >/dev/null 2>&1; then printf '%-12s %-10s %s\n' "$t" ok "$(command -v "$t")";
-    else printf '%-12s %-10s %s\n' "$t" MISSING "-"; miss=$((miss+1)); fi
+    if [ -x "$p" ]; then
+      ver="$(grep -m1 "^$t " "$PREFIX/.installed-versions" 2>/dev/null | awk '{print $2}')"
+      [ -n "$ver" ] || ver="(未知：安装清单无记录)"
+      printf '%-12s %-10s %-8s %-12s %s\n' "$t" ok bundle "$ver" "$p"
+      continue
+    fi
+    q="$(command -v "$t" 2>/dev/null || true)"
+    if [ -n "$q" ]; then
+      # PATH 上的同名文件可能是别家的（例：Kali 的 python3-httpx 也装了 /usr/bin/httpx）
+      ident="$(timeout 8 "$q" -version 2>&1 | head -3 || true)"
+      case "$ident" in
+        *[Pp]roject[Dd]iscovery*|*v[0-9]*.[0-9]*.[0-9]*) printf '%-12s %-10s %-8s %-12s %s\n' "$t" ok path "(未记录)" "$q" ;;
+        *) printf '%-12s %-10s %-8s %-12s %s\n' "$t" FOREIGN path "(未记录)" "$q" ;;
+      esac
+      if is_required "$t"; then
+        case "$ident" in *[Pp]roject[Dd]iscovery*|*v[0-9]*.[0-9]*.[0-9]*) ;; *) miss_req=$((miss_req+1));; esac
+      fi
+    else
+      printf '%-12s %-10s %-8s %-12s %s\n' "$t" MISSING - "-" "-"
+      if is_required "$t"; then miss_req=$((miss_req+1)); else miss_opt=$((miss_opt+1)); fi
+    fi
   done
+  echo
+  if [ -d "${ROOT}/bin/windows" ] || [ -d "${ROOT}/bin/darwin" ]; then
+    echo "（bin/ 下还有其它平台目录：$(cd "${ROOT}/bin" && ls -d */ 2>/dev/null | tr '\n' ' ')）"
+  fi
+  echo "SOURCE: bundle = 已装到 $PREFIX；path = 来自 PATH（注意 FOREIGN 可能是同名但不同工具）"
+  echo "VERSION: 来自 $PREFIX/.installed-versions 安装清单；PATH 安装无法追溯版本"
+  [ "$miss_opt" -gt 0 ] && warn "缺少 $miss_opt 个可选工具（不影响核心链路）"
+  if [ "$miss_req" -gt 0 ]; then
+    warn "缺少 $miss_req 个必需工具（$REQUIRED_TOOLS）"
+    exit 1
+  fi
   [ -f "$PREFIX/../findinfo.py" ] && [ "$(command -v python3)" != "" ] && \
     (cd "$ROOT" && python3 findinfo.py doctor 2>/dev/null | head -c 600; echo)
   exit 0
@@ -97,54 +138,112 @@ fi
 # ---------------------------------------------------------------- 工具清单
 # 名称|仓库|资产过滤|二进制名
 if [ "$WITH_OPTIONAL" -eq 1 ]; then
-  TOOLS="subfinder|projectdiscovery/subfinder|linux_${ARCH}.zip|subfinder
-httpx|projectdiscovery/httpx|linux_${ARCH}.zip|httpx
-dnsx|projectdiscovery/dnsx|linux_${ARCH}.zip|dnsx
-naabu|projectdiscovery/naabu|linux_${ARCH}.zip|naabu
-tlsx|projectdiscovery/tlsx|linux_${ARCH}.zip|tlsx
-cdncheck|projectdiscovery/cdncheck|linux_${ARCH}.zip|cdncheck
-uncover|projectdiscovery/uncover|linux_${ARCH}.zip|uncover
-katana|projectdiscovery/katana|linux_${ARCH}.zip|katana
-chaos|projectdiscovery/chaos-client|linux_${ARCH}.zip|chaos
-gau|lc/gau|linux_${ARCH}.tar.gz|gau
-ffuf|ffuf/ffuf|linux_${ARCH}.tar.gz|ffuf
-ksubdomain|knownsec/ksubdomain|linux.zip|ksubdomain"
+  TOOLS="subfinder|projectdiscovery/subfinder|subfinder_{ver}_linux_${ARCH}.zip|subfinder
+httpx|projectdiscovery/httpx|httpx_{ver}_linux_${ARCH}.zip|httpx
+dnsx|projectdiscovery/dnsx|dnsx_{ver}_linux_${ARCH}.zip|dnsx
+naabu|projectdiscovery/naabu|naabu_{ver}_linux_${ARCH}.zip|naabu
+tlsx|projectdiscovery/tlsx|tlsx_{ver}_linux_${ARCH}.zip|tlsx
+cdncheck|projectdiscovery/cdncheck|cdncheck_{ver}_linux_${ARCH}.zip|cdncheck
+uncover|projectdiscovery/uncover|uncover_{ver}_linux_${ARCH}.zip|uncover
+katana|projectdiscovery/katana|katana_{ver}_linux_${ARCH}.zip|katana
+chaos|projectdiscovery/chaos-client|chaos-client_{ver}_linux_${ARCH}.zip|chaos
+gau|lc/gau|gau_{ver}_linux_${ARCH}.tar.gz|gau
+ffuf|ffuf/ffuf|ffuf_{ver}_linux_${ARCH}.tar.gz|ffuf
+ksubdomain|knownsec/ksubdomain|ksubdomain_linux.zip|ksubdomain
+hostCollision|alwaystest18/hostCollision|hostCollision_{ver}_linux_${ARCH}.tar.gz|hostCollision"
 else
-  TOOLS="subfinder|projectdiscovery/subfinder|linux_${ARCH}.zip|subfinder
-httpx|projectdiscovery/httpx|linux_${ARCH}.zip|httpx
-dnsx|projectdiscovery/dnsx|linux_${ARCH}.zip|dnsx
-naabu|projectdiscovery/naabu|linux_${ARCH}.zip|naabu
-tlsx|projectdiscovery/tlsx|linux_${ARCH}.zip|tlsx
-cdncheck|projectdiscovery/cdncheck|linux_${ARCH}.zip|cdncheck
-uncover|projectdiscovery/uncover|linux_${ARCH}.zip|uncover
-katana|projectdiscovery/katana|linux_${ARCH}.zip|katana"
+  TOOLS="subfinder|projectdiscovery/subfinder|subfinder_{ver}_linux_${ARCH}.zip|subfinder
+httpx|projectdiscovery/httpx|httpx_{ver}_linux_${ARCH}.zip|httpx
+dnsx|projectdiscovery/dnsx|dnsx_{ver}_linux_${ARCH}.zip|dnsx
+naabu|projectdiscovery/naabu|naabu_{ver}_linux_${ARCH}.zip|naabu
+tlsx|projectdiscovery/tlsx|tlsx_{ver}_linux_${ARCH}.zip|tlsx
+cdncheck|projectdiscovery/cdncheck|cdncheck_{ver}_linux_${ARCH}.zip|cdncheck
+uncover|projectdiscovery/uncover|uncover_{ver}_linux_${ARCH}.zip|uncover
+katana|projectdiscovery/katana|katana_{ver}_linux_${ARCH}.zip|katana
+hostCollision|alwaystest18/hostCollision|hostCollision_{ver}_linux_${ARCH}.tar.gz|hostCollision"
 fi
 
-api_get() { curl -fsSL --max-time 25 -H 'Accept: application/vnd.github+json' "$1" 2>/dev/null; }
+api_get() { # url body_file -> 打印 HTTP 状态码（000 = 网络不可达）
+  local hdr=()
+  [ -n "${GITHUB_TOKEN:-}" ] && hdr=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  curl -sSL --max-time 25 -o "$2" -w '%{http_code}' \
+       -H 'Accept: application/vnd.github+json' "${hdr[@]}" "$1" 2>/dev/null || echo 000
+}
 
 json_field() { # 从 stdin 的 JSON 里取顶层字符串字段
   [ -n "$PY" ] || return 1
   "$PY" -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1" 2>/dev/null
 }
 
-latest_tag() { # repo -> tag
-  api_get "https://api.github.com/repos/$1/releases/latest" | json_field tag_name
+latest_tag() { # repo -> tag；API 挂了就走 releases/latest 的 302（不需要 API）
+  local tmp code tag=""
+  tmp="$(mktemp)"
+  code="$(api_get "https://api.github.com/repos/$1/releases/latest" "${tmp}")"
+  if [ "${code}" = "200" ]; then
+    tag="$(json_field tag_name < "${tmp}")"
+  fi
+  rm -f "${tmp}"
+  if [ -z "${tag}" ]; then
+    tag="$(curl -sSI --max-time 25 "https://github.com/$1/releases/latest" 2>/dev/null \
+      | tr -d '\r' | awk -F'/tag/' '/^location:/ {print $2; exit}')"
+    if [ -n "${tag}" ]; then
+      [ "${code}" = "403" ] && warn "$1: GitHub API 限流（60/h，匿名共享出口 IP），已用 releases/latest 重定向拿到 ${tag}"
+      [ "${code}" = "000" ] && warn "$1: API 不可达，已用 releases/latest 重定向拿到 ${tag}"
+    fi
+  fi
+  printf '%s' "${tag}"
 }
 
-asset_url() { # repo tag filter -> browser_download_url
-  api_get "https://api.github.com/repos/$1/releases/tags/$2" \
-    | "$PY" -c '
-import json,sys
-tag, flt = sys.argv[1], sys.argv[2]
+asset_url() { # repo tag template -> 可用 URL（构造 + HEAD 校验，不依赖 API）
+  local repo="$1" tag="$2" tpl="$3" ver url code try
+  ver="${tag#v}"
+  url="https://github.com/${repo}/releases/download/${tag}/${tpl//\{ver\}/${ver}}"
+  # HEAD 探测有时会被代理打断（000），重试一次再下结论
+  for try in 1 2; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -L -I --max-time 30 "${url}")"
+    [ "${code}" = "200" ] && { printf '%s' "${url}"; return 0; }
+    sleep 2
+  done
+
+  # 命名不规律时再问一次 API（能通就用 API 的权威资产名）
+  local tmp c2
+  tmp="$(mktemp)"
+  c2="$(api_get "https://api.github.com/repos/${repo}/releases/tags/${tag}" "${tmp}")"
+  if [ "${c2}" = "200" ]; then
+    url="$("$PY" -c '
+import json, sys
+tpl, arch, path = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    d = json.load(sys.stdin)
+    d = json.load(open(path, encoding="utf-8"))
 except Exception:
     sys.exit(1)
+pre = tpl.split("{ver}")[0]
+suf = tpl.split("{ver}")[1] if "{ver}" in tpl else tpl[len(pre):]
+suf = suf.replace("{arch}", arch)
+best = ""
 for a in d.get("assets", []):
-    if flt in a.get("name", ""):
-        print(a.get("browser_download_url", ""))
-        break
-' "$2" "$3" 2>/dev/null
+    n = a.get("name", "")
+    low = n.lower()
+    # never pick checksums / sbom / signature files as the binary payload
+    if "checksum" in low or "sbom" in low or low.endswith((".txt", ".sig", ".sha256", ".intoto.jsonl")):
+        continue
+    if arch and arch not in n:
+        continue
+    if pre and not n.startswith(pre):
+        continue
+    if suf and not n.endswith(suf):
+        continue
+    best = a.get("browser_download_url", "")
+    break
+print(best)
+' "${tpl}" "${ARCH}" "${tmp}")"
+    rm -f "${tmp}"
+    [ -n "${url}" ] && { printf '%s' "${url}"; return 0; }
+  else
+    rm -f "${tmp}"
+  fi
+  warn "   构造的 URL 不可用（HTTP ${code}）：${url}"
+  return 1
 }
 
 extract_pkg() { # pkg destdir
@@ -168,19 +267,41 @@ mkdir -p "$PREFIX" || die "无法创建 $PREFIX"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-failed=""
+failed_req=""
+failed_opt=""
 ok=0
-while IFS='|' read -r name repo flt bin; do
+record_version() { # tool tag -> 追加/更新 $PREFIX/.installed-versions
+  local f="$PREFIX/.installed-versions"
+  touch "$f" 2>/dev/null || return 0
+  grep -v "^$1 " "$f" 2>/dev/null >"$f.tmp" || true
+  mv "$f.tmp" "$f"
+  echo "$1 $2" >> "$f"
+}
+while IFS='|' read -r name repo tpl bin; do
   [ -n "$name" ] || continue
   case "$ONLY" in
     "") ;;
     *) case ",$ONLY," in *,$name,*) ;; *) continue ;; esac ;;
   esac
+  # 幂等但不浪费：已装好的直接跳过，--force 才重下（重下 350MB 很贵）
+  if [ -x "$PREFIX/$name" ] && [ "$FORCE" -eq 0 ]; then
+    log "---- $name: already installed, skip (use --force to re-download)"
+    ok=$((ok+1))
+    continue
+  fi
   log "---- $name ($repo)"
   tag="$(latest_tag "$repo")"
-  if [ -z "$tag" ]; then warn "$name: 取不到 latest tag（网络或 API 限流），跳过"; continue; fi
-  url="$(asset_url "$repo" "$tag" "$flt")"
-  if [ -z "$url" ]; then warn "$name: $tag 没有匹配 '$flt' 的资产，跳过（可用 go install 自建）"; continue; fi
+  if [ -z "$tag" ]; then
+    warn "$name: 取不到版本号（API 403/不可达，且 releases/latest 也失败）；离线安装见 docs/LINUX.md"
+    if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
+    continue
+  fi
+  url="$(asset_url "$repo" "$tag" "$tpl")"
+  if [ -z "$url" ]; then
+    warn "$name: $tag 找不到资产 $tpl，跳过（可 go install 自建）"
+    if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
+    continue
+  fi
   log "     $tag -> $url"
   if [ "$DRY" -eq 1 ]; then
     code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 25 "$url")"
@@ -188,13 +309,30 @@ while IFS='|' read -r name repo flt bin; do
     continue
   fi
   pkg="$TMP/$name.$(basename "$url")"
-  if ! curl -fSL --max-time 300 -o "$pkg" "$url"; then warn "$name: 下载失败"; continue; fi
+  if ! curl -fSL --max-time 300 -o "$pkg" "$url"; then
+    warn "$name: 下载失败"
+    if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
+    continue
+  fi
   rm -rf "$TMP/x_$name"; mkdir -p "$TMP/x_$name"
-  if ! extract_pkg "$pkg" "$TMP/x_$name"; then warn "$name: 解包失败（缺 unzip/tar？）"; continue; fi
+  if ! extract_pkg "$pkg" "$TMP/x_$name"; then
+    warn "$name: 解包失败（缺 unzip/tar？）"
+    if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
+    continue
+  fi
   src="$(pick_binary "$TMP/x_$name" "$bin")"
-  if [ -z "$src" ]; then warn "$name: 解包后找不到可执行文件"; continue; fi
-  if ! install -m 0755 "$src" "$PREFIX/$name"; then warn "$name: 安装到 $PREFIX 失败（需要写权限？用 --prefix 或 sudo）"; continue; fi
-  log "     installed -> $PREFIX/$name"
+  if [ -z "$src" ]; then
+    warn "$name: 解包后找不到可执行文件"
+    if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
+    continue
+  fi
+  if ! install -m 0755 "$src" "$PREFIX/$name"; then
+    warn "$name: 安装到 $PREFIX 失败（需要写权限？用 --prefix 或 sudo）"
+    if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
+    continue
+  fi
+  record_version "$name" "$tag"
+  log "     installed -> $PREFIX/$name ($tag)"
   ok=$((ok+1))
 done < <(printf '%s\n' "$TOOLS")
 log "GitHub 二进制作业完成（本次安装 $ok 个）"
@@ -205,14 +343,19 @@ if [ "$WITH_ONEPASS" -eq 1 ]; then
     log "---- onepass（cargo build --release）"
     if [ "$DRY" -eq 1 ]; then log "     dry-run: 跳过编译"; else
       if bash "$ROOT/scripts/build-onepass.sh" >/dev/null 2>&1; then
-        if [ -f "$ROOT/bin/onepass" ]; then install -m 0755 "$ROOT/bin/onepass" "$PREFIX/onepass"; fi
+        if [ -f "$ROOT/bin/onepass" ]; then
+          install -m 0755 "$ROOT/bin/onepass" "$PREFIX/onepass" && \
+            record_version onepass "$(grep -m1 '^version' "$ROOT/rust/onepass/Cargo.toml" | sed 's/[^0-9.]*//g')"
+        fi
         log "     installed -> $PREFIX/onepass"
       else
         warn "onepass 编译失败（cargo 报错见 scripts/build-onepass.sh 输出）"
+        failed_req="$failed_req onepass"
       fi
     fi
   else
     warn "无 cargo，跳过 onepass（apt install -y cargo 或 rustup 后重跑）"
+    failed_req="$failed_req onepass"
   fi
 fi
 
@@ -226,10 +369,12 @@ if [ "$WITH_ENSCAN" -eq 1 ]; then
         [ -f "$src" ] && install -m 0755 "$src" "$PREFIX/enscan" && log "     installed -> $PREFIX/enscan"
       else
         warn "enscan 编译失败（entity 阶段不可用；被动/主动其余阶段不受影响）"
+        failed_opt="$failed_opt enscan"
       fi
     fi
   else
     warn "无 go，跳过 enscan（entity 阶段不可用）"
+    failed_opt="$failed_opt enscan"
   fi
 fi
 
@@ -259,10 +404,9 @@ cat <<'EOF'
   sysctl -w net.ipv4.tcp_tw_reuse=1
 
 [setup] 下一步:
-  1) 授权范围:  cp config/scope.example.json config/scope.json   # 填 domains/cidrs
-  2) API Key :  cp config/.env.example config/.env               # 可留空
-  3) 企业信息:  cp bin/config.example.yaml bin/config.yaml        # 填 aiqicha Cookie
-  4) 自检    :  python3 findinfo.py doctor
+  1) API Key :  cp config/.env.example config/.env               # 可留空
+  2) 企业信息:  cp bin/config.example.yaml bin/config.yaml        # 填 aiqicha Cookie
+  3) 自检    :  python3 findinfo.py doctor
 EOF
 
 if [ "$DRY" -eq 0 ] && need python3 && [ -f "$ROOT/findinfo.py" ]; then
@@ -270,4 +414,14 @@ if [ "$DRY" -eq 0 ] && need python3 && [ -f "$ROOT/findinfo.py" ]; then
   (cd "$ROOT" && python3 findinfo.py doctor 2>/dev/null | head -c 1200) || true
   echo
 fi
+
+# ---------------------------------------------------------------- 退出码
+# 0 = 必需工具全部就位；1 = 有必需工具安装失败（可选工具失败只提示）。
+if [ -n "$failed_req" ]; then
+  warn "必需工具安装失败：$failed_req（核心链路缺件，退出码 1）"
+fi
+if [ -n "$failed_opt" ]; then
+  warn "可选工具安装失败：$failed_opt（不阻塞，按需补装）"
+fi
+[ -n "$failed_req" ] && exit 1
 exit 0

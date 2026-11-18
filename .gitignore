@@ -17,3 +17,9 @@ __pycache__/
 # build artifacts
 rust/onepass/target/
 bin/*.exe
+# per-platform binaries (bin/windows, bin/linux, bin/darwin) are never tracked
+bin/*/
+
+# runtime binary state & agent session logs
+bin/*.gob
+agent-records/

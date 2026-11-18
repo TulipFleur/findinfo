@@ -65,22 +65,28 @@ pub fn under(host: &str, root: &str) -> bool {
 /// This is the single extractor used by every source: it does not care about
 /// the response format, only about hostname-shaped tokens. That is why adding
 /// a source needs no parser code.
+///
+/// UTF-8 safety: `i` only ever advances to a char boundary (`is_char_boundary`
+/// check), because slicing `text[i..]` mid-codepoint panics. Non-ASCII bodies
+/// (Chinese pages, emoji) hit this constantly. The backward/forward walks are
+/// safe by construction: they only step over ASCII bytes, and every position
+/// they can reach from a boundary is itself a boundary.
 pub fn extract_hosts(text: &str, root: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let bytes = text.as_bytes();
     let root_b = root.as_bytes();
     let mut i = 0usize;
     while i + root_b.len() <= bytes.len() {
-        // fast skip: look for start of root
-        if !text[i..].starts_with(root) {
+        // fast skip to the next char boundary and look for the start of root
+        if !text.is_char_boundary(i) || !text[i..].starts_with(root) {
             i += 1;
             continue;
         }
         // walk backwards to the beginning of the hostname token
         let mut start = i;
         while start > 0 {
-            let c = bytes[start - 1] as char;
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '*' {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_' || c == b'*' {
                 start -= 1;
             } else {
                 break;
@@ -89,8 +95,8 @@ pub fn extract_hosts(text: &str, root: &str) -> Vec<String> {
         // walk forward to the end of the token
         let mut end = i + root_b.len();
         while end < bytes.len() {
-            let c = bytes[end] as char;
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_' {
                 end += 1;
             } else {
                 break;
@@ -111,6 +117,53 @@ pub fn extract_hosts(text: &str, root: &str) -> Vec<String> {
         i = end.max(i + 1);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_subdomains_under_root() {
+        let got = extract_hosts("www.example.com api.example.com example.com", "example.com");
+        assert!(got.contains(&"www.example.com".to_string()));
+        assert!(got.contains(&"api.example.com".to_string()));
+        assert!(got.contains(&"example.com".to_string()));
+    }
+
+    #[test]
+    fn utf8_bodies_do_not_panic() {
+        // Chinese + emoji + escaped JSON text mixed with domains
+        let text = "欢迎访问 example.com 中文内容 🚀 再看 sub.example.com \
+                    \"\\nfoo.example.com\" 结尾 api.example.com\u{1F680}";
+        let got = extract_hosts(text, "example.com");
+        assert!(got.iter().any(|h| h == "sub.example.com"));
+        assert!(got.iter().any(|h| h == "api.example.com"));
+    }
+
+    #[test]
+    fn similar_suffixes_are_excluded() {
+        // notexample.com / evil-example.com / sub.example.com.attacker.io
+        // contain the root bytes but are NOT under it
+        let got = extract_hosts(
+            "notexample.com evil-example.com sub.example.com.attacker.io",
+            "example.com",
+        );
+        assert!(got.is_empty(), "got {:?}", got);
+    }
+
+    #[test]
+    fn out_of_scope_hosts_excluded() {
+        let got = extract_hosts("www.other.org www.example.com", "example.com");
+        assert_eq!(got, vec!["www.example.com".to_string()]);
+    }
+
+    #[test]
+    fn multibyte_adjacent_text_is_not_swallowed() {
+        // the token must stop at the Chinese bytes, not include them
+        let got = extract_hosts("中文example.com", "example.com");
+        assert_eq!(got, vec!["example.com".to_string()]);
+    }
 }
 
 /// Stable dedupe, preserving first-seen order.
