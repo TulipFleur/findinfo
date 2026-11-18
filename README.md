@@ -131,7 +131,7 @@ flowchart TD
 | docs/TOOLS.md | 每个命令的参数、输出 JSON、示例 |
 | lib/report.py | 最终交付生成器：`report` 的 json(给 AI) / md / html(给人) 三种产物 |
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
-| docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd/Docker、故障排查 |
+| docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd、故障排查 |
 | docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex / Claude Desktop）加载机制与坑 |
 | prompts/AGENT.md | **给新会话 agent 的完整工作流提示词**（复制即用，含收敛判据） |
 

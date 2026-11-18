@@ -42,10 +42,10 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 `-p/--print` 只回显将要执行的命令（不执行），适合先确认参数；`-m steps` 把被动阶段拆开跑（`passive→certs→subs→icp→dns`），主动阶段仍交给 `run`（带断点/心跳）。
 数据写入用户级目录（默认 `~/.findinfo`），与 skill 代码目录分离；`doctor` 的 `root`/`home`/`db` 字段可确认实际位置。
 **工具必须在 skill 目录内**：`doctor` 的 `tools_summary` 会直接回答这件事——
-`all_in_bin: true` 表示 16 个工具全部解析到 `<skill>/bin`，没有任何一个从 `PATH` 借来。
+`all_in_bin: true` 表示 13 个工具全部解析到 `<skill>/bin/<platform>/`，没有任何一个从 `PATH` 借来。
 每个工具条目还带 `source: bundle|path`；出现 `path` 就说明会依赖别处的同名二进制
 （典型坑：Kali 自带 `python3-httpx` 占了 `/usr/bin/httpx`），此时 `doctor` 也会给 `suspect`/`hint`。
-修法：`bash scripts/setup-linux.sh --prefix <skill>/bin`（Windows 直接用内置 `bin/*.exe`）。
+修法：`bash scripts/setup-linux.sh`（装到 `<skill>/bin/linux`；Windows 直接用内置 `bin/windows/*.exe`）。
 
 > 新会话接手时，最省事的方式是直接采用 `prompts/AGENT.md`（完整工作流提示词：定位 skill → 快速出结果 → 加深 → 回流收敛 → 交付模板）。
 
@@ -92,7 +92,7 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 ### B. 自检（10 秒，决定能力边界）
 
 ```bash
-python findinfo.py doctor          # 16 个工具是否都在 bin/ + 哪些 key 可用
+python findinfo.py doctor          # 13 个工具是否都在 bin/ + 哪些 key 可用
 python findinfo.py runs --active   # 是否已有在跑的任务（先看，别重复起）
 ```
 
@@ -410,11 +410,11 @@ findinfo/
 ├── findinfo.py         ← CLI 入口（19 个子命令）
 ├── prompts/AGENT.md    ← ★ 新会话工作流提示词（含交付模板）
 ├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
-│   ├── windows/        ← 16 个 .exe（Windows 预置；doctor 追踪 16 个，含可选 jsluice）
+│   ├── windows/        ← 13 个 .exe（Windows 预置；doctor 追踪 13 个，含可选 jsluice）
 │   ├── linux/          ← ELF（scripts/setup-linux.sh 装必需+PD 家族；jsluice 用 go install 自备）
 │   └── config.example.yaml  ← ENScan Cookie 模板 → 复制成 bin/config.yaml
 ├── rust/onepass/       ← onepass 源码（15 源被动聚合，cargo build --release）
-├── Dockerfile          ← Linux 镜像（多阶段编译 onepass/ENScan）
+
 ├── deploy/             ← systemd 模板（findinfo@.service / .timer）
 ├── lib/
 │   ├── core.py         ← 配置/存储/归一化/缓存/限速/执行
@@ -427,7 +427,7 @@ findinfo/
 ├── docs/
 │   ├── API-KEYS.md     ← ★ 哪些需要 key / 申请地址 / 免费额度
 │   ├── TOOLS.md        ← 每个命令的详细参数与输出示例
-│   ├── LINUX.md        ← Linux 部署（二进制/CAP_NET_RAW/systemd/Docker）
+│   ├── LINUX.md        ← Linux 部署（二进制/CAP_NET_RAW/systemd）
 │   └── CLIENTS.md      ← 各客户端加载机制差异与排错
 ├── wordlists/          ← 字典（brute / vhost 用，均为裸标签）
 │   ├── sub.txt         ← 174 条高价值前缀（内部系统/中间件，先跑这个）

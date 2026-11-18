@@ -63,7 +63,7 @@ case "$uname_s" in
     elif [ "$DRY" -eq 1 ]; then
       warn "当前是 $uname_s，非 Linux；--dry-run 只输出计划（不下载不安装）"
     else
-      die "本脚本只用于 Linux（当前 $uname_s）。Windows 直接用 bin\\*.exe；容器请看 Dockerfile。"
+      die "本脚本只用于 Linux（当前 $uname_s）。Windows 直接用 bin\\windows\\*.exe。"
     fi
     ;;
 esac

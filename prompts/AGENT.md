@@ -22,7 +22,7 @@ echo "SKILL=$SKILL"
 cd "$SKILL" && python findinfo.py doctor
 ```
 
-`doctor` 必须满足：`tools_summary.all_in_bin == true` 且 `in_bin == 16`。
+`doctor` 必须满足：`tools_summary.all_in_bin == true`（13 个工具全部在 `bin/<platform>/`）。
 不满足就停止并把 `tools_summary` 原样报给用户（不要自己装工具）。
 以 `doctor` 返回的 `bin_dir`/`root`/`home` 作为后续所有路径的依据。
 

@@ -7,10 +7,10 @@
 
 | 项 | Windows | Linux |
 |---|---|---|
-| 15 个工具 | `bin/windows/*.exe` 已内置 | `scripts/setup-linux.sh` 现场安装 |
+| 13 个工具 | `bin/windows/*.exe` 已内置 | `scripts/setup-linux.sh` 现场安装 |
 | 装到客户端 | junction | symlink（`install.py` 自动判断） |
 | 端口扫描 / DNS 爆破 | 管理员 + Npcap | `CAP_NET_RAW` + libpcap |
-| 长任务 | 前台 / `nohup` | systemd / tmux / Docker |
+| 长任务 | 前台 / `nohup` | systemd / tmux |
 | 终止子进程 | `CREATE_NO_WINDOW` | 无（该参数在 Linux 是 no-op） |
 
 ## 1. 快速开始
@@ -46,7 +46,7 @@ python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 
 ~~~text
 bin/
-├── windows/    ← 16 个 .exe（Windows 预置；doctor 追踪 16 个，含可选 jsluice）
+├── windows/    ← 13 个 .exe（Windows 预置；doctor 追踪 13 个，含可选 jsluice）
 ├── linux/      ← ELF（setup-linux.sh 装必需+PD 家族；jsluice 需 go install 自备，见下）
 └── config.example.yaml
 ~~~
@@ -137,21 +137,6 @@ sudo systemctl enable --now 'findinfo@example.com.timer' # 每天 04:17 被动�
 ~~~
 
 单元文件里已经处理了三件事：`FINDINFO_HOME` 指向 `/var/lib/findinfo`、`TimeoutStartSec=3h`（长流程）、`AmbientCapabilities=CAP_NET_RAW`。
-
-### 5.3 Docker
-
-~~~bash
-docker build -t findinfo:latest .
-docker run --rm -it --cap-add=NET_RAW --network=host \
-  -v "$$PWD/config:/opt/findinfo/config" \
-  -v findinfo-data:/data \
-  findinfo:latest doctor
-docker run --rm --cap-add=NET_RAW --network=host -v "$PWD/config:/opt/findinfo/config" \
-  -v findinfo-data:/data findinfo:latest run --domain example.com
-~~~
-
-镜像内：13 个 GitHub 工具装在 `/usr/local/bin`，onepass 与 ENScan 在镜像构建阶段编译（ENScan 源不可达时会跳过并打印提示，不阻塞镜像）。
-数据卷挂 `/data`（对应 `FINDINFO_HOME`），配置挂 `config/`。
 
 ## 6. 与 Windows 的差异
 
