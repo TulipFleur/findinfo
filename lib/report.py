@@ -613,6 +613,9 @@ def collect(store, match=None, min_conf=0.4, limit=300, ep_limit=400,
         "assets_total": all_counts,
         "environment": {"platform": core.PLATFORM, "warnings": warnings},
         "hosts": hosts[:limit],
+        # html/md render the whole list; json keeps the capped view so an
+        # agent can always read the digest in one go
+        "hosts_all": hosts,
         "hosts_total": len(hosts),
         "internal_services": [h for h in hosts if h["internal"]][:limit],
         "endpoints": ep_records,
@@ -685,7 +688,7 @@ def build_md(data) -> str:
             out.append("- " + w)
         out.append("")
 
-    hosts = data["hosts"]
+    hosts = data.get("hosts_all") or data["hosts"]
     out.append("## 3. 高价值主机（前 " + str(min(len(hosts), 40)) + " / 共 "
                + str(data["hosts_total"]) + "）")
     out.append("")
@@ -794,29 +797,6 @@ def build_md(data) -> str:
         out.append("_资产来源信息为空（资产库中没有范围内记录）。_")
         out.append("")
 
-    stages = data["stages"]
-    out.append("## 8. 阶段执行记录")
-    out.append("")
-    if stages:
-        out.append("| 阶段 | 状态 | 更新时间 |")
-        out.append("| --- | --- | --- |")
-        for s in stages:
-            out.append("| " + s["step"] + " | " + str(s["status"]) + " | "
-                       + str(s["updated_at"]) + " |")
-        out.append("")
-    else:
-        out.append("_资产库中没有阶段记录（本次报告直接读库生成，未经 run 编排）。_")
-        out.append("")
-
-    steps = data["next_steps"] or []
-    out.append("## 9. 下一步")
-    out.append("")
-    for i, s in enumerate(steps, 1):
-        out.append(str(i) + ". " + s)
-    if not steps:
-        out.append("_无。_")
-    out.append("")
-
     out.append("---")
     out.append("")
     out.append("同目录另有 report.html（可视化看板，可直接转发/打印）与 report.json"
@@ -887,6 +867,155 @@ color:var(--dim);font-size:12px}
 .panel,.card{background:#fff;border-color:#ddd}.bars .fill{background:#4a63d8}
 th{background:#f2f4f8;color:#555}td{border-color:#e5e5e5}.tag{color:#555;border-color:#ddd}
 .host{color:#123}.mono{color:#333}h2{color:#2b3fa0}}
+/* --- collapsible sections + table controls --- */
+.sec-head{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;
+margin:0 0 12px;padding:0}
+.sec-head h2{margin:0}
+.sec-head .chev{color:var(--dim);font-size:11px;transition:transform .15s;display:inline-block}
+.sec-head.collapsed .chev{transform:rotate(-90deg)}
+.sec-head:hover h2{filter:brightness(1.15)}
+.sec-body{overflow:hidden}
+.sec-body.hidden{display:none}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px;
+padding:10px 12px;background:var(--panel2);border:1px solid var(--line);
+border-radius:8px;font-size:12.5px}
+.toolbar input[type=search],.toolbar select{background:#12151b;border:1px solid var(--line);
+color:var(--fg);border-radius:6px;padding:4px 8px;font-size:12.5px;font-family:inherit}
+.toolbar input[type=search]{min-width:200px}
+.toolbar .cnt{color:var(--dim);margin-left:auto;font-variant-numeric:tabular-nums}
+.toolbar .cnt b{color:var(--fg)}
+.toolbar button{background:#1d2534;border:1px solid var(--line);color:#b9c6da;
+border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;font-family:inherit}
+.toolbar button:hover{background:#25303f;color:#fff}
+.pager{display:flex;gap:6px;align-items:center;justify-content:center;margin:12px 0 0;
+font-size:12.5px;color:var(--dim)}
+.pager button{min-width:30px}
+.pager button:disabled{opacity:.35;cursor:default}
+.pager .info{margin:0 10px;font-variant-numeric:tabular-nums}
+h2 .badge{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:20px;
+font-size:11px;background:#1d2534;border:1px solid var(--line);color:#9fb0c8;
+font-weight:400;vertical-align:middle}
+tr.dup td{opacity:.62}
+tr.dup:hover td{opacity:1}
+.dupmark{display:inline-block;font-size:10.5px;color:#8d97a8;border:1px dashed #3a4150;
+border-radius:4px;padding:0 5px;margin-left:6px}
+@media print{.toolbar,.pager{display:none}.sec-body.hidden{display:block}}"""
+
+
+
+_JS = """
+(function(){
+  // ---- collapsible sections -------------------------------------------------
+  document.querySelectorAll(".sec-head").forEach(function(h){
+    h.addEventListener("click", function(){
+      var body = document.getElementById(h.dataset.target);
+      if(!body) return;
+      var hidden = body.classList.toggle("hidden");
+      h.classList.toggle("collapsed", hidden);
+    });
+  });
+
+  // ---- table controls: search / status / source / dup-collapse / paging ----
+  function uniq(arr){var s={},o=[];arr.forEach(function(v){if(v&&!s[v]){s[v]=1;o.push(v);}});return o.sort();}
+
+  document.querySelectorAll(".toolbar").forEach(function(tb){
+    var uid = tb.dataset.for;
+    var body = document.getElementById(uid);
+    if(!body) return;
+    var table = body.querySelector("table");
+    var tbody = table && table.querySelector("tbody");
+    if(!tbody) return;
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+    var pager = document.querySelector('.pager[data-for="' + uid + '"]');
+    var per = pager ? parseInt(pager.dataset.per, 10) : 50;
+    var page = 1;
+    var hideDup = false;
+
+    // populate status + source dropdowns from the rows themselves
+    var statusSel = tb.querySelector('[data-role="status"]');
+    var srcSel = tb.querySelector('[data-role="source"]');
+    if(statusSel){
+      uniq(rows.map(function(r){return r.dataset.status;})).forEach(function(v){
+        var o=document.createElement("option"); o.value=v; o.textContent=v; statusSel.appendChild(o);
+      });
+    }
+    if(srcSel){
+      var srcs=[];
+      rows.forEach(function(r){(r.dataset.src||"").split("|").forEach(function(s){if(s)srcs.push(s);});});
+      uniq(srcs).forEach(function(v){
+        var o=document.createElement("option"); o.value=v; o.textContent=v; srcSel.appendChild(o);
+      });
+    }
+
+    function match(r){
+      var q = (tb.querySelector('[data-role="q"]')||{}).value || "";
+      q = q.trim().toLowerCase();
+      if(q && (r.textContent||"").toLowerCase().indexOf(q) === -1) return false;
+      if(statusSel && statusSel.value && r.dataset.status !== statusSel.value) return false;
+      if(srcSel && srcSel.value && (r.dataset.src||"").split("|").indexOf(srcSel.value) === -1) return false;
+      if(hideDup && r.dataset.dup === "1") return false;
+      return true;
+    }
+
+    function render(){
+      var hits = rows.filter(match);
+      var pages = Math.max(1, Math.ceil(hits.length / per));
+      if(page > pages) page = pages;
+      var start = (page - 1) * per, end = start + per;
+      rows.forEach(function(r){ r.style.display = "none"; });
+      hits.slice(start, end).forEach(function(r){ r.style.display = ""; });
+      var shown = tb.querySelector('[data-role="shown"]');
+      if(shown) shown.textContent = hits.length;
+      if(pager){
+        var cur = pager.querySelector('[data-role="cur"]');
+        if(cur) cur.textContent = page;
+        var pagesEl = pager.querySelector(".info b:last-of-type");
+        pager.querySelectorAll("button").forEach(function(b){ b.disabled = false; });
+        if(page <= 1){
+          pager.querySelector('[data-role="first"]').disabled = true;
+          pager.querySelector('[data-role="prev"]').disabled = true;
+        }
+        if(page >= pages){
+          pager.querySelector('[data-role="next"]').disabled = true;
+          pager.querySelector('[data-role="last"]').disabled = true;
+        }
+        var info = pager.querySelector(".info");
+        if(info) info.innerHTML = '第 <b>' + page + '</b> / ' + pages + ' 页';
+      }
+    }
+
+    tb.addEventListener("input", function(e){
+      if(e.target.dataset.role === "q"){ page = 1; render(); }
+    });
+    tb.addEventListener("change", function(e){
+      if(e.target.dataset.role === "status" || e.target.dataset.role === "source"){ page = 1; render(); }
+    });
+    tb.addEventListener("click", function(e){
+      var role = e.target.dataset.role;
+      if(role === "reset"){
+        tb.querySelectorAll("input,select").forEach(function(el){ el.value = ""; });
+        hideDup = false; page = 1; render();
+      } else if(role === "duptoggle"){
+        hideDup = !hideDup;
+        e.target.textContent = hideDup ? "显示重复标题" : "折叠重复标题";
+        page = 1; render();
+      }
+    });
+    if(pager){
+      pager.addEventListener("click", function(e){
+        var role = e.target.dataset.role;
+        var pages = Math.max(1, Math.ceil(rows.filter(match).length / per));
+        if(role === "first") page = 1;
+        else if(role === "prev") page = Math.max(1, page - 1);
+        else if(role === "next") page = Math.min(pages, page + 1);
+        else if(role === "last") page = pages;
+        else return;
+        render();
+      });
+    }
+    render();
+  });
+})();
 """
 
 
@@ -930,26 +1059,54 @@ def _kpi(value, label, kind=""):
             + '</div><div class="k">' + _esc(label) + "</div></div>")
 
 
-def _host_rows(hosts, limit=60):
+def _host_rows(hosts):
+    """Render every host row; filtering/paging happens client-side.
+
+    Each <tr> carries data-pri / data-status / data-src / data-dup so the
+    toolbar can filter without re-querying, and duplicate titles stay
+    collapsible instead of being silently truncated to 60 rows.
+    """
     if not hosts:
         return '<tr><td colspan="8" class="empty">无范围内主机</td></tr>'
     rows = []
-    for h in hosts[:limit]:
+    seen_titles = {}
+    for h in hosts:
         tags = "".join('<span class="tag tch">' + _esc(t, 24) + "</span>"
                        for t in h["tech"][:6])
         srcs = "".join('<span class="tag src">' + _esc(s, 28) + "</span>"
                        for s in h["provenance"][:5])
         if h["internal"]:
-            srcs = '<span class="tag src" style="color:#ff9d9d;border-color:#6b2020">内部服务</span>' + srcs
+            srcs = ('<span class="tag src" style="color:#ff9d9d;border-color:#6b2020">'
+                    "内部服务</span>" + srcs)
         reasons = "；".join(_esc(r, 70) for r in h["reasons"][:3])
+        # duplicate titles: first occurrence is the canonical row, later ones
+        # are marked so the UI can collapse them behind a toggle
+        title = (h["title"] or "").strip()
+        dup = False
+        dup_note = ""
+        if title:
+            if title in seen_titles:
+                dup = True
+                seen_titles[title] += 1
+                dup_note = '<span class="dupmark">重复 ×' + str(seen_titles[title]) + "</span>"
+            else:
+                seen_titles[title] = 1
+        status_txt = h["status"] if h["status"] is not None else "-"
+        src_attr = "|".join(h["provenance"]) if h["provenance"] else ""
         rows.append(
-            "<tr><td><span class=\"pri " + h["priority"] + '">' + _esc(h["priority"])
+            '<tr data-pri="' + _esc(h["priority"]) + '"'
+            + ' data-status="' + _esc(status_txt) + '"'
+            + ' data-src="' + _esc(src_attr) + '"'
+            + ' data-title="' + _esc(title) + '"'
+            + (' data-dup="1"' if dup else "")
+            + (' class="dup"' if dup else "") + ">"
+            + "<td><span class=\"pri " + h["priority"] + '">' + _esc(h["priority"])
             + "</span></td>"
             + '<td><span class="host">' + _esc(h["host"]) + "</span>"
             + ('<br><span class="meta">' + _esc(h["ip"]) + "</span>" if h["ip"] else "")
             + '</td><td><span class="st ' + _status_class(h["status"]) + '">'
-            + _esc(h["status"] if h["status"] is not None else "-") + "</span></td>"
-            + "<td>" + _esc(h["title"], 60) + "</td>"
+            + _esc(status_txt) + "</span></td>"
+            + "<td>" + _esc(title, 60) + dup_note + "</td>"
             + "<td>" + (tags or '<span class="meta">-</span>') + "</td>"
             + "<td>" + (srcs or '<span class="meta">-</span>') + "</td>"
             + '<td><span class="st">' + str(h["score"]) + "</span></td>"
@@ -957,21 +1114,76 @@ def _host_rows(hosts, limit=60):
     return "".join(rows)
 
 
-def _endpoint_rows(eps, limit=60):
+def _endpoint_rows(eps):
+    """Render every endpoint row; filtering/paging happens client-side."""
     if not eps:
         return '<tr><td colspan="6" class="empty">无带参数或敏感路径端点</td></tr>'
     rows = []
-    for e in eps[:limit]:
+    for e in eps:
+        status_txt = e["status"] if e["status"] is not None else "-"
         rows.append(
-            '<tr><td><span class="host">' + _esc(e["host"]) + "</span></td>"
+            '<tr data-host="' + _esc(e["host"]) + '"'
+            + ' data-method="' + _esc(e["method"]) + '"'
+            + ' data-status="' + _esc(status_txt) + '"'
+            + ' data-src="' + _esc(e["provenance"]) + '"'
+            + ">"
+            + '<td><span class="host">' + _esc(e["host"]) + "</span></td>"
             + "<td>" + _esc(e["method"]) + "</td>"
             + '<td class="mono">' + _esc(e["path"], 90) + "</td>"
             + '<td class="mono">' + _esc(", ".join(e["params"][:5]), 60) + "</td>"
             + '<td><span class="st ' + _status_class(e["status"]) + '">'
-            + _esc(e["status"] if e["status"] is not None else "-") + "</span></td>"
+            + _esc(status_txt) + "</span></td>"
             + '<td><span class="tag src">' + _esc(e["provenance"])
             + "</span> " + _esc("；".join(e["why"]), 60) + "</td></tr>")
     return "".join(rows)
+
+
+
+
+def _section(title, subtitle="", collapsed=False, body_id=""):
+    """Open a collapsible section. Pair with _section_end().
+
+    A collapsed section keeps the report short: the caller still emits the
+    full table, it is just display:none until the header is clicked.
+    """
+    cls = "sec-head collapsed" if collapsed else "sec-head"
+    sub = ("<span>" + _esc(subtitle) + "</span>") if subtitle else ""
+    return ('<section><div class="' + cls + '" data-target="' + body_id + '">'
+            + '<span class="chev"></span><h2>' + _esc(title) + sub + "</h2></div>"
+            + '<div class="sec-body' + (" hidden" if collapsed else "")
+            + '" id="' + body_id + '">')
+
+
+def _section_end():
+    return "</div></section>"
+
+
+def _toolbar(uid, status=True, source=True, dup=False, total=0):
+    """Filter/search toolbar bound to the table that follows it."""
+    parts = ['<div class="toolbar" data-for="' + uid + '">']
+    parts.append('<input type="search" data-role="q" placeholder="搜索主机 / 路径 / 标题...">')
+    if status:
+        parts.append('<select data-role="status"><option value="">全部状态</option></select>')
+    if source:
+        parts.append('<select data-role="source"><option value="">全部来源</option></select>')
+    if dup:
+        parts.append('<button type="button" data-role="duptoggle">折叠重复标题</button>')
+    parts.append('<button type="button" data-role="reset">重置</button>')
+    parts.append('<span class="cnt">显示 <b data-role="shown">0</b> / ' + str(total) + "</span>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _pager(uid, total, per_page=50):
+    pages = max(1, (total + per_page - 1) // per_page)
+    return ('<div class="pager" data-for="' + uid + '" data-per="' + str(per_page)
+            + '" data-pages="' + str(pages) + '">'
+            + '<button type="button" data-role="first">&laquo;</button>'
+            + '<button type="button" data-role="prev">&lsaquo;</button>'
+            + '<span class="info">第 <b data-role="cur">1</b> / ' + str(pages) + " 页</span>"
+            + '<button type="button" data-role="next">&rsaquo;</button>'
+            + '<button type="button" data-role="last">&raquo;</button>'
+            + "</div>")
 
 
 def build_html(data) -> str:
@@ -1020,13 +1232,19 @@ def build_html(data) -> str:
     parts.append('<div class="panel"><h3>端口分布</h3>' + _bars(charts.get("ports") or []) + "</div>")
     parts.append("</div></section>")
 
-    hosts = data["hosts"]
-    parts.append("<section><h2>高价值主机<span>前 " + str(min(len(hosts), 60)) + " / 共 "
-                 + str(data["hosts_total"]) + "，内部服务优先</span></h2>")
+    hosts = data.get("hosts_all") or data["hosts"]
+    parts.append(_section(
+        "高价值主机",
+        "共 " + str(data["hosts_total"]) + " 条，内部服务优先（可搜索 / 筛选 / 翻页）",
+        body_id="sec-hosts"))
+    parts.append(_toolbar("sec-hosts", status=True, source=True, dup=True,
+                          total=len(hosts)))
     parts.append('<div class="panel"><table><thead><tr><th>优先</th><th>主机</th>'
                  "<th>状态</th><th>标题</th><th>指纹</th><th>来源</th><th>评分</th>"
-                 "<th>判定依据</th></tr></thead><tbody>" + _host_rows(hosts) + "</tbody></table></div>")
-    parts.append("</section>")
+                 '<th>判定依据</th></tr></thead><tbody>' + _host_rows(hosts)
+                 + "</tbody></table></div>")
+    parts.append(_pager("sec-hosts", len(hosts)))
+    parts.append(_section_end())
 
     internal = data["internal_services"]
     if internal:
@@ -1044,11 +1262,17 @@ def build_html(data) -> str:
         parts.append("</tbody></table></div></section>")
 
     eps = data["endpoints"]
-    parts.append("<section><h2>待复核端点<span>" + str(len(eps)) + " / 共 "
-                 + str(c["endpoints_interesting"]) + "，按关注度排序</span></h2>")
+    parts.append(_section(
+        "待复核端点",
+        str(len(eps)) + " 条，按关注度排序（默认折叠，点击标题展开）",
+        collapsed=True,
+        body_id="sec-eps"))
+    parts.append(_toolbar("sec-eps", status=True, source=True, total=len(eps)))
     parts.append('<div class="panel"><table><thead><tr><th>主机</th><th>方法</th><th>路径</th>'
-                 "<th>参数</th><th>状态</th><th>来源 / 关注点</th></tr></thead><tbody>"
-                 + _endpoint_rows(eps) + "</tbody></table></div></section>")
+                 '<th>参数</th><th>状态</th><th>来源 / 关注点</th></tr></thead><tbody>'
+                 + _endpoint_rows(eps) + "</tbody></table></div>")
+    parts.append(_pager("sec-eps", len(eps)))
+    parts.append(_section_end())
 
     leaks = data["leaks"]
     if leaks["domains"] or leaks["ips"] or leaks["private_ips"]:
@@ -1073,29 +1297,14 @@ def build_html(data) -> str:
                          + "</td></tr>")
         parts.append("</tbody></table></div></section>")
 
-    stages = data["stages"]
-    if stages:
-        parts.append("<section><h2>阶段执行记录<span>来自 steps 检查点</span></h2>")
-        parts.append('<div class="panel"><table><thead><tr><th>阶段</th><th>状态</th>'
-                     "<th>更新时间</th></tr></thead><tbody>")
-        for s in stages:
-            parts.append("<tr><td>" + _esc(s["step"]) + '</td><td><span class="tag">'
-                         + _esc(s["status"]) + '</span></td><td class="mono">'
-                         + _esc(s["updated_at"]) + "</td></tr>")
-        parts.append("</tbody></table></div></section>")
-
-    steps = data["next_steps"] or []
-    if steps:
-        parts.append("<section><h2>下一步<span>按缺口生成，可直接执行</span></h2>")
-        parts.append('<div class="panel"><ol class="steps">'
-                     + "".join("<li>" + _esc(s) + "</li>" for s in steps) + "</ol></div></section>")
-
     parts.append('<footer>本页由 findinfo report 生成，单文件自包含（无外部 JS/CSS/字体），'
                  "可直接归档、打印或转发。同目录 report.json 为给 Agent 的机器可读版，"
                  "report.md 为文字摘要版。资产采用共享库 + 范围过滤：本次已隔离 "
                  + str(c["domains_dropped"]) + " 条资产、"
                  + str(c["endpoints_noise"]) + " 条端点。</footer>")
-    parts.append("</main></body></html>")
+    parts.append("</main>")
+    parts.append("<script>" + _JS + "</script>")
+    parts.append("</body></html>")
     return "".join(parts)
 
 

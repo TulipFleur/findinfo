@@ -339,7 +339,8 @@ python findinfo.py report --match hniu.cn --match hniu.com --slug hniu
 # → ~/.findinfo/reports/20261117-224155-hniu/
 #   report.json  机器可读：结构化结论 + 每条资产的来源标注 + 图表数据（单行紧凑 JSON）
 #   report.md    markdown 简报：贴进对话 / 提交 issue
-#   report.html  自包含可视化：双击即开，无外链/无 JS 依赖，可直接打印成 PDF
+#   report.html  自包含可视化：双击即开，无外链（CSS/JS 全部内联），可直接打印成 PDF
+#                支持搜索 / 按状态与来源筛选 / 分页 / 折叠重复标题 / 折叠整节
 python findinfo.py report --print-md      # 顺便把 md 正文回显到 stdout，便于直接引用
 ```
 
@@ -347,7 +348,7 @@ python findinfo.py report --print-md      # 顺便把 md 正文回显到 stdout�
 |---|---|---|
 | `report.json` | agent / 脚本 | 结论、优先级、来源标注、`charts`；`--json-limit N` 截断大数组（0 = 与 md/html 同视图） |
 | `report.md` | 人 / 对话 | 5 分钟读完的分级清单 |
-| `report.html` | 人 | 深色看板：KPI、环境告警、6 个分布图、高价值主机表（来源 chips / 评分 / 判定依据）、端点与泄露 |
+| `report.html` | 人 | 深色看板：KPI、环境告警、6 个分布图、高价值主机（全量表格，可搜索/筛选状态与来源/分页/折叠重复标题）、待复核端点（默认折叠）、泄露情报 |
 
 **范围判定**：不给 `--match` 时自动回退最近一次 `run` 的目标域（`scope.auto=true`）；两者都没有则覆盖整库并告警。
 库里有跨项目残留时，报告把不属于目标域的记录统计成 `domains_dropped` / `endpoints_noise`，在 HTML 顶部列为"已隔离噪声"，**不计入结论**。
@@ -409,8 +410,8 @@ findinfo/
 ├── findinfo.py         ← CLI 入口（19 个子命令）
 ├── prompts/AGENT.md    ← ★ 新会话工作流提示词（含交付模板）
 ├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
-│   ├── windows/        ← 16 个 .exe（Windows 预置；doctor 追踪 15 个）
-│   ├── linux/          ← 15 个 ELF（scripts/setup-linux.sh 装到这里）
+│   ├── windows/        ← 16 个 .exe（Windows 预置；doctor 追踪 16 个，含可选 jsluice）
+│   ├── linux/          ← ELF（scripts/setup-linux.sh 装必需+PD 家族；jsluice 用 go install 自备）
 │   └── config.example.yaml  ← ENScan Cookie 模板 → 复制成 bin/config.yaml
 ├── rust/onepass/       ← onepass 源码（15 源被动聚合，cargo build --release）
 ├── Dockerfile          ← Linux 镜像（多阶段编译 onepass/ENScan）
@@ -418,7 +419,7 @@ findinfo/
 ├── lib/
 │   ├── core.py         ← 配置/存储/归一化/缓存/限速/执行
 │   ├── tools.py        ← 13 个工具封装（全部返回结构化数据）
-│   ├── jsleak.py       ← 纯 Python JS 泄露提取（无需 jsluice）
+│   ├── jsleak.py       ← JS 泄露提取·正则引擎（jsluice 缺席时的回退路径）
 │   └── report.py       ← 两种最终输出（json 给 AI / html+md 给人）+ 来源标注 + 优先级评分
 ├── config/
 │   ├── .env.example    ← ★ API Key 存档模板
