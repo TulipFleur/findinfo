@@ -155,6 +155,41 @@ findinfo 是给 AI agent 调用的：装好之后，用一段提示词让 agent 
 - 回流循环规则：什么时候该再跑一轮、什么时候该收口
 - 交付模板：报告该写哪些字段、证据怎么标注
 
+### 需要哪些 API Key（可选项，不配也能跑 80%）
+
+纯被动阶段（`onepass` / `certs` / `subs`）里的 onepass 有 8 个免 key 数据源，不配任何 key 也能出结果；
+下面这些是**扩展覆盖**用的，按需申请。填进 `config/.env`（`cp config/.env.example config/.env`）。
+
+| 用途 | 字段 | 申请地址 | 免费额度 |
+|---|---|---|---|
+| 爱企查 Cookie（企业锚定，`entity` 阶段必需） | `bin/config.yaml` → `cookies.aiqicha` | 登录 https://aiqicha.baidu.com → F12 → Network → 复制 Cookie 头 | 免费 |
+| FOFA（备案反查 / 子域扩展） | `FOFA_EMAIL` + `FOFA_KEY` | https://fofa.info/userInfo | 200~300 次/月 |
+| 360 Quake（备案反查 / 子域扩展） | `QUAKE_TOKEN` | https://quake.360.net/quake/#/personalInfo | 3000 次/月 |
+| Hunter 鹰图（备案反查 / 子域扩展） | `HUNTER_KEY` | https://hunter.qianxin.com/home/userInfo | 100 积分/月 |
+| Shodan（子域扩展，`subs` 默认引擎之一） | `SHODAN_KEY` | https://account.shodan.io/ | 极低，建议付费 |
+
+```bash
+cp config/.env.example config/.env
+# 编辑 config/.env，填入：
+#   FOFA_EMAIL=your@mail.com
+#   FOFA_KEY=xxxxxxxx
+#   QUAKE_TOKEN=xxxxxxxx
+#   HUNTER_KEY=xxxxxxxx
+#   SHODAN_KEY=xxxxxxxx
+
+# 爱企查 Cookie 单独放（二进制自己读，不走 .env）：
+cp bin/config.example.yaml bin/config.yaml
+#   cookies:
+#     aiqicha: "BAIDUID=xxxx; BDUSS=xxxx; ..."   # 整段 Cookie 头原样粘贴
+
+python findinfo.py doctor   # 确认 api_keys 里对应项变成 true
+```
+
+> 两个文件都已在 `.gitignore` 里，不会被提交，也不会被 `install.py --copy` 复制到客户端目录。
+> 空值 = 该数据源未启用，流水线跳过并在报告里记为覆盖缺口，不会报错。
+
+> **爱企查 Cookie 只对 `entity`（企业锚定）有用。** 直接给域名（`--domain example.com`）时完全不需要它。
+
 ### 装到各客户端
 
 agent 必须先「看得见」这个 skill 才会调用它。一条命令装到所有客户端：
