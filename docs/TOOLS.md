@@ -31,13 +31,16 @@ python findinfo.py doctor
 ```json
 {
   "python": "ok",
+  "environment": {"python_version": "3.10.9", "python_ok": true, "python_required": ">=3.10",
+                  "net_egress": {"probes": {"crt.sh": true, "rapiddns": true, "hackertarget": true},
+                                 "any_reachable": true}},
   "tools": {
-    "subfinder": {"present": true, "source": "bundle", "path": ".../bin/subfinder.exe", "version": "v2.17.0"},
-    "httpx":     {"present": true, "source": "bundle", "version": "v1.12.0"},
-    "enscan":    {"present": true, "source": "bundle", "version": ""}
+    "subfinder": {"present": true, "source": "bundle", "path": ".../bin/subfinder.exe", "version": "v2.17.0", "executable": true},
+    "httpx":     {"present": true, "source": "bundle", "version": "v1.12.0", "executable": true},
+    "enscan":    {"present": true, "source": "bundle", "version": "", "executable": true}
   },
-  "tools_summary": {"total": 14, "in_bin": 14, "outside_bin": [],
-                    "missing": [], "suspect": [], "all_in_bin": true},
+  "tools_summary": {"total": 13, "in_bin": 13, "outside_bin": [], "missing": [],
+                    "suspect": [], "not_executable": [], "all_in_bin": true},
   "api_keys": {"fofa": false, "quake": false, "hunter": false, "chaos": false},
   "bin_dir": "...", "db": "..."
 }
@@ -45,7 +48,11 @@ python findinfo.py doctor
 
 **`source` / `tools_summary`**：`bundle` = 解析到 `<skill>/bin`（自包含，推荐）；`path` = 从 `PATH` 借的，
 可能根本不是同一个工具（Kali 的 `python3-httpx` 就占着 `/usr/bin/httpx`，此时会给 `suspect` + `hint`）。
-`all_in_bin: true` 是“13 个工具全在 skill 目录”的机器可读结论。
+`all_in_bin: true` 是“13 个工具全在 skill 目录且都能执行”的机器可读结论。
+
+**`environment`（宿主前提）**：`python_ok` = 解释器 ≥3.10（代码用 PEP 604 语法，低版本阶段必 SyntaxError）；
+`not_executable` = 在场但本机**执行不了**的二进制（沙箱剥执行位/拦截未知二进制 → 条目给 `executable:false` + 原因 hint）；
+`net_egress.any_reachable` = 三个被动数据源至少一个可达，全 false 表示本机无出网，被动采集出不了数据。
 
 **何时调**：每次会话第一条命令。`api_keys` 全 false 说明只能跑无 key 链路。
 
@@ -484,12 +491,16 @@ python findinfo.py wait --run <run_id> --timeout 30 --since 12   # 只看 seq �
 
 ```json
 {"run_id":"20261118-010612-example.com","state":"running","changed":true,"timed_out":false,
- "terminal":false,"alive":true,"interrupted":false,"stalled":false,"seq":7,"waited_sec":0.2,
+ "terminal":false,"alive":true,"interrupted":false,"stalled":false,"reaped_by_host":false,"seq":7,"waited_sec":0.2,
  "stage":"probe","stage_state":"running","stage_index":4,"stage_total":9,"percent":44.4,
  "counts":{"domain":128,"ip":64},"endpoints":37}
 ```
 
 `--full` 额外给出 `progress.elapsed_sec`、`coverage`、`run_dir`、`note`。
+
+**`reaped_by_host`**（interrupted 时才有意义）：`true` = worker 没执行到任何 Python 就被宿主回收
+（stderr.log 空），该环境下后台模式不可用，改前台 `--task-timeout` 或由存活父进程托管；
+`false` = 普通崩溃，`run --resume` 断点续跑即可。
 
 - `timed_out: true` → **只是本次等待窗口结束**，继续等同一个 run_id。
 - `changed: true` / `terminal: true` → 提前返回（有进展或已结束）。
@@ -583,7 +594,8 @@ python findinfo.py --task example-com run --domain example.com --active --vhost 
 - 独立 Python 工作进程（POSIX `setsid` / Windows `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`），
   **不依赖发起它的那次终端调用**；每次运行的 `status.json`/`summary.jsonl`/`stdout.log`/`stderr.log` 独立。
 - 同一目标（同 task + 同参数）已在跑时返回 `reused: true` + 原 `run_id`，不会重复采集。
-- `--resume <run_id>` 续跑已有运行（复用断点）；工作进程已死（`interrupted`）时用它。
+- `--resume <run_id>` 续跑已有运行（复用断点）；工作进程已死（`interrupted` 且 `reaped_by_host:false`）时用它。
+  **`reaped_by_host:true` 时不要 resume**——resume 仍会 spawn 一个脱离进程，在会回收它的宿主上同样死掉，改前台执行。
 - 边界：进程存活 ≠ 会话存活。已结束的 Agent 会话不会被自动唤醒，需重新进入会话用 `runs`/`status` 接续；
   机器重启后能否自动续跑取决于宿主是否注册为系统服务，本 skill 不作保证。
 

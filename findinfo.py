@@ -521,6 +521,7 @@ def cmd_status(args) -> None:
         "state": st.get("state"), "stage": st.get("stage"),
         "stage_state": st.get("stage_state"),
         "alive": st.get("alive"), "interrupted": st.get("interrupted"),
+        "reaped_by_host": bool(st.get("reaped_by_host")),
         "stalled": st.get("stalled"), "terminal": st.get("terminal"),
         "heartbeat_age_sec": st.get("heartbeat_age_sec"),
         "pid": st.get("pid"), "attempt": st.get("attempt"),
@@ -557,6 +558,14 @@ def _next_steps(st: dict) -> list:
     if state == "cancelled":
         return ["assets collected so far are still in the store; re-run when needed"]
     if st.get("interrupted"):
+        if st.get("reaped_by_host"):
+            # The host killed the detached worker before it ran any Python.
+            # --resume spawns another detached worker, which dies the same
+            # way: the only working modes here are foreground or a worker
+            # held by a live parent process.
+            return ["host reaps detached workers (empty stderr.log); do not retry --background",
+                    "run the same command in the FOREGROUND with --task-timeout as a ceiling",
+                    "or hold the worker under a live parent process (subprocess.Popen + wait)"]
         return ["worker died: " + ctx + " run --resume " + rid]
     return [ctx + " wait --run " + rid + " --timeout 30"]
 

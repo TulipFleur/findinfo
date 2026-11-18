@@ -10,6 +10,8 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import urllib.error
+import urllib.request
 import uuid
 import re
 import socket
@@ -1630,6 +1632,60 @@ def _stale_check(name: str, exe: str) -> dict | None:
     return None
 
 
+def _env_selfcheck() -> dict:
+    """Environment preconditions a consumer-grade host may not satisfy.
+
+    The pipeline assumes three things that are NOT true everywhere:
+    (1) Python >= 3.10 (the codebase uses PEP 604 unions);
+    (2) the bundled binaries can actually execute here (cloud sandboxes
+        strip the exec bit or block unknown binaries by policy);
+    (3) there is a network egress to the passive data sources.
+    doctor used to hardcode "python": "ok" and had no probe for (2)/(3),
+    so an agent inside a restricted sandbox learned about the problem only
+    when a stage failed mid-run. This makes all three explicit up front.
+    """
+    import sys as _sys
+    env = {"python_version": ".".join(map(str, _sys.version_info[:3])),
+           "python_ok": _sys.version_info >= (3, 10),
+           "python_required": ">=3.10"}
+    if not env["python_ok"]:
+        env["python_hint"] = ("findinfo uses PEP 604 syntax and needs Python "
+                              ">= 3.10; stages will crash with SyntaxError on "
+                              "this interpreter")
+    # network egress: probe the actual passive sources, in parallel. Any one
+    # reachable means the passive stages can produce something; zero means
+    # this host has no usable egress and everything past `doctor` is moot.
+    probes = {"crt.sh": "https://crt.sh/?output=json",
+              "rapiddns": "https://rapiddns.io/",
+              "hackertarget": "https://api.hackertarget.com/"}
+    reach = {}
+    with futures.ThreadPoolExecutor(max_workers=len(probes)) as ex:
+        futs = {}
+        for label, url in probes.items():
+            req = urllib.request.Request(url, method="GET",
+                                         headers={"User-Agent": "Mozilla/5.0 findinfo-doctor"})
+            futs[ex.submit(_probe_url, req)] = label
+        for fut, label in futs.items():
+            reach[label] = fut.result()
+    reachable = [k for k, v in reach.items() if v]
+    env["net_egress"] = {"probes": reach, "any_reachable": bool(reachable)}
+    if not reachable:
+        env["net_hint"] = ("no passive source reachable from this host: passive "
+                           "collection cannot produce data here; check egress "
+                           "firewall / proxy before running any stage")
+    return env
+
+
+def _probe_url(req, timeout: float = 8.0) -> bool:
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 100 <= int(r.status) < 500
+    except urllib.error.HTTPError:
+        return True          # got an HTTP answer: the egress works
+    except Exception:
+        return False
+
+
 def doctor() -> dict:
     names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "cdncheck",
              "uncover", "katana", "chaos", "ksubdomain", "onepass",
@@ -1642,8 +1698,15 @@ def doctor() -> dict:
             report[n] = {"present": False}
             continue
         ver = ""
+        exec_error = ""
         for arg in VERSION_ARGS:
             rc, out, err = core.run([exe, arg], timeout=20)
+            if rc == 126:
+                # binary exists but the OS refuses to run it (no exec bit /
+                # wrong arch / sandbox policy). core.run already converted the
+                # OSError into rc=126; surface it instead of "no version".
+                exec_error = (err or "")[:200]
+                break
             blob = (out or "") + (err or "")
             m = re.search(r"(v?\d+\.\d+\.\d+[\w.\-]*)", blob)
             if m:
@@ -1653,6 +1716,10 @@ def doctor() -> dict:
         # turns up here is a bundled binary by construction.
         report[n] = {"present": True, "path": exe, "version": ver,
                      "source": "bundle"}
+        if exec_error:
+            report[n].update({"executable": False, "hint": exec_error})
+            continue
+        report[n]["executable"] = True
         stale = _stale_check(n, exe)
         if stale:
             report[n].update(stale)
@@ -1677,6 +1744,7 @@ def doctor() -> dict:
     outside = []
     suspects = [n for n, v in report.items() if v.get("suspect")]
     stale = [n for n, v in report.items() if v.get("stale_binary")]
+    not_executable = [n for n, v in report.items() if v.get("present") and not v.get("executable")]
     gw_base = core.api_base("fofa")
     gw = None
     if gw_base and core.api_key("fofa"):
@@ -1685,7 +1753,10 @@ def doctor() -> dict:
               "remaining": (u or {}).get("remaining"),
               "max": (u or {}).get("maxQueries"),
               "usable": (u or {}).get("usable")}
-    return {"python": "ok", "skill_version": core.skill_version(),
+    env = _env_selfcheck()
+    return {"python": "ok" if env["python_ok"] else "incompatible:" + env["python_version"],
+            "skill_version": core.skill_version(),
+            "environment": env,
             "tools": report, "api_keys": keys,
             "fofa_gateway": gw,
             "tools_summary": {
@@ -1695,7 +1766,8 @@ def doctor() -> dict:
                 "missing": missing,
                 "suspect": suspects,
                 "stale_binary": stale,
-                "all_in_bin": not missing and not outside,
+                "not_executable": not_executable,
+                "all_in_bin": not missing and not outside and not not_executable,
             },
             "bin_dir": str(core.BIN_PLATFORM),
             "bin_platform": core.PLATFORM,

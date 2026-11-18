@@ -236,10 +236,38 @@ def derive(state: dict) -> dict:
     st["terminal"] = name in TERMINAL
     st["heartbeat_age_sec"] = age
     if interrupted:
-        st["hint"] = ("worker process " + str(pid) + " is gone; the job stopped "
-                      "unexpectedly. Resume with: python findinfo.py run --resume " + st.get("run_id", ""))
+        # Distinguish "the host reaped the worker before it ran any Python"
+        # from an ordinary crash. The worker writes its '[worker] entered'
+        # breadcrumb as its very first action, so an interrupted job whose
+        # stderr.log is EMPTY never reached the interpreter: the detached
+        # process was killed by the host (sandbox / session-scoped process
+        # reaping). Remediation differs from a crash: retrying --background
+        # dies the same way, so the caller must switch execution modes.
+        reaped = False
+        try:
+            log = Path(str(st.get("run_dir") or "")) / "stderr.log"
+            # spawn() opens stderr.log in append mode BEFORE starting the child,
+            # so a backgrounded run dir always has the file. An ABSENT file
+            # means the snapshot was hand-built (tests) or the dir predates
+            # the job system: absent evidence is not evidence of reaping.
+            reaped = log.is_file() and not log.read_text(
+                encoding="utf-8", errors="replace").strip()
+        except OSError:
+            reaped = False
+        st["reaped_by_host"] = reaped
+        if reaped:
+            st["hint"] = ("worker was killed by the host before it ran any Python "
+                          "(empty stderr.log): this environment reaps detached "
+                          "processes. Do NOT retry --background; run the same "
+                          "command in the foreground with --task-timeout, or hold "
+                          "the worker under a live parent process")
+        else:
+            st["hint"] = ("worker process " + str(pid) + " is gone; the job stopped "
+                          "unexpectedly. Resume with: python findinfo.py run --resume " + st.get("run_id", ""))
     elif stalled:
         st["hint"] = "worker is alive but has not reported progress for a while; keep waiting"
+    if "reaped_by_host" not in st:
+        st["reaped_by_host"] = False
     return st
 
 
@@ -680,6 +708,7 @@ def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict
                    "waited_sec": round(time.time() - start, 1),
                    "progress": progress(st), "alive": st.get("alive"),
                    "interrupted": st.get("interrupted"), "stalled": st.get("stalled"),
+                   "reaped_by_host": st.get("reaped_by_host"),
                    "result": st.get("result"), "coverage": st.get("coverage"),
                    "run_dir": st.get("run_dir"), "seq": st.get("seq")}
             if st.get("terminal"):
@@ -691,6 +720,7 @@ def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict
                    "waited_sec": round(time.time() - start, 1),
                    "progress": progress(st), "alive": st.get("alive"),
                    "interrupted": st.get("interrupted"), "stalled": st.get("stalled"),
+                   "reaped_by_host": st.get("reaped_by_host"),
                    "run_dir": st.get("run_dir"), "seq": st.get("seq"),
                    "note": "wait timeout means this wait window ended, not that the "
                            "job failed; keep waiting on the same run_id"}

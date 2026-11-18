@@ -46,6 +46,10 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 每个工具条目还带 `source: bundle|path`；出现 `path` 就说明会依赖别处的同名二进制
 （典型坑：Kali 自带 `python3-httpx` 占了 `/usr/bin/httpx`），此时 `doctor` 也会给 `suspect`/`hint`。
 修法：`bash scripts/setup-linux.sh`（装到 `<skill>/bin/linux`；Windows 直接用内置 `bin/windows/*.exe`）。
+**环境前提一次验清**：`doctor` 的 `environment` 块还检查 ①Python ≥3.10（`python_ok`，代码用 PEP 604 语法，低版本必 SyntaxError）
+②二进制在本机**真的能执行**（`not_executable` 列表；受限沙箱会剥离执行位/拦截未知二进制 → 该工具报 `executable:false`）
+③网络出口（`net_egress.any_reachable`；三个被动源全不可达 = 被动采集在本机出不了数据）。
+任何一条不满足时：停止并如实告知用户宿主环境缺什么，不要硬跑阶段、不要自己装工具。
 
 > 新会话接手时，最省事的方式是直接采用 `prompts/AGENT.txt`（完整工作流提示词：定位 skill → 快速出结果 → 加深 → 回流收敛 → 交付模板）。
 
@@ -86,6 +90,9 @@ bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 1. **先出结果再加深**：`passive → certs → dns` 几分钟就能给第一版；`--active --vhost --crawl` 再逐步加深。
 2. **永不前台阻塞**：长命令一律 `--background` 拿 run_id，再 `wait --run <id> --timeout 30` 循环；
    超时只代表本次等待结束，不要重启、不要提前宣布完成。
+   **宿主回收检查**：`wait`/`status` 返回 `interrupted:true` 时看 `reaped_by_host` 字段——
+   `true` = 宿主杀脱离进程，后台模式在本机不可用，改前台 `--task-timeout` 或由存活父进程托管（不要重试后台）；
+   `false` = 普通崩溃，`run --resume` 断点续跑。
 3. **只认 run_id**：换会话/换人接手都用 `runs` 找 run_id → `status --run <id>` 恢复，不依赖"最近一次"。
 4. **终态只有三种**：`completed`（跑完，还要看 coverage 判断完整/部分）/ `failed` / `cancelled`。
    不要用 `done` 当终态名；退出码 5 = 跑完但有阶段失败，不是成功。

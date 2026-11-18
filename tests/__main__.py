@@ -44,6 +44,8 @@ MODULES = [
     "tests.test_integration_e2e",
     "tests.test_tool_resolution",
     "tests.test_tool_inventory",
+    "tests.test_host_reap",
+    "tests.test_env_selfcheck",
 ]
 
 

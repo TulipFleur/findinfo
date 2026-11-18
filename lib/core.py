@@ -499,6 +499,13 @@ def run(cmd: list[str], timeout: int = 300, input_text: str | None = None,
                     next_beat += float(progress_every)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        # Not executable in this environment: a binary without the exec bit
+        # (Linux PermissionError), a non-PE file on Windows (WinError 193),
+        # or a blocked-by-policy sandbox. Callers (doctor above all) turn
+        # this into a suspect entry instead of crashing on the very machine
+        # they are asked to diagnose.
+        return 126, "", type(exc).__name__ + ": " + str(exc)
 
 
 # ---------------------------------------------------------------- streaming exec

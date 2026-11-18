@@ -81,6 +81,14 @@ flowchart TD
 - 作业状态与断点持久化，便于换会话后查询和恢复。后台进程不会自动唤醒已经结束的 Agent 会话，进程能否持续存活也取决于宿主策略。
 - 交付包括 JSON / Markdown / HTML 报告及按需导出的资产 JSONL，并注明目标、实际范围、统计、主要证据和结束原因。
 
+## 执行环境前提（受限沙箱请先读）
+
+skill 假定宿主满足三件事：**本地 Python ≥3.10**、**能执行仓库自带的原生二进制**（`bin/<platform>/`）、**有到被动数据源的网络出口**。跑在受限云沙箱里的 agent 可能三者都不满足——那样整个流水线不成立。一条命令验清：
+
+    python findinfo.py doctor
+
+看返回里的 `environment` 块：`python_ok`（版本）、`tools_summary.not_executable`（二进制被沙箱拦截时非空）、`net_egress.any_reachable`（出网）。任一不满足就到此为止，如实告知缺什么，不要硬跑。
+
 ## 快速开始
 
     cd <本目录>
@@ -213,8 +221,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 | 文件 | 内容 |
 |---|---|
 | SKILL.md | AI 使用说明：何时用、流程、硬规则、故障处理 |
-| docs/TOOLS.md | 每个命令的参数、输出 JSON、示例 |
-| lib/report.py | 最终交付生成器：`report` 的 json(给 AI) / md / html(给人) 三种产物 |
+| docs/TOOLS.md | 每个命令的参数、输出 JSON、示例、内置工具能力矩阵 |
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
 | docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd、故障排查 |
 | docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex / Claude Desktop）加载机制与坑 |
@@ -227,18 +234,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 
 ## 内置工具
 
-全部二进制随仓库分发，开箱即用；Linux 端用 `scripts/setup-linux.sh` 安装。
-
-| 能力 | 工具 |
-|---|---|
-| 企业锚定 | ENScan_GO（需 Cookie） |
-| 子域发现 | onepass（Rust，15 源）、subfinder、chaos、uncover、ksubdomain |
-| 证书 / DNS | crt.sh、CertSpotter（内置封装）、dnsx |
-| 存活与侦察 | httpx、cdncheck、naabu |
-| 内部服务 | hostCollision（Host 头碰撞） |
-| 内容提取 | katana、jsleak（内置正则引擎，零依赖） |
-
-每个命令的详细参数见 [docs/TOOLS.md](docs/TOOLS.md)，工具清单自检用 `python findinfo.py doctor`。
+二进制随仓库分发、开箱即用（Linux 端用 `scripts/setup-linux.sh` 安装），能力矩阵与每个命令的详细参数见 [docs/TOOLS.md](docs/TOOLS.md)；在场/可执行/版本自检用 `python findinfo.py doctor`。
 
 
 ## 核心设计
