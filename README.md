@@ -218,6 +218,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
 | docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd、故障排查 |
 | docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex / Claude Desktop）加载机制与坑 |
+| docs/DEVELOPMENT.md | **开发文档**：目录结构、回归测试怎么跑（日常使用不需要看） |
 | prompts/AGENT.txt | **复制给 agent 的完整工作流提示词模板**（人工复制粘贴，不参与自动加载） |
 
 最终交付长这样（`findinfo.py report` 产出的 html 看板，可打印成 PDF）：

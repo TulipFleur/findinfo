@@ -82,21 +82,30 @@ def test_skill_standard_flow_is_single_line_and_ordered():
     cmds = _commands(loop)
     joined = "\n".join(cmds)
 
-    assert any(c.startswith("doctor") for c in cmds), "doctor missing from the flow"
-    run_lines = [c for c in cmds if c.startswith("run ") or " run --domain" in c]
+    # the canonical form puts global options (--task/--home) first, so match the
+    # subcommand after any leading "--opt value" pairs
+    def sub_of(c):
+        toks = c.split()
+        i = 0
+        while i < len(toks) and toks[i].startswith("--"):
+            i += 2 if "=" not in toks[i] else 1
+        return toks[i] if i < len(toks) else ""
+
+    assert any(sub_of(c) == "doctor" for c in cmds), "doctor missing from the flow"
+    run_lines = [c for c in cmds if sub_of(c) == "run"]
     assert run_lines, "run missing from the flow"
     assert any("--background" in c for c in run_lines), \
         "the canonical run must be backgrounded"
-    assert any("wait" in c for c in cmds), "wait missing from the flow"
-    assert any("status" in c for c in cmds), "status missing from the flow"
+    assert any(sub_of(c) == "wait" for c in cmds), "wait missing from the flow"
+    assert any(sub_of(c) == "status" for c in cmds), "status missing from the flow"
     # order: doctor before run before wait before status
     def idx(pred):
         for i, c in enumerate(cmds):
             if pred(c):
                 return i
         return -1
-    assert idx(lambda c: c.startswith("doctor")) < idx(lambda c: " run --domain" in c or c.startswith("run "))
-    assert idx(lambda c: " run --domain" in c or c.startswith("run ")) < idx(lambda c: c.startswith("wait"))
+    assert idx(lambda c: sub_of(c) == "doctor") < idx(lambda c: sub_of(c) == "run")
+    assert idx(lambda c: sub_of(c) == "run") < idx(lambda c: sub_of(c) == "wait")
     # --task must be the global (leading) form; --home likewise when present
     for c in run_lines:
         assert c.split()[0].startswith("--") or c.startswith("run "), c
