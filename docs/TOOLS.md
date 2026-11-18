@@ -54,7 +54,7 @@ python findinfo.py doctor
 ## entity — 企业 → 实体树/备案号/域名
 
 ```bash
-python findinfo.py entity --name "美团" --invest 51 --deep 2
+python findinfo.py entity --name "示例公司" --invest 51 --deep 2
 ```
 
 | 参数 | 默认 | 说明 |
@@ -71,8 +71,8 @@ python findinfo.py entity --name "美团" --invest 51 --deep 2
   "rc": 0, "json_files": 3,
   "companies": ["北京三快在线科技有限公司", "..."],
   "icp": ["京ICP备10210538号", "..."],
-  "domains": ["meituan.com", "dianping.com", "..."],
-  "apps": ["美团"]
+  "domains": ["example.com", "example.org", "..."],
+  "apps": ["示例公司"]
 }
 ```
 
@@ -84,9 +84,9 @@ python findinfo.py entity --name "美团" --invest 51 --deep 2
 ## passive — 15 源被动聚合（阶段一B ⓪ 路，onepass）
 
 ```bash
-python findinfo.py passive --domain meituan.com
+python findinfo.py passive --domain example.com
 python findinfo.py passive --from-store --min-conf 0.7
-python findinfo.py passive --domain meituan.com --sources crtsh,certspotter,rapiddns
+python findinfo.py passive --domain example.com --sources crtsh,certspotter,rapiddns
 bin/onepass.exe sources                 # 看 15 个源的 id / 是否需要 key / 当前是否 ready
 ```
 
@@ -120,17 +120,17 @@ chaos / fofa / quake / hunter 需 key（缺 key 自动跳过，不报错，`per_
 ## certs — 证书透明（阶段一B ① 路）
 
 ```bash
-python findinfo.py certs --domain meituan.com
+python findinfo.py certs --domain example.com
 ```
 
 **输出**
 
 ```json
 {
-  "domain": "meituan.com",
+  "domain": "example.com",
   "count": 128,
   "records": 4213,
-  "domains": ["api.meituan.com", "dev.meituan.com", "uat.meituan.com", "..."]
+  "domains": ["api.example.com", "dev.example.com", "uat.example.com", "..."]
 }
 ```
 
@@ -142,7 +142,7 @@ python findinfo.py certs --domain meituan.com
 ## subs — 多源被动子域（阶段一B ③ 路）
 
 ```bash
-python findinfo.py subs --domain meituan.com
+python findinfo.py subs --domain example.com
 python findinfo.py subs --from-store        # 对库内所有 ≥0.7 域名跑
 ```
 
@@ -156,10 +156,10 @@ python findinfo.py subs --from-store        # 对库内所有 ≥0.7 域名跑
 
 ```json
 {
-  "domain": "meituan.com",
+  "domain": "example.com",
   "count": 214,
   "domains": [
-    {"domain": "api.meituan.com", "sources": ["crt.sh", "subfinder"], "confidence": 0.75}
+    {"domain": "api.example.com", "sources": ["crt.sh", "subfinder"], "confidence": 0.75}
   ]
 }
 ```
@@ -548,8 +548,8 @@ python findinfo.py run --domain example.com --active --ports
 ```json
 {
   "engagement": "demo", "active": false,
-  "run_dir": "...\\runs\\20261117-131500-美团",
-  "seed_domains": ["meituan.com"],
+  "run_dir": "...\\runs\\20261117-131500-示例公司",
+  "seed_domains": ["example.com"],
   "stages": [
     {"stage": "entity", "companies": 12, "icp": 3, "domains": 8},
     {"stage": "onepass", "found": 214},
@@ -641,8 +641,8 @@ python findinfo.py --task example-com run --domain example.com --active --vhost 
 会把别的目标的资产一起读回来。清理/隔离命令：
 
 ```bash
-python findinfo.py clean --keep hniu.cn --keep hniu.com --vacuum   # 只留本目标
-python findinfo.py clean --match meituan.com                       # 只删某目标
+python findinfo.py clean --keep example.com --keep example.org --vacuum   # 只留本目标
+python findinfo.py clean --match example.com                       # 只删某目标
 python findinfo.py clean --all --vacuum                            # 全清
 ```
 
@@ -665,7 +665,7 @@ python findinfo.py clean --all --vacuum                            # 全清
 
 ```bash
 python findinfo.py report                                  # 范围 = 最近一次 run 的目标域
-python findinfo.py report --match hniu.cn --match hniu.com --slug hniu
+python findinfo.py report --match example.com --match example.org --slug example
 python findinfo.py report --print-md                       # 额外回显 markdown 正文
 python findinfo.py report --json-limit 40                  # 截断 json 里的大数组（省 token）
 python findinfo.py report --out ./out --limit 80 --ep-limit 200
@@ -696,7 +696,7 @@ Windows 无软链权限时退化为 `reports/latest.txt`）
 {
   "counts": {"domains_in_scope": 48, "live": 27, "interesting": 12, "internal_services": 4,
              "endpoints_in_scope": 6379, "endpoints_interesting": 153, "leak_domains": 8},
-  "scope": {"match": ["hniu.cn"], "auto": false},
+  "scope": {"match": ["example.com"], "auto": false},
   "paths": {"json": ".../report.json", "md": ".../report.md", "html": ".../report.html"},
   "warnings": ["检测到 4 个域名解析到 198.18.0.0/15（Clash/TUN fake-IP）…"],
   "next_steps": ["关闭 TUN 后重跑 dns/probe…"]

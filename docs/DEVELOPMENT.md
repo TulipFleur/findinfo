@@ -85,8 +85,8 @@ python -m tests          # 全套（Windows 与 WSL Kali 均已通过，Python >
 - 已模拟验证：生命周期（spawn/wait/cancel/interrupt/resume）、状态机、result/coverage、回流停止条件、并发隔离、文档一致性。
 - 已实测：Windows 与 WSL Kali 上真实 Python 子进程 spawn→wait→completed，以及 `runs`/`status --run` CLI 路径。
 - 已在**真实目标**上跑通全流程（详见 `runs/REAL-TEST-NOTES.md`）：
-  - hniu.cn/hniu.com：6359 域名 / 359 IP / 5680 端点，`complete: true`（7 阶段）
+  - example.com/example.org：6359 域名 / 359 IP / 5680 端点，`complete: true`（7 阶段）
   - 含 entity 的重跑：8 阶段全 done，certs 因 crt.sh 超时失败 → 如实标 `partial`
-  - meituan.com：7001 域名 / 12542 IP / 5083 端点，`complete: true`
+  - example.com：7001 域名 / 12542 IP / 5083 端点，`complete: true`
   - 耗时参考：subs+dns+probe 在 7000 个域名规模下约 25~35 分钟；crawl 在 287 站点 depth=3 下约 17 分钟
 - **未验证**：真实宿主保活（关终端/注销/重启）、macOS、小时级真实运行。不承诺"跨客户端退出后自动续跑"。

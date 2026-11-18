@@ -64,7 +64,7 @@ vim config/config.json
 | 存活/指纹/IP 映射 | httpx | 核心资产富化 |
 | CDN 判别 | cdncheck | 内置数据 |
 | 端口扫描 | naabu | 无需 key |
-| Host 碰撞 | 内置 socket + SNI | 真正出内部服务的一步 |
+| Host 碰撞 | hostCollision（Host 头碰撞）+ curl 差分兜底 | 真正出内部服务的一步 |
 | 爬虫 / JS 泄露 | katana + 内置 jsleak | 无需 key |
 | 企业信息 | ENScan | 只需要 Cookie，不需要 key |
 

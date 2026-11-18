@@ -442,7 +442,7 @@ def _gateway_rows_to_domains(res: dict) -> tuple[list[str], list[str]]:
     """Pull subdomains out of a gateway result set.
 
     The relay only exposes the *registered* domain in `domain`; the real
-    hostname appears in `link` (e.g. https://ehall.hniu.cn:8080/). Parse it
+    hostname appears in `link` (e.g. https://ehall.example.com:8080/). Parse it
     out and keep only hostnames that are actually subdomains.
     """
     doms: list[str] = []
@@ -1667,8 +1667,9 @@ def doctor() -> dict:
                 report[n]["hint"] = ("binary in bin/ does not identify itself as " + n +
                                      "; it may be broken or the wrong build -- reinstall "
                                      "it into bin/" + core.PLATFORM + "/")
-    keys = {k: bool(api_key_or_empty(k)) for k in ["fofa", "quake", "hunter", "chaos",
-                                                   "securitytrails", "virustotal", "urlscan"]}
+    keys = {k: bool(api_key_or_empty(k)) for k in ["fofa", "quake", "hunter", "shodan",
+                                                   "chaos", "securitytrails", "virustotal",
+                                                   "urlscan"]}
     missing = [n for n, v in report.items() if not v.get("present")]
     # Every resolvable tool lives in bin/<platform>/ now: core.tool() has no
     # PATH fallback, so "outside bin" cannot happen. Kept in the output

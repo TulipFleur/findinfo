@@ -28,20 +28,6 @@ ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "bin"
 
 
-def skill_version() -> str:
-    """Version stamp of this skill copy (VERSION file at the repo root).
-
-    Agents working across machines (Windows host + WSL clone + containers) need
-    to detect copy drift: a stale clone silently behaves differently even
-    though every command succeeds. doctor reports this value; comparing it
-    across environments is the intended usage. Falls back to 'unknown'.
-    """
-    try:
-        return (ROOT / "VERSION").read_text(encoding="utf-8").strip() or "unknown"
-    except OSError:
-        return "unknown"
-
-
 def _platform_tag() -> str:
     """Directory name used to keep per-platform binaries apart under bin/."""
     if os.name == "nt":
@@ -77,7 +63,7 @@ def _safe_task_name(task: str) -> str:
 
     Plain [A-Za-z0-9_-]+ names keep their directory verbatim (existing
     installs stay where they are). Anything else -- Chinese, spaces,
-    punctuation -- would collide after sanitizing (both "美团" and "百度"
+    punctuation -- would collide after sanitizing (both "示例公司" and "百度"
     used to collapse into tasks/default), so a hash of the original name is
     mixed in. Same name always maps to the same token; different names never
     share a token.
@@ -1606,7 +1592,7 @@ class Store:
         """Query assets.
 
         `match` restricts results to rows whose canonical OR parent equals/sits
-        under one of the given suffixes (e.g. ["hniu.cn"]). The store is a
+        under one of the given suffixes (e.g. ["example.com"]). The store is a
         shared, cross-engagement graph, so any caller that feeds results back
         into an active stage must scope the query or it will drag another
         target's assets along. Scope lists longer than 50 entries are applied

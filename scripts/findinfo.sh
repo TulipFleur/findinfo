@@ -8,7 +8,7 @@
 #   bash scripts/findinfo.sh --status                           # 看进度
 #   bash scripts/findinfo.sh -t example.com -b --notify /path/hook.sh
 #                                 # 后台跑，跑完自动执行 hook.sh（拿到 JSON 再继续干活）
-#   bash scripts/findinfo.sh --task hniu -t hniu.cn            # 按任务隔离资产图
+#   bash scripts/findinfo.sh --task example -t example.com            # 按任务隔离资产图
 #   bash scripts/findinfo.sh --export runs/assets.jsonl         # 导出资产图
 #
 # 后台模式产物（~/.findinfo/last/<task>/，按任务隔离）：

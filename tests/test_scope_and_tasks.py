@@ -15,14 +15,14 @@ from tests.util import fresh_core
 def test_task_name_mapping():
     core = fresh_core()
     # ASCII names stay verbatim (existing installs keep their directory)
-    assert core._safe_task_name("hniu") == "hniu"
+    assert core._safe_task_name("example") == "example"
     assert core._safe_task_name("default") == "default"
     assert core._safe_task_name("proj-2024_a") == "proj-2024_a"
     # pure Chinese: distinct stable tokens, never the shared "default"
-    a1 = core._safe_task_name("美团")
+    a1 = core._safe_task_name("示例公司")
     b1 = core._safe_task_name("百度")
     assert a1.startswith("task-") and b1.startswith("task-") and a1 != b1
-    assert core._safe_task_name("美团") == a1          # stable across calls
+    assert core._safe_task_name("示例公司") == a1          # stable across calls
     # mixed names that sanitize identically stay distinct (a b vs a.b)
     m1 = core._safe_task_name("a b")
     m2 = core._safe_task_name("a.b")
@@ -33,24 +33,24 @@ def test_task_name_mapping():
 
 
 def test_two_chinese_tasks_distinct_dbs():
-    core_a = fresh_core(task="美团")
-    assert core_a.HOME.name == core_a._safe_task_name("美团")
+    core_a = fresh_core(task="示例公司")
+    assert core_a.HOME.name == core_a._safe_task_name("示例公司")
     db_a = str(core_a.DATA / "findinfo.db")
     store_a = core_a.Store()
-    store_a.upsert_asset("domain", "meituan.com", source="enscan", confidence=0.9)
+    store_a.upsert_asset("domain", "example.com", source="enscan", confidence=0.9)
     store_a.close()
     core_b = fresh_core(task="百度")
     db_b = str(core_b.DATA / "findinfo.db")
     assert db_a != db_b
     store_b = core_b.Store()
-    assert store_b.count_assets() == {}, "task 美团 assets must not leak into task 百度"
+    assert store_b.count_assets() == {}, "task 示例公司 assets must not leak into task 百度"
     store_b.close()
 
 
 def test_registrable_domain_suffix_aware():
     core = fresh_core()
-    assert core.registrable_domain("www.hniu.cn") == "hniu.cn"
-    assert core.registrable_domain("hniu.cn") == "hniu.cn"
+    assert core.registrable_domain("www.example.com") == "example.com"
+    assert core.registrable_domain("example.com") == "example.com"
     # multi-label public suffixes: last-two-labels must NOT be used here
     assert core.registrable_domain("customer.co.uk") == "customer.co.uk"
     assert core.registrable_domain("www.customer.co.uk") == "customer.co.uk"

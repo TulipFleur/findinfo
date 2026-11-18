@@ -5,10 +5,10 @@ Every subcommand prints one JSON object to stdout (machine-readable for the agen
 and human-readable progress to stderr.
 
     python findinfo.py doctor
-    python findinfo.py entity --name 美团
+    python findinfo.py entity --name 示例公司
     python findinfo.py subs   --domain example.com
     python findinfo.py probe  --from-store
-    python findinfo.py run    --name 美团 --active
+    python findinfo.py run    --name 示例公司 --active
 """
 from __future__ import annotations
 
@@ -376,7 +376,7 @@ def cmd_report(args) -> None:
     match = list(args.match or [])
     if not match and args.run:
         # Fall back to the run's own scope: a run started with two seeds
-        # (hniu.cn + hniu.com) must not have half its assets reported as
+        # (example.com + example.org) must not have half its assets reported as
         # out-of-scope noise just because the caller quoted one seed.
         spec = jobs.read_spec(args.run)
         scope = core.canon_scope(spec.get("scope") or [])
@@ -1339,7 +1339,7 @@ def _run_pipeline(args) -> int:
                 if r.get("rc") not in (0, None) and not r.get("json_files"):
                     # rc != 0 with no JSON used to fail the stage outright. But
                     # ENScan can print a complete report table and still not
-                    # write the JSON (observed on a deep 美团 query: 35 KB of
+                    # write the JSON (observed on a deep 示例公司 query: 35 KB of
                     # tables, zero files), and it can also die while wrapping up.
                     # Neither is "the entity was not found": report the real
                     # shape -- table seen, JSON missing -- and let the stage
@@ -1375,7 +1375,7 @@ def _run_pipeline(args) -> int:
         # entity anchoring discovered. certs/subs/brute only walk the first
         # --max-seed entries, and a company anchor can surface hundreds of
         # unrelated domains (ICP rows, CDN hosts) -- without this ordering a run
-        # with --domain meituan.com would spend its cert budget on app.chaoxing.com.
+        # with --domain example.com would spend its cert budget on app.chaoxing.com.
         named = [core.canon_domain(d) for d in (args.domain or [])]
         named = [d for d in named if d]
         discovered = [d for d in domains if d not in named]

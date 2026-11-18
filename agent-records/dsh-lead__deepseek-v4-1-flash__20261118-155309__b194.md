@@ -27,7 +27,7 @@
 
 
 - `python -m pytest tests/` — **167 passed**
-- `python findinfo.py report --match hniu.cn` — 生成成功，实测：2 个可折叠区块、1 个默认折叠、158 行数据、两节已消失
+- `python findinfo.py report --match example.com` — 生成成功，实测：2 个可折叠区块、1 个默认折叠、158 行数据、两节已消失
 - 提取内联 JS 用 `node --check` 验证语法通过（首次生成时发现一处引号转义错误，已修复并复查）
 - report.json 的 `next_steps` 字段仍在（未被误删）
 

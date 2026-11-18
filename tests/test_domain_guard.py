@@ -21,8 +21,8 @@ def test_js_property_chains_are_not_domains():
 
 def test_real_hosts_still_accepted():
     core = fresh_core()
-    good = ["hniu.cn", "ehall.hniu.cn", "authserver.hniu.cn",
-            "www.meituan.com", "api.example.io", "x.co.uk",
+    good = ["example.com", "ehall.example.com", "authserver.example.com",
+            "www.example.com", "api.example.io", "x.co.uk",
             "hr.lh.rendd.cn", "a1.b2.example.org", "sub.domain.tech"]
     for value in good:
         assert core.canon_domain(value) == value, "real host rejected: " + value

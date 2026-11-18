@@ -34,19 +34,20 @@ def test_target_domain_survives_a_huge_allow_list():
     core = fresh_core()
     tools = fresh_tools(core)
     decoys = ["0%d.a%d.cn" % (i, i) for i in range(3000)]
-    decoys += ["%d.chaoxing.com" % i for i in range(2000)]
-    decoys += ["%d.hniu.cn" % i for i in range(2000)]
-    cmd = _crawl_cmd(core, tools, ["meituan.com"] + decoys)
+    decoys += ["%d.decoy-a.example.net" % i for i in range(2000)]
+    decoys += ["%d.decoy-b.example.org" % i for i in range(2000)]
+    cmd = _crawl_cmd(core, tools, ["example.com"] + decoys)
     joined = chr(32).join(_filters(cmd))
-    assert "meituan" in joined, ("target dropped from katana filter", joined[:200])
+    # the filter is a regex, so the dot is escaped: look for example\.com
+    assert "example" + chr(92) + ".com" in joined, (        "target dropped from katana filter", joined[:200])
 
 
 def test_filter_never_uses_unsupported_rdn_syntax():
     """-fs rdn:<host> silently filters out EVERY result on this build."""
     core = fresh_core()
     tools = fresh_tools(core)
-    decoys = ["%d.hniu.cn" % i for i in range(3000)]
-    cmd = _crawl_cmd(core, tools, ["meituan.com"] + decoys)
+    decoys = ["%d.example.com" % i for i in range(3000)]
+    cmd = _crawl_cmd(core, tools, ["example.com"] + decoys)
     for f in _filters(cmd):
         assert not f.startswith("rdn:"), "unsupported -fs rdn: form emitted"
 
