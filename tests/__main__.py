@@ -43,6 +43,7 @@ MODULES = [
     "tests.test_docs_flow",
     "tests.test_integration_e2e",
     "tests.test_tool_resolution",
+    "tests.test_tool_inventory",
 ]
 
 

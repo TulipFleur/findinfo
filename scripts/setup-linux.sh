@@ -93,7 +93,7 @@ is_required() { case " $REQUIRED_TOOLS " in *" $1 "*) return 0 ;; *) return 1 ;;
 if [ "$CHECK" -eq 1 ]; then
   printf '%-12s %-10s %-8s %-12s %s\n' TOOL STATUS SOURCE VERSION PATH
   miss_req=0; miss_opt=0
-  for t in subfinder httpx dnsx naabu cdncheck uncover katana chaos ksubdomain hostCollision onepass enscan; do
+  for t in subfinder httpx dnsx naabu cdncheck uncover katana chaos ksubdomain hostCollision onepass enscan jsluice; do
     ver=""
     p="$PREFIX/$t"
     [ -x "$p" ] || p="$PREFIX/$t.exe"
