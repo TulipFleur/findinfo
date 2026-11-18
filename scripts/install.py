@@ -352,10 +352,8 @@ def _install_one(kind: str, dst: Path, mode: str, force: bool, dry: bool) -> dic
     # - OTHER platforms' bin dirs are excluded, but THIS platform's binaries
     #   are included -- the old pattern list named all three, so a copy on
     #   Linux shipped zero binaries and nothing ran
-    cur_platform = {"windows": "windows", "linux": "linux", "darwin": "darwin"}[
-        sys.platform if sys.platform in ("windows", "linux", "darwin")
-        else ("darwin" if sys.platform == "darwin" else "linux")]
-    other_platforms = {"windows", "linux", "darwin"} - {cur_platform}
+    cur_platform = "windows" if os.name == "nt" else "linux"
+    other_platforms = {"windows", "linux"} - {cur_platform}
     ignore = ["data", "cache", "runs", "_tmp", "__pycache__", "*.pyc", ".git",
               ".env", "config.yaml", "target", *sorted(other_platforms)]
     shutil.copytree(SOURCE, dst, ignore=shutil.ignore_patterns(*ignore))

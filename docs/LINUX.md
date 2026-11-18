@@ -23,7 +23,7 @@ bash scripts/setup-linux.sh --cap           # ③ 或装到 PATH 并顺便 setca
 python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 ~~~
 
-安装器做的事：解析 GitHub 最新 release → 下载 → 解包 → 找到可执行文件 → 装到 `--prefix`（默认 `<skill>/bin`）→ 建 onepass（cargo）/ ENScan（go）→ 打印系统参数建议。
+安装器做的事：解析 GitHub 最新 release → 下载 → 解包 → 找到可执行文件 → 装到 `<skill>/bin/linux`（固定，不支持 --prefix）→ 建 onepass（cargo）/ ENScan（go）→ 打印系统参数建议。
 它是**幂等**的，随时可以重跑；`--check` 只体检不安装，`--only httpx,katana` 只装指定几个。
 
 **退出码与版本追踪**：必需工具（subfinder/httpx/dnsx/naabu/katana/onepass）任一失败/缺失 → exit 1，调用方可以据此判定"装完能不能跑"；可选工具失败只 WARN。每次成功安装把 `工具 → tag` 记入 `<prefix>/.installed-versions`，`--check` 展示该版本（PATH 同名工具标"未记录"，`doctor` 按二进制实探交叉验证；`FOREIGN` 表示 PATH 上同名但不是该工具）。`bash scripts/build-onepass.sh` 支持从仓库根相对路径或绝对路径调用（路径基于 BASH_SOURCE 解析，cd 之后不失效）。
@@ -40,30 +40,31 @@ python3 findinfo.py doctor                  # ④ 应看到 15/15 present
 | onepass | 本仓库 `rust/onepass` | `cargo build --release` |
 | enscan | 社区镜像 ENScan_GO | `go build` |
 
-## 2. 装到哪里：bin/linux（默认）或 PATH
+## 2. 装到哪里：bin/linux（固定）
 
 `bin/` 按平台分目录，同一份代码可以同时容纳 Windows 和 Linux 的工具：
 
 ~~~text
 bin/
 ├── windows/    ← 16 个 .exe（Windows 预置；doctor 追踪 15 个）
-├── linux/      ← 15 个 ELF（bash scripts/setup-linux.sh 装到这里，默认）
+├── linux/      ← 15 个 ELF（bash scripts/setup-linux.sh 装到这里）
 └── config.example.yaml
 ~~~
 
-`core.tool()` 的查找顺序：**`bin/<当前平台>/` → `bin/`（旧扁平布局，兼容）→ `PATH`**。
-所以：
+**`core.tool()` 只查 `bin/<当前平台>/`，没有 PATH 回退、没有扁平 `bin/` 回退。**
+这是刻意的：环境里同名的二进制可能是别的版本、别的构建，甚至是完全不同的工具
+（例如 Kali 的 `python3-httpx` 也往 `/usr/bin/httpx` 放了个同名文件）。
+只认一个目录，agent 在任何机器上跑出来的结果才是可复现的。
 
-- 默认 `<skill>/bin/linux`：跟代码走，Windows/Linux 各自一套互不干扰
-- `--prefix /usr/local/bin`：多用户/多 skill 共享，一次装全机器可用
-- 旧版把二进制平铺在 `bin/` 的装法仍然有效（不会破坏）
+因此安装位置固定为 `<skill>/bin/linux`，`setup-linux.sh` 不再接受 `--prefix`。
+缺工具时 `doctor` 会报 `tool not found in <skill>/bin/<platform>/`，
+修法只有一个：把二进制补进那个目录。
 
 ~~~bash
-bash scripts/setup-linux.sh                        # 装到 bin/linux（推荐）
-bash scripts/setup-linux.sh --prefix /usr/local/bin --cap
-bash scripts/setup-linux.sh --check                # 表格：TOOL / STATUS / SOURCE / PATH
+bash scripts/setup-linux.sh                        # 装到 bin/linux
+bash scripts/setup-linux.sh --cap                  # 同时加 raw socket 能力
+bash scripts/setup-linux.sh --check                # 表格：TOOL / STATUS / SOURCE / VERSION
 ~~~
-
 ## 3. 权限：CAP_NET_RAW
 
 `naabu`（SYN 扫描）和 `ksubdomain`（裸包爆破）需要 raw socket；其余工具（httpx/katana/dnsx/hostCollision）用普通 socket，**不需要特权**。
@@ -167,7 +168,7 @@ docker run --rm --cap-add=NET_RAW --network=host -v "$PWD/config:/opt/findinfo/c
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `解包失败` | 缺 unzip / tar | `apt install -y unzip tar` |
-| `取不到 latest tag` / HTTP 403 | GitHub API 限流（匿名 60 次/时） | 等一小时，或手动下载 release 放进 `--prefix` |
+| `取不到 latest tag` / HTTP 403 | GitHub API 限流（匿名 60 次/时） | 等一小时，或手动下载 release 放进 bin/linux |
 | `无 cargo` / `无 go` | 缺工具链 | `apt install -y cargo golang`，或 `--no-onepass --no-enscan` 先跑 |
 | `setcap: Operation not permitted` | 未提权 | 用 sudo；容器加 `--cap-add=NET_RAW` |
 | `naabu` 报 socket 错误 | 没有 CAP_NET_RAW | 见第 3 节 |
@@ -181,18 +182,18 @@ docker run --rm --cap-add=NET_RAW --network=host -v "$PWD/config:/opt/findinfo/c
 在有网的机器上装到临时目录，然后整目录拷到目标机：
 
 ~~~bash
-bash scripts/setup-linux.sh --prefix ./offline-bin
-tar czf findinfo-linux.tar.gz offline-bin
+bash scripts/setup-linux.sh                        # 先在有网机器装到 <skill>/bin/linux
+tar czf findinfo-linux.tar.gz -C <skill> bin/linux
 # 目标机
-tar xzf findinfo-linux.tar.gz
-cp -f offline-bin/* <skill>/bin/ && chmod +x <skill>/bin/*
+tar xzf findinfo-linux.tar.gz -C <skill>
+chmod +x <skill>/bin/linux/*
 bash scripts/setup-linux.sh --check
-~~~
+~~~~~~
 
 ## 9. 卸载
 
 ~~~bash
-rm -f /usr/local/bin/{subfinder,httpx,dnsx,naabu,tlsx,cdncheck,uncover,katana,chaos,gau,ffuf,ksubdomain,hostCollision,onepass,enscan}
+rm -f <skill>/bin/linux/{subfinder,httpx,dnsx,naabu,tlsx,cdncheck,uncover,katana,chaos,gau,ffuf,ksubdomain,hostCollision,onepass,enscan}
 rm -rf /var/lib/findinfo            # 资产库（~/.findinfo 同理）
 # systemd
 sudo systemctl disable --now 'findinfo@example.com.timer'

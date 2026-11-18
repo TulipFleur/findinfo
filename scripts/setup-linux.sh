@@ -2,13 +2,14 @@
 # findinfo — Linux 安装/体检脚本（幂等，可重复执行）
 #
 #   bash scripts/setup-linux.sh                     # 装到 <skill>/bin（与 core.tool 查找顺序一致）
-#   bash scripts/setup-linux.sh --prefix /usr/local/bin --cap
+#   bash scripts/setup-linux.sh --cap          # 加 raw socket 能力（需要 sudo）
 #   bash scripts/setup-linux.sh --dry-run           # 只解析版本/打印下载地址，不落盘
 #   bash scripts/setup-linux.sh --check             # 只体检已装工具
 #   bash scripts/setup-linux.sh --minimal           # 跳过 gau/ffuf/chaos
 #   bash scripts/setup-linux.sh --only httpx,katana
 #
-# 卸载：删掉 --prefix 下这些文件即可，脚本不写其他地方。
+# 安装位置固定为 <skill>/bin/linux（core.tool() 只查这个目录，不回退 PATH）。
+# 卸载：删掉 bin/linux 下这些文件即可，脚本不写其他地方。
 #
 # 退出码：0 必需工具全部就位 / 1 有必需工具缺失或安装失败（详见输出）。
 # 必需（核心被动+主动链路）：subfinder httpx dnsx naabu katana onepass
@@ -18,7 +19,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# 与 core.py 的平台布局一致：bin/linux、bin/windows、bin/darwin
+# 与 core.py 的平台布局一致：bin/linux、bin/windows（不支持 macOS）
 PREFIX="${ROOT}/bin/linux"
 ARCH=""
 DRY=0
@@ -38,7 +39,6 @@ usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 && !/^#/ { exi
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --prefix)  PREFIX="$2"; shift 2 ;;
     --arch)    ARCH="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --check)   CHECK=1; shift ;;
@@ -103,28 +103,14 @@ if [ "$CHECK" -eq 1 ]; then
       printf '%-12s %-10s %-8s %-12s %s\n' "$t" ok bundle "$ver" "$p"
       continue
     fi
-    q="$(command -v "$t" 2>/dev/null || true)"
-    if [ -n "$q" ]; then
-      # PATH 上的同名文件可能是别家的（例：Kali 的 python3-httpx 也装了 /usr/bin/httpx）
-      ident="$(timeout 8 "$q" -version 2>&1 | head -3 || true)"
-      case "$ident" in
-        *[Pp]roject[Dd]iscovery*|*v[0-9]*.[0-9]*.[0-9]*) printf '%-12s %-10s %-8s %-12s %s\n' "$t" ok path "(未记录)" "$q" ;;
-        *) printf '%-12s %-10s %-8s %-12s %s\n' "$t" FOREIGN path "(未记录)" "$q" ;;
-      esac
-      if is_required "$t"; then
-        case "$ident" in *[Pp]roject[Dd]iscovery*|*v[0-9]*.[0-9]*.[0-9]*) ;; *) miss_req=$((miss_req+1));; esac
-      fi
-    else
-      printf '%-12s %-10s %-8s %-12s %s\n' "$t" MISSING - "-" "-"
-      if is_required "$t"; then miss_req=$((miss_req+1)); else miss_opt=$((miss_opt+1)); fi
-    fi
+    # 只认 bin/linux：core.tool() 不回退 PATH，环境里的同名工具不算数
+    # （例：Kali 的 python3-httpx 也往 /usr/bin/httpx 放了个同名文件）。
+    printf '%-12s %-10s %-8s %-12s %s\n' "$t" MISSING - "-" "-"
+    if is_required "$t"; then miss_req=$((miss_req+1)); else miss_opt=$((miss_opt+1)); fi
   done
   echo
-  if [ -d "${ROOT}/bin/windows" ] || [ -d "${ROOT}/bin/darwin" ]; then
-    echo "（bin/ 下还有其它平台目录：$(cd "${ROOT}/bin" && ls -d */ 2>/dev/null | tr '\n' ' ')）"
-  fi
-  echo "SOURCE: bundle = 已装到 $PREFIX；path = 来自 PATH（注意 FOREIGN 可能是同名但不同工具）"
-  echo "VERSION: 来自 $PREFIX/.installed-versions 安装清单；PATH 安装无法追溯版本"
+  echo "SOURCE: 全部工具必须位于 $PREFIX（core.tool() 只查 bin/<platform>/，不回退 PATH）"
+  echo "VERSION: 来自 $PREFIX/.installed-versions 安装清单"
   [ "$miss_opt" -gt 0 ] && warn "缺少 $miss_opt 个可选工具（不影响核心链路）"
   if [ "$miss_req" -gt 0 ]; then
     warn "缺少 $miss_req 个必需工具（$REQUIRED_TOOLS）"
@@ -327,7 +313,7 @@ while IFS='|' read -r name repo tpl bin; do
     continue
   fi
   if ! install -m 0755 "$src" "$PREFIX/$name"; then
-    warn "$name: 安装到 $PREFIX 失败（需要写权限？用 --prefix 或 sudo）"
+    warn "$name: 安装到 $PREFIX 失败（需要写权限？用 sudo）"
     if is_required "$name"; then failed_req="$failed_req $name"; else failed_opt="$failed_opt $name"; fi
     continue
   fi
@@ -339,15 +325,28 @@ log "GitHub 二进制作业完成（本次安装 $ok 个）"
 
 # ---------------------------------------------------------------- 自研二进制
 if [ "$WITH_ONEPASS" -eq 1 ]; then
-  if need cargo; then
+  # 幂等：已装好的 onepass 不需要 cargo（rustup 常在 ~/.cargo/bin，非登录
+  # shell 的 PATH 里没有 —— 不能因为没有 cargo 就把一个已就位的必需工具
+  # 判成失败）
+  if [ -x "$PREFIX/onepass" ] && [ "$FORCE" -eq 0 ]; then
+    log "---- onepass: already installed, skip (use --force to rebuild)"
+  elif need cargo || [ -x "$HOME/.cargo/bin/cargo" ]; then
+    [ -x "$HOME/.cargo/bin/cargo" ] && [ -n "${PATH%%*\.cargo/bin*}" ] && \
+      export PATH="$HOME/.cargo/bin:$PATH"
     log "---- onepass（cargo build --release）"
     if [ "$DRY" -eq 1 ]; then log "     dry-run: 跳过编译"; else
       if bash "$ROOT/scripts/build-onepass.sh" >/dev/null 2>&1; then
-        if [ -f "$ROOT/bin/onepass" ]; then
-          install -m 0755 "$ROOT/bin/onepass" "$PREFIX/onepass" && \
+        # build-onepass.sh 现在写 bin/<platform>/；兼容旧的扁平 bin/ 产物
+        built="$ROOT/bin/onepass"
+        [ -f "$built" ] || built="$ROOT/bin/linux/onepass"
+        if [ -f "$built" ]; then
+          install -m 0755 "$built" "$PREFIX/onepass" && \
             record_version onepass "$(grep -m1 '^version' "$ROOT/rust/onepass/Cargo.toml" | sed 's/[^0-9.]*//g')"
+          log "     installed -> $PREFIX/onepass"
+        else
+          warn "onepass 编译成功但找不到产物（build-onepass.sh 输出位置变了？）"
+          failed_req="$failed_req onepass"
         fi
-        log "     installed -> $PREFIX/onepass"
       else
         warn "onepass 编译失败（cargo 报错见 scripts/build-onepass.sh 输出）"
         failed_req="$failed_req onepass"
@@ -360,7 +359,10 @@ if [ "$WITH_ONEPASS" -eq 1 ]; then
 fi
 
 if [ "$WITH_ENSCAN" -eq 1 ]; then
-  if need go; then
+  if [ -x "$PREFIX/enscan" ] && [ "$FORCE" -eq 0 ]; then
+    log "---- enscan: already installed, skip (use --force to rebuild)"
+  elif need go || [ -x /usr/local/go/bin/go ]; then
+    [ -x /usr/local/go/bin/go ] && command -v go >/dev/null 2>&1 || export PATH="/usr/local/go/bin:$PATH"
     log "---- enscan（go build，需联网拉源码）"
     if [ "$DRY" -eq 1 ]; then log "     dry-run: 跳过编译"; else
       if bash "$ROOT/scripts/build-enscan.sh" >/dev/null 2>&1; then

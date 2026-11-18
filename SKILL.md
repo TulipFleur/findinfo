@@ -408,7 +408,7 @@ findinfo/
 ├── SKILL.md            ← 本文件（AI 读这个决定怎么用）
 ├── findinfo.py         ← CLI 入口（19 个子命令）
 ├── prompts/AGENT.md    ← ★ 新会话工作流提示词（含交付模板）
-├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（bin/darwin/）
+├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
 │   ├── windows/        ← 16 个 .exe（Windows 预置；doctor 追踪 15 个）
 │   ├── linux/          ← 15 个 ELF（scripts/setup-linux.sh 装到这里）
 │   └── config.example.yaml  ← ENScan Cookie 模板 → 复制成 bin/config.yaml

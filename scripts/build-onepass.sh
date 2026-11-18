@@ -20,7 +20,7 @@ cargo build --release
 PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$PLATFORM" in
   msys*|mingw*|cygwin*) PLATFORM="windows"; EXE="onepass.exe" ;;
-  darwin)              PLATFORM="darwin";   EXE="onepass" ;;
+  darwin)              echo "onepass: macOS not supported (windows/linux only)" >&2; exit 1 ;;
   *)                   PLATFORM="linux";    EXE="onepass" ;;
 esac
 DEST="$ROOT/bin/$PLATFORM"

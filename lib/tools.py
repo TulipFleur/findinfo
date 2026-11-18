@@ -1659,6 +1659,33 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
 VERSION_ARGS = ["-version", "--version", "-V", "-h"]
 
 
+# The only bundled binary that is built from in-repo source: if the binary is
+# older than the source tree, a rebuild was forgotten and fixes silently
+# never shipped (exactly how a UTF-8 panic fix stayed out of bin/ for a day).
+_SOURCE_BUILT_TOOLS = {
+    "onepass": core.ROOT / "rust" / "onepass" / "src",
+}
+
+
+def _stale_check(name: str, exe: str) -> dict | None:
+    """Compare the binary's mtime against the source dir it is built from."""
+    src = _SOURCE_BUILT_TOOLS.get(name)
+    if not src or not src.exists():
+        return None
+    try:
+        exe_mt = os.path.getmtime(exe)
+        src_newest = exe_mt
+        for p in src.rglob("*.rs"):
+            src_newest = max(src_newest, os.path.getmtime(p))
+        if src_newest > exe_mt + 60:      # 1min skew tolerance for copy tools
+            return {"stale_binary": True,
+                    "hint": ("binary is older than " + str(src) +
+                             "; rebuild it: bash scripts/build-onepass.sh")}
+    except OSError:
+        return None
+    return None
+
+
 def doctor() -> dict:
     names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "tlsx", "cdncheck",
              "uncover", "katana", "chaos", "gau", "ffuf", "ksubdomain", "onepass",
@@ -1678,38 +1705,33 @@ def doctor() -> dict:
             if m:
                 ver = m.group(1)
                 break
-        # "bundle" means it came from the skill's own bin tree, either the
-        # per-platform subdir (bin/<platform>/) or the legacy flat bin/.
-        exe_dir = os.path.abspath(os.path.dirname(exe))
-        bundle_dirs = {os.path.abspath(str(core.BIN)),
-                       os.path.abspath(str(core.BIN_PLATFORM))}
-        in_bin = exe_dir in bundle_dirs
+        # core.tool() only resolves inside bin/<platform>/, so anything that
+        # turns up here is a bundled binary by construction.
         report[n] = {"present": True, "path": exe, "version": ver,
-                     "source": "bundle" if in_bin else "path"}
-        if not in_bin:
-            report[n]["hint"] = ("resolved from PATH, not from <skill>/bin/; put the "
-                                 "binary in <skill>/bin/" + core.PLATFORM +
-                                 " or run scripts/setup-linux.sh")
+                     "source": "bundle"}
+        stale = _stale_check(n, exe)
+        if stale:
+            report[n].update(stale)
         if not ver:
-            # A same-named binary from PATH (e.g. Kali's python3-httpx owns
-            # /usr/bin/httpx) would otherwise look "present" and then fail on
-            # every real invocation. Probe its help text for an identity hint.
+            # A binary that cannot state its version is not necessarily wrong,
+            # but if it also fails to identify itself it is worth flagging:
+            # the file in bin/<platform>/ may be broken or a wrong build.
             _rc, _out, _err = core.run([exe, "-h"], timeout=15)
             _blob = ((_out or "") + (_err or "")).lower()
             if "projectdiscovery" not in _blob and n.lower() not in _blob:
                 report[n]["suspect"] = True
-                if not in_bin:
-                    report[n]["hint"] = ("found on PATH but does not look like " + n +
-                                         "; PATH collision? install into bin/ via scripts/setup-linux.sh")
-                else:
-                    report[n]["hint"] = ("binary in bin/ does not identify itself as " + n +
-                                         "; it may be broken or the wrong build")
+                report[n]["hint"] = ("binary in bin/ does not identify itself as " + n +
+                                     "; it may be broken or the wrong build -- reinstall "
+                                     "it into bin/" + core.PLATFORM + "/")
     keys = {k: bool(api_key_or_empty(k)) for k in ["fofa", "quake", "hunter", "chaos",
                                                    "securitytrails", "virustotal", "urlscan"]}
     missing = [n for n, v in report.items() if not v.get("present")]
-    outside = [n for n, v in report.items()
-               if v.get("present") and v.get("source") != "bundle"]
+    # Every resolvable tool lives in bin/<platform>/ now: core.tool() has no
+    # PATH fallback, so "outside bin" cannot happen. Kept in the output
+    # shape so existing consumers of doctor keep parsing.
+    outside = []
     suspects = [n for n, v in report.items() if v.get("suspect")]
+    stale = [n for n, v in report.items() if v.get("stale_binary")]
     gw_base = core.api_base("fofa")
     gw = None
     if gw_base and core.api_key("fofa"):
@@ -1718,7 +1740,8 @@ def doctor() -> dict:
               "remaining": (u or {}).get("remaining"),
               "max": (u or {}).get("maxQueries"),
               "usable": (u or {}).get("usable")}
-    return {"python": "ok", "tools": report, "api_keys": keys,
+    return {"python": "ok", "skill_version": core.skill_version(),
+            "tools": report, "api_keys": keys,
             "fofa_gateway": gw,
             "tools_summary": {
                 "total": len(names),
@@ -1726,9 +1749,10 @@ def doctor() -> dict:
                 "outside_bin": outside,
                 "missing": missing,
                 "suspect": suspects,
+                "stale_binary": stale,
                 "all_in_bin": not missing and not outside,
             },
-            "bin_dir": str(core.BIN_PLATFORM if core.BIN_PLATFORM.exists() else core.BIN),
+            "bin_dir": str(core.BIN_PLATFORM),
             "bin_platform": core.PLATFORM,
             "db": str(core.DATA / "findinfo.db"),
             "root": str(core.ROOT), "home": str(core.HOME)}

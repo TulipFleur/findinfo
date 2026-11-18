@@ -28,17 +28,48 @@ ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "bin"
 
 
+def skill_version() -> str:
+    """Version stamp of this skill copy (VERSION file at the repo root).
+
+    Agents working across machines (Windows host + WSL clone + containers) need
+    to detect copy drift: a stale clone silently behaves differently even
+    though every command succeeds. doctor reports this value; comparing it
+    across environments is the intended usage. Falls back to 'unknown'.
+    """
+    try:
+        return (ROOT / "VERSION").read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
 def _platform_tag() -> str:
     """Directory name used to keep per-platform binaries apart under bin/."""
     if os.name == "nt":
         return "windows"
     if sys.platform == "darwin":
-        return "darwin"
+        raise RuntimeError(
+            "findinfo does not ship macOS binaries: supported platforms are "
+            "windows (bin/windows/*.exe) and linux (bin/linux/*). "
+            "Run on Windows or Linux."
+        )
     return "linux"
 
 
 PLATFORM = _platform_tag()
 BIN_PLATFORM = BIN / PLATFORM
+
+
+def skill_version() -> str:
+    """Skill version string, read from the VERSION file at the repo root.
+
+    Surfaced through `doctor` so an agent can tell which build it is talking
+    to. Falls back to "unknown" rather than raising: a missing VERSION file
+    must never break a diagnostic command.
+    """
+    try:
+        return (ROOT / "VERSION").read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
 
 
 def _safe_task_name(task: str) -> str:
@@ -396,24 +427,27 @@ def tool_env() -> dict:
 
 # ---------------------------------------------------------------- tool lookup
 def tool(name: str) -> str:
-    """Resolve a bundled binary for this platform, else fall back to PATH.
+    """Resolve a bundled binary. Only bin/<platform>/ is searched.
 
-    Search order:
-      1. bin/<platform>/<name>[.exe]   per-platform, the recommended layout
-      2. bin/<name>[.exe]             legacy flat layout (still supported)
-      3. PATH                         system-installed (Linux via setup-linux.sh --prefix)
+    There is deliberately NO PATH fallback and NO flat bin/ fallback. A
+    same-named binary from the ambient environment may be a different build,
+    a different version, or an unrelated tool that happens to share the
+    name; resolving it silently made every result depend on whichever machine
+    the agent ran on. Bundling all tools under one directory is what makes a
+    run repeatable.
+
+    Repair is always the same action: install the missing binary into
+    bin/<platform>/ (Windows: drop the .exe there; Linux: run
+    scripts/setup-linux.sh), then re-run doctor.
     """
-    for base in (BIN_PLATFORM, BIN):
-        for cand in (name, name + ".exe"):
-            p = base / cand
-            if p.exists():
-                return str(p)
-    found = shutil.which(name)
-    if found:
-        return found
+    for ext in ("", ".exe"):
+        p = BIN_PLATFORM / (name + ext)
+        if p.exists():
+            return str(p)
     raise ToolMissing(
-        "tool not found in bin/" + PLATFORM + "/, bin/ or PATH: " + name +
-        " -- run: python findinfo.py doctor"
+        "tool not found in " + str(BIN_PLATFORM) + ": " + name +
+        " -- install it into bin/" + PLATFORM + "/, then run: " 
+        "python findinfo.py doctor"
     )
 
 
