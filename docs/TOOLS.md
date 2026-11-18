@@ -45,7 +45,7 @@ python findinfo.py doctor
 
 **`source` / `tools_summary`**：`bundle` = 解析到 `<skill>/bin`（自包含，推荐）；`path` = 从 `PATH` 借的，
 可能根本不是同一个工具（Kali 的 `python3-httpx` 就占着 `/usr/bin/httpx`，此时会给 `suspect` + `hint`）。
-`all_in_bin: true` 是“15 个工具全在 skill 目录”的机器可读结论。
+`all_in_bin: true` 是“13 个工具全在 skill 目录”的机器可读结论。
 
 **何时调**：每次会话第一条命令。`api_keys` 全 false 说明只能跑无 key 链路。
 
@@ -391,6 +391,18 @@ python findinfo.py extract --from-store        # 回流：直接用库里的 URL
 **三种来源**：`--url` 指定单个 JS/页面；`--from-run` 读 crawl 的 JSONL 产物；
 `--from-store` 直接用库里 `kind=url` 的资产（回流循环里用它，不必关心 runs 目录路径）。
 每次最多抓 40 个 JS/JSON/map 文件，扫描文本有 4 MB 预算（防内存爆）。
+
+**双引擎**：默认优先用 **jsluice**（tree-sitter AST 解析）——它能恢复正则看不到的
+参数拼接（`"/login?redirect=" + redirect` 这种，AST 行里 queryParams=[redirect]），
+返回里每条记录带 `engine: "jsluice"`；**没有 jsluice 二进制时自动回退纯 Python 正则**
+（`lib/jsleak.py`，覆盖略低但零依赖）。jsluice 不随 setup-linux.sh 安装，需要 AST 级
+提取时自备：
+
+```bash
+go install github.com/BishopFox/jsluice/cmd/jsluice@latest   # 需 go >= 1.21
+cp "$(go env GOPATH)/bin/jsluice" bin/linux/                  # 或 bin/windows/jsluice.exe
+python findinfo.py doctor                                     # 确认 jsluice 出现在 tools 里
+```
 
 **输出**
 
