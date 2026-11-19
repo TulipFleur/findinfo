@@ -101,6 +101,7 @@ def test_docs_document_wait_and_status_run():
 DOC_PATHS = ["SKILL.md", "README.md", "prompts/AGENT.txt"] + [
     "docs/" + p for p in (
         "TOOLS.md", "LINUX.md", "CLIENTS.md", "API-KEYS.md", "DEVELOPMENT.md",
+        "DATA-MODEL.md", "TROUBLESHOOTING.md",
     )
 ]
 
@@ -508,3 +509,57 @@ def test_agent_txt_places_authorization_before_active_stages():
         pos = text.find(needle)
         assert pos != -1, AGENT_TXT + " no longer shows " + needle
         assert pos > gate, AGENT_TXT + " runs an active stage before the gate: " + needle
+
+
+# ---------------------------------------------------------------- size budgets
+
+# SKILL.md is loaded into the agent's context on every invocation and
+# AGENT.txt is pasted in whole, so both have a hard size budget. The numbers are
+# deliberately explicit: "it grew a bit" is how 25 KB became 28 KB.
+SKILL_BUDGET = 15 * 1024
+AGENT_BUDGET = 12 * 1024
+DESCRIPTION_BUDGET = 1024
+
+
+def _size_of(rel):
+    """Logical size of a doc: text with LF endings.
+
+    The checkout converts to CRLF on Windows (core.autocrlf=true), which
+    adds one byte per line; measuring bytes on disk would make the budget
+    depend on the host instead of on how much text the agent must read.
+    """
+    root = Path(__file__).resolve().parent.parent
+    text = (root / rel).read_text(encoding="utf-8")
+    return len(text.replace("\r\n", "\n").encode("utf-8"))
+
+
+def test_skill_md_stays_within_its_context_budget():
+    size = _size_of("SKILL.md")
+    assert size <= SKILL_BUDGET, (
+        "SKILL.md is " + str(size) + " bytes, over the " + str(SKILL_BUDGET)
+        + "-byte budget; move detail into docs/TOOLS.md and leave a link")
+
+
+def test_agent_template_stays_within_its_paste_budget():
+    size = _size_of(AGENT_TXT)
+    assert size <= AGENT_BUDGET, (
+        AGENT_TXT + " is " + str(size) + " bytes, over the " + str(AGENT_BUDGET)
+        + "-byte budget; put rules that also live in SKILL.md behind a pointer")
+
+
+def test_skill_description_fits_the_client_limit():
+    """Clients cap the frontmatter description; over-long ones get truncated."""
+    import yaml  # noqa: F401  (only to confirm the dependency exists)
+
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "SKILL.md").read_text(encoding="utf-8")
+    assert text.startswith("---"), "SKILL.md must open with YAML frontmatter"
+    front = text.split("---", 2)[1]
+    desc = ""
+    for line in front.splitlines():
+        if line.startswith("description:"):
+            desc = line.split(":", 1)[1].strip()
+    assert desc, "SKILL.md frontmatter has no description"
+    assert len(desc) <= DESCRIPTION_BUDGET, (
+        "description is " + str(len(desc)) + " characters, over "
+        + str(DESCRIPTION_BUDGET))

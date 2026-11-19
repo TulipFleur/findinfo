@@ -10,7 +10,7 @@
 | **Claude Code** | 扫描 skills 目录 | `~/.claude/skills/findinfo` | 同上（frontmatter 的 `name` 必须等于目录名） |
 | **Codex CLI** | **读 config.toml 注册表** | 任意（建议 `~/.codex/skills/findinfo`） | `~/.codex/config.toml` 的 `[[skills.config]]` + `enabled = true` |
 | **Claude Desktop · Code 标签** | 就是 Claude Code，扫描 skills 目录 | `~/.claude/skills/findinfo` | 同 Claude Code |
-| **Claude Desktop · 聊天 / Cowork** | 运行在云端 Linux 沙箱，**不读本机 skills 目录** | — | 本项目跑不了（包含 Windows 二进制，且沙箱出网受限） |
+| **Claude Desktop · 聊天 / Cowork** | 待确认：桌面端有本地 agent 模式（`local-agent-mode-sessions/skills-plugin`，但只装了 Anthropic 自家 skill），会话也可能在云端执行；官方文档当前不可达 | — | 第三方 skill 能否加载、会话在本地还是云端：**待确认**。即使能加载，Windows 包里的 `.exe` 在 Linux 沙箱里也跑不了 |
 
 **关键坑（已踩过）**：只往 `~/.codex/skills/` 建链接，Codex 完全看不见；
 而且 `[[skills.config]]` 必须同时有 `path` 和 `enabled`——只写 `path` 会让整份 config 失效（`codex doctor` 报 `invalid data`）。
@@ -59,13 +59,18 @@ python scripts/install.py --enable-instructions   # 全局，影响所有 skill
 - 改完跑 `codex doctor`，`0 fail` 才算配置有效。
 
 ### Claude Desktop
-桌面端分两种运行位置，行为不同（以 Anthropic 官方 skills 文档为准）：
 
-- **Code 标签** = Claude Code 本体，读 `~/.claude/skills/`，和终端用法一致。
-- **聊天 / Cowork 会话**：跑在**云端 Linux 沙箱**里，不加载本机 skills 目录（只加载 claude.ai 账号同步的 skills）。
-  即使同步了，**本项目也跑不起来**：交付包里是 Windows `.exe`，沙箱是 Linux；
-  而且沙箱出网受限，主动阶段向目标发包也不现实。
-- 要在桌面上用，走 Code 标签；要在云端用，得把 skill 提交到仓库的 `.claude/skills/` 且使用 Linux 二进制。
+桌面端存在两套运行方式，本次**未能核实官方文档**（`docs.claude.com` / `docs.anthropic.com` 在本地被地域墙拦截，只能拿到 "App unavailable in region"），以下据本机文件证据与 Anthropic 自家 skill 内的措辞给出，标 **待确认** 的部分不要当成结论：
+
+- **Code 标签 = Claude Code 本体**，读 `~/.claude/skills/`，与终端用法一致。这条可用。
+- **聊天 / Cowork 会话**：本机 `%APPDATA%\Claude\local-agent-mode-sessions\` 与
+  `%LOCALAPPDATA%\Claude-Data\<id>\local-agent-mode-sessions\` 下确有 `skills-plugin`（`plugin.json` 名为 `anthropic-skills`），
+  里面只放 Anthropic 自家的 17 个 skill（`source: anthropic-example`）——说明桌面端有**本地 agent 模式**的 skills 装入点，
+  但这是否对第三方 skill 开放、以及会话究竟跑在本机还是云端，**待确认**（Anthropic 的 `computer-use` skill 里同时区分了
+  "session runs in the desktop app" 与 "cloud session"，可见两种都存在）。
+- 即便第三方 skill 能被加载，**用 Windows 包也跑不起来**：包里是 `.exe`，云端沙箱是 Linux；
+  要云端用就得在 Linux 上装 Linux 包（[docs/LINUX.md](LINUX.md)）。
+- **实操建议**：要在桌面上跑本项目，走 Code 标签。
 
 ## 4. 状态共享
 

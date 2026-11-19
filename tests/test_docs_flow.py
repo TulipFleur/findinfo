@@ -77,8 +77,8 @@ def _clean_env():
 def test_skill_standard_flow_is_single_line_and_ordered():
     """The canonical flow must be: doctor -> run --background -> wait -> status."""
     text = _skill_text()
-    loop = _section("1.6", text)
-    assert loop, "SKILL.md must keep the agent session section (§1.6)"
+    loop = _section("1.5", text)
+    assert loop, "SKILL.md must keep the agent session section (§1.5)"
     cmds = _commands(loop)
     joined = "\n".join(cmds)
 

@@ -135,36 +135,8 @@ skill 假定宿主满足三件事：**本地 Python ≥3.10**、**能执行仓�
 
 ## 让 Agent 使用这个 Skill
 
-findinfo 是给 AI agent 调用的：装好之后，用一段提示词让 agent 自己去跑完整流程，
-不需要人盯着敲命令。下面两种用法二选一。
-
-### 用法一：一句话（最省事）
-
-直接把下面这段发给 agent，把 `{{TARGET}}` 换成目标域名或企业名即可：
-
-```text
-用 findinfo skill 完整收集 {{TARGET}} 的资产。
-1) 定位 skill 目录 → python findinfo.py doctor（要求 tools_summary.all_in_bin=true）
-   → python findinfo.py runs --active 看有没有在跑的旧任务
-2) 起任务：python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --vhost --crawl --background --rounds 3
-   拿到 run_id（reused=true 说明已有在跑，直接用它的 run_id，不要再起一个）
-3) 等待：python findinfo.py wait --run <run_id> --timeout 30，超时返回 running 只代表本次等待结束，
-   继续等同一个 run_id；不要重启、不要提前宣布完成
-4) 结果：state=completed → python findinfo.py status --run <run_id> 读 result/coverage；
-   失败/中断 → run --resume <run_id> 断点续跑；预算用尽 → 如实说明覆盖不完整
-5) 交付：python findinfo.py brief --match {{TARGET}}（你读的，stdout 一行 JSON）+
-   python findinfo.py report --match {{TARGET}}（人看的 md/html），
-   最终说明必须写清 结束原因（complete/partial/failed/cancelled）、已执行/失败/未执行阶段、覆盖缺口与产物路径
-```
-
-### 用法二：完整工作流（推荐，交给新会话 agent）
-
-把 [`prompts/AGENT.txt`](prompts/AGENT.txt) 整份内容作为提示词投给 agent。它比一句话版多了：
-
-- 快速路径 / 全面路径的分阶段命令（先 5 分钟内出第一版，再逐步加深）
-- 结果推进判据：`wait` 超时、`state=failed`、`reused=true` 各自该怎么处理
-- 回流循环规则：什么时候该再跑一轮、什么时候该收口
-- 交付模板：报告该写哪些字段、证据怎么标注
+findinfo 是给 AI agent 调用的。把 [`prompts/AGENT.txt`](prompts/AGENT.txt) 整份内容作为提示词投给 agent（替换其中的占位符即可）。
+工作流、硬规则、判读与交付模板都在那一份里，本文件不重复。Agent 装载后的行为约束见 [SKILL.md](SKILL.md)。
 
 ### 需要哪些 API Key（可选项，不配也能跑 80%）
 
@@ -215,7 +187,7 @@ python scripts/install.py --status   # 查每个客户端是否已装
 python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 ```
 
-不同客户端的加载机制不一样（Codex 走 config.toml 注册表、Claude Desktop 只能走 MCP），
+不同客户端的加载机制不一样（Codex 走 `config.toml` 注册表；Claude Desktop 的聊天/Cowork 是否能加载第三方 skill **待确认**，Code 标签可用），
 细节和常见坑见 [docs/CLIENTS.md](docs/CLIENTS.md)。
 
 ### 使用边界
@@ -232,6 +204,8 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
 | docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd、故障排查 |
 | docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex / Claude Desktop）加载机制与坑 |
+| docs/DATA-MODEL.md | **数据模型**：资产字段、置信度规则、报告字段口径、旧数据迁移 |
+| docs/TROUBLESHOOTING.md | **故障与结果推进**：常见故障、wait 判读、来源级分支、红线 |
 | docs/DEVELOPMENT.md | **开发文档**：目录结构、回归测试怎么跑（日常使用不需要看） |
 | prompts/AGENT.txt | **复制给 agent 的完整工作流提示词模板**（人工复制粘贴，不参与自动加载） |
 
@@ -247,26 +221,19 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 ## 核心设计
 
 1. **确定性优先**：能工具化的不交给模型，所有工具返回结构化数据
-2. **provenance + confidence**：每条资产记录谁发现的（采集工具+上游两层）、几个**独立上游**、可信度。同一上游（如 crt.sh）经不同采集入口只算一票；重复跑/乱序不会提升置信度
+2. **provenance + confidence**：每条资产记录谁发现的、几个**独立上游**、可信度；同一上游经不同入口只算一票，重复跑/乱序不提升置信度
 3. **幂等 + 增量**：findinfo.db 是唯一真值，重复跑只更新 sources
-4. **被动/主动物理分离**：--active 之前不产生任何目标流量
-5. **任务隔离**：`--task 名字` 各任务独立数据库；中文名会映射成稳定且可区分的目录（纯中文名 → `tasks/task-<hash>`，不会都落到 default）
-6. **断点续跑**：阶段按输入哈希 checkpoint；`--active`/`--crawl` 追加运行时已完成阶段跳过并从库里重建输入。**阶段失败（如工具 rc=124）不写 done**，重跑会自动重试
-7. **范围控制**：`run` 只主动触达 `--domain`/企业锚点给出的种子；ICP 反查、JS 泄露等发现的**范围外域名只入库报告，不自动扩大主动范围**。范围推导用公共后缀表（customer.co.uk 不会扩成 co.uk）
+4. **被动/主动物理分离**：`--active` 之前不产生任何目标流量
+5. **任务隔离**：`--task 名字` 各任务独立数据库（中文名映射到稳定的 `tasks/task-<hash>` 目录）
+6. **断点续跑**：阶段按输入哈希 checkpoint；**阶段失败（如工具 rc=124）不写 done**，重跑自动重试
+7. **范围控制**：`run` 只主动触达种子域名；范围外域名只入库报告，不扩大主动范围（用公共后缀表推导范围）
 
-### 展示上限 ≠ 处理上限
-
-工具 stdout 里的列表（默认最多 500 行）只是**展示样本**；阶段实际处理的全量都进了库，下游阶段（probe/ports/crawl/extract）从库里取完整集合。人为预算（--max-seed/--limit/--max-vhost-ips 等）造成的覆盖缺口会在 summary/report 里明说。
-
-### 旧数据兼容与迁移
-
-- **任务名目录**：纯 ASCII 任务名目录不变；旧版把中文名任务都落到 `tasks/default`（混在一个库里）。修复后中文名任务映射到 `task-<hash>` 独立目录。**旧 default 库不会被动过**，要访问它：`python findinfo.py --task default assets`。
-- **来源列**：旧格式 `onepass:crt.sh,rapiddns`（仅首 token 带前缀）在读取/合并时自动归一为 `onepass:crt.sh,onepass:rapiddns`，无需手工迁移。
-- **置信度重算**：合并时按独立上游数确定性重算。历史上因前缀 bug 虚高到 0.95、实际只有 2 个上游的分数，在下一次合并时会被压回 ≤0.9；证据齐全的 0.95（≥3 上游）不受影响。不做批量刷库。
+字段含义、置信度规则、展示上限与旧数据迁移口径统一写在 [docs/DATA-MODEL.md](docs/DATA-MODEL.md)。
 
 ## 运行状态与失败语义
 
-- `findinfo.py status`：心跳（阶段每 30s 刷新 status.json）+ pid 判活；超过 90s 无心跳或进程不在即 `alive=false`。
-- 阶段状态：`done`（成功）/ `failed`（工具失败，**部分结果仍保留**且下游可用，重跑自动重试）/ `skipped`（checkpoint 命中）。
+- `findinfo.py status`：心跳（每 30s 刷 status.json）+ pid 判活；超过 90s 无心跳或进程不在即 `alive=false`。
+- 阶段状态：`done` / `failed`（**部分结果仍保留**且下游可用，重跑自动重试）/ `skipped`（checkpoint 命中）。
 - 退出码：0 成功 / 2 业务错 / 4 工具缺失 / 5 阶段失败（含部分结果）。
+- 逐条判读见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
