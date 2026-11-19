@@ -1405,12 +1405,39 @@ def _brief_host(h):
     return out
 
 
+def _is_gap_value(value) -> bool:
+    """True for a value that actually describes a gap.
+
+    coverage.unavailable carries two flags next to the real lists -- blocking
+    (a bool) and note (often empty). Expanding every key into a row produced
+    junk like {"kind": "blocking", "reason": "False"}, which makes a reader
+    distrust the whole block. A bool says nothing on its own and an empty
+    string says less; the caller handles both explicitly instead.
+    """
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+_GAP_FLAG_KEYS = ("blocking", "blocking_tools", "note")
+
+
 def _brief_coverage(data=None, coverage=None):
     """Failed / not-run / unavailable stages, each with a human-readable why.
 
     This is the part agents get wrong most often: a run with three unavailable
     sources is not the same as a run with nothing found, and a brief that only
     lists findings cannot tell the two apart.
+
+    known is part of the answer: when no run could be read there are no gaps
+    to report, which is NOT the same as "there were no gaps", and the brief
+    has to say so rather than show an empty list that reads like a clean bill.
     """
     # Callers pass either a whole digest (data) or a ready coverage block; both
     # have to end up in the same shape, or a caller-supplied block silently
@@ -1420,20 +1447,27 @@ def _brief_coverage(data=None, coverage=None):
     cov = coverage or {}
     unavail = cov.get("unavailable") or {}
     unavailable = []
+    blocking = cov.get("blocking") is True
+    note = str(cov.get("note") or "").strip()
     for key, entries in unavail.items():
+        if key in _GAP_FLAG_KEYS:
+            continue
         if isinstance(entries, dict):
             entries = list(entries.items())
         if not isinstance(entries, (list, tuple)):
-            unavailable.append({"kind": key, "reason": str(entries)})
+            if _is_gap_value(entries):
+                unavailable.append({"kind": key, "reason": str(entries)})
             continue
         for item in entries:
             if isinstance(item, dict):
                 row = dict(item)
                 row.setdefault("kind", key)
                 unavailable.append(row)
-            else:
+            elif _is_gap_value(item):
                 unavailable.append({"kind": key, "reason": str(item)})
-    return {
+    out = {
+        "source": str(cov.get("source") or "none"),
+        "known": bool(cov.get("known")),
         "failed_stages": [dict(x) for x in (cov.get("failed_stages") or [])
                           if isinstance(x, dict)],
         "not_run_stages": list(cov.get("not_run_stages") or []),
@@ -1441,6 +1475,19 @@ def _brief_coverage(data=None, coverage=None):
         "unavailable": unavailable[:BRIEF_MAX_COVERAGE],
         "unavailable_total": len(unavailable),
     }
+    if blocking:
+        # A blocking gap is what explains a partial run, so it gets its own
+        # top-level entry instead of hiding in unavailable as reason=True.
+        out["blocking"] = True
+        if note:
+            out["blocking_reason"] = note
+    elif note:
+        out["note"] = note
+    if not out["known"]:
+        out["hint"] = ("no run matched, so this does not mean there were no "
+                       "gaps; pass --run <run_id> (see: runs) to read real "
+                       "coverage")
+    return out
 
 
 def build_brief(data, top=None, leak_limit=None, max_bytes=None, coverage=None) -> dict:
@@ -1492,11 +1539,11 @@ def build_brief(data, top=None, leak_limit=None, max_bytes=None, coverage=None) 
     if len(ranked) > len(brief["top_hosts"]):
         brief["truncated"]["top_hosts"] = {
             "kept": len(brief["top_hosts"]), "total": len(ranked),
-            "hint": "--brief-top 调整；完整列表在 report.json 的 hosts"}
+            "hint": "--brief-top 调整；完整列表：report --with-json，或 assets --export"}
     if len(internal) > len(brief["internal_services"]):
         brief["truncated"]["internal_services"] = {
             "kept": len(brief["internal_services"]), "total": len(internal),
-            "hint": "完整列表在 report.json 的 internal_services"}
+            "hint": "完整列表：report --with-json，或 assets --export"}
     for key in ("domains", "ips"):
         total = brief["leaks"][key + "_total"]
         kept = len(brief["leaks"][key])

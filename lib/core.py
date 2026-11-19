@@ -169,10 +169,14 @@ _OUTCOME_RANK = {
 def combine_outcome(*outcomes: str) -> str:
     """Merge per-source outcomes, never letting a gap masquerade as success.
 
-    Rules (see tests/test_source_outcomes.py for the contract):
+    Rules (see tests/test_outcome_and_evidence.py for the contract):
       - no source at all usable -> unavailable (a coverage gap, not a failure)
       - every usable source failed -> failed
-      - some usable succeeded, some failed -> partial
+      - every usable source timed out -> timeout, never failed: the fix is a
+        bigger deadline, and "the tool is broken" sends an agent retrying
+        something that only needed more time
+      - some usable succeeded, some broke -> partial (timeout if one of the
+        broken ones timed out: the results are real but a deadline was hit)
       - otherwise the worst remaining outcome wins (timeout > partial > budget)
     Unknown values are ignored so a new adapter cannot poison the merge.
     """
@@ -183,6 +187,8 @@ def combine_outcome(*outcomes: str) -> str:
     if not usable:
         return OUTCOME_UNAVAILABLE
     if all(o in (OUTCOME_FAILED, OUTCOME_TIMEOUT) for o in usable):
+        if all(o == OUTCOME_TIMEOUT for o in usable):
+            return OUTCOME_TIMEOUT
         return OUTCOME_FAILED
     succeeded = [o for o in usable
                  if o in (OUTCOME_OK, OUTCOME_EMPTY, OUTCOME_PARTIAL, OUTCOME_BUDGET)]
@@ -190,6 +196,37 @@ def combine_outcome(*outcomes: str) -> str:
     if succeeded and broken:
         return OUTCOME_TIMEOUT if OUTCOME_TIMEOUT in broken else OUTCOME_PARTIAL
     return max(usable, key=lambda o: _OUTCOME_RANK[o])
+
+
+# Marker for "we could not tell what the last run did". A brief that shows an
+# empty gap list because it read the wrong run is worse than one that admits
+# ignorance: the agent reads "no gaps" and reports a clean result.
+COVERAGE_SOURCE_NONE = "none"
+
+
+def select_coverage(coverage: dict | None, source: str) -> dict:
+    """Wrap a run coverage block with where it came from.
+
+    `source` is the run id it was read from, or COVERAGE_SOURCE_NONE when no
+    run matched at all. known=False tells the brief "this is not evidence of
+    zero gaps" -- report and brief must call this identically, or the same
+    question gets two different answers depending on the command.
+    """
+    out = dict(coverage) if isinstance(coverage, dict) else {}
+    src = str(source or "").strip()
+    # "known" needs an actual run id AND something recorded in it. Copying the
+    # source key into `out` first would make bool(out) always true, which is
+    # exactly the "no gaps found" lie this function exists to prevent.
+    known = bool(src) and src != COVERAGE_SOURCE_NONE and bool(out)
+    out["source"] = src or COVERAGE_SOURCE_NONE
+    out["known"] = known
+    return out
+
+
+def empty_coverage() -> dict:
+    """The honest answer when no run matched: known=False, not a clean bill.
+    """
+    return select_coverage(None, COVERAGE_SOURCE_NONE)
 
 
 def outcome_from_rc(rc: int, count: int, *, ok: bool | None = None) -> str:
@@ -384,7 +421,6 @@ def api_key(name: str) -> str:
     return ""
 
 
-    v = CFG.get("apis", {}).get(name, {})
 # Which config key each uncover engine needs. An engine with no key can only
 # fail, so it must never be handed to uncover: one dead engine out of five
 # turns a successful stage into "every source failed".
@@ -429,8 +465,6 @@ def split_engines(engines: str) -> tuple[list[str], list[str]]:
 def api_email(name: str) -> str:
     v = CFG.get("apis", {}).get(name, {})
     return v.get("email", "") if isinstance(v, dict) else ""
-
-
 
 
 def api_base(name: str) -> str:

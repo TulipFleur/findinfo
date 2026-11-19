@@ -50,6 +50,7 @@ MODULES = [
     "tests.test_version_parsing",
     "tests.test_report_brief",
     "tests.test_brief_command",
+    "tests.test_coverage_semantics",
     "tests.test_release_bundle",
 ]
 

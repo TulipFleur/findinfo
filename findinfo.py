@@ -361,8 +361,8 @@ def cmd_extract(args) -> None:
 PRINT_JSON_WARN_BYTES = 64 * 1024
 
 
-def _report_coverage(run_id: str) -> dict:
-    """Read the coverage block of a finished run, for the agent brief.
+def _run_coverage(run_id: str) -> dict:
+    """The coverage block of one run, or {} when it cannot be read.
 
     report.collect() reads the asset graph and knows nothing about which
     stages ran; the gaps live in the run state. The brief must carry them or
@@ -376,6 +376,51 @@ def _report_coverage(run_id: str) -> dict:
         return {}
     cov = st.get("coverage") or (st.get("result") or {}).get("coverage") or {}
     return dict(cov) if isinstance(cov, dict) else {}
+
+
+def _latest_run_for_match(match: list[str], task: str) -> str:
+    """Newest run in this task whose scope overlaps `match`, or "".
+
+    Only --match is not enough to find the gaps: the asset graph is shared,
+    but every run has its own coverage. Without this fallback a bare
+    `brief --match example.com` reads no coverage at all and reports zero
+    gaps, which reads as "nothing was missing".
+    """
+    want = core.canon_scope(match)
+    if not want:
+        return ""
+    for row in jobs.list_runs(limit=200):
+        rid = str(row.get("run_id") or "")
+        if not rid:
+            continue
+        spec = jobs.read_spec(rid)
+        if task and str(spec.get("task") or "") not in ("", task):
+            continue
+        scope = core.canon_scope(spec.get("scope") or [])
+        if scope and set(scope) & set(want):
+            return rid
+    return ""
+
+
+def _resolve_coverage(args) -> dict:
+    """Where the gaps come from, in a fixed order brief and report both use.
+
+    --run wins (the caller named a run); then an explicit --engagement that is
+    not the default; then the newest run in this task matching --match. When
+    nothing matches, the result says known=False instead of showing an empty
+    gap list that looks like a clean report.
+    """
+    run_id = str(getattr(args, "run", "") or "").strip()
+    engagement = str(getattr(args, "engagement", "") or "").strip()
+    if run_id:
+        return core.select_coverage(_run_coverage(run_id), run_id)
+    if engagement and engagement != ENGAGEMENT:
+        return core.select_coverage(_run_coverage(engagement), engagement)
+    found = _latest_run_for_match(list(getattr(args, "match", None) or []),
+                                  str(getattr(args, "task", "") or ""))
+    if found:
+        return core.select_coverage(_run_coverage(found), found)
+    return core.empty_coverage()
 
 
 def _resolve_report_scope(args) -> list:
@@ -439,7 +484,7 @@ def cmd_brief(args) -> None:
                               engagement=args.engagement)
     finally:
         store.close()
-    coverage = _report_coverage(args.engagement)
+    coverage = _resolve_coverage(args)
     brief = report.build_brief(data, top=args.top,
                                max_bytes=args.max_bytes,
                                coverage=coverage)
@@ -473,8 +518,10 @@ def cmd_report(args) -> None:
     finally:
         store.close()
     # The brief has to state what the collection could NOT do, so pull the
-    # run's coverage snapshot; --engagement is the run id it reads from.
-    coverage = _report_coverage(args.engagement)
+    # run's coverage snapshot. Same resolution order as brief (see
+    # _resolve_coverage): --run, then an explicit --engagement, then the
+    # newest run matching --match.
+    coverage = _resolve_coverage(args)
     paths = report.write_bundle(data, out_dir=args.out, slug=args.slug,
                                 json_limit=args.json_limit,
                                 with_json=args.with_json,
@@ -1586,9 +1633,12 @@ def _run_pipeline(args) -> int:
             # subfinder + uncover both dead used to return a clean count=0 and
             # checkpoint "done". That is the difference between "this domain has
             # no subdomains" and "we never actually asked".
-            if oc == core.OUTCOME_FAILED:
+            # failed and timeout share this branch: neither may be
+            # checkpointed as done, or a stage that only ran out of time would
+            # be skipped forever and the stage would look empty, not slow.
+            if oc in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT):
                 raise core.StageError(
-                    "subs: every source failed (" +
+                    "subs: " + oc + " (" +
                     ",".join(sorted({p.get("id", "?") for p in per_source
                                      if p.get("outcome") in (core.OUTCOME_FAILED,
                                                              core.OUTCOME_TIMEOUT)})) + ")",
@@ -2144,7 +2194,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="cap arrays inside report.json (0 = same as the md/html view)")
     rp.add_argument("--out", default="", help="output dir (default ~/.findinfo/reports/<stamp>-<slug>)")
     rp.add_argument("--slug", default="", help="label for the default output dir")
-    rp.add_argument("--engagement", default="default", help="read stage checkpoints for this run id")
+    rp.add_argument("--engagement", default="default", help="coverage gaps to read: --run already picks that run, so set this only to read a different one")
     rp.add_argument("--print-md", action="store_true", help="also return the markdown text")
     rp.add_argument("--brief-top", type=int, default=20,
                     help="kept in report.brief.json when --with-brief is given "
@@ -2175,7 +2225,7 @@ def build_parser() -> argparse.ArgumentParser:
     bf.add_argument("--min-conf", type=float, default=0.3)
     bf.add_argument("--limit", type=int, default=300, help="hosts kept in the digest")
     bf.add_argument("--ep-limit", type=int, default=400, help="endpoints kept in the digest")
-    bf.add_argument("--engagement", default="default", help="read stage checkpoints for this run id")
+    bf.add_argument("--engagement", default="default", help="coverage gaps to read: --run already picks that run, so set this only to read a different one")
     bf.add_argument("--top", type=int, default=20,
                     help="high-priority hosts kept in the brief (default 20)")
     bf.add_argument("--max-bytes", type=int, default=32768,

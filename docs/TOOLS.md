@@ -743,12 +743,36 @@ python findinfo.py brief --match 主域 --max-bytes 8192 # 字节上限（默认
 | `--run <run_id>` | 不给 `--match` 时沿用该 run 的 scope |
 | `--top` / `--max-bytes` | top_hosts 条数（默认 20）/ payload 字节上限（默认 32768） |
 | `--min-conf` / `--limit` / `--ep-limit` | 同 report |
-| `--engagement` | 读哪个 run 的阶段检查点（coverage 字段） |
+| `--engagement <run_id>` | 显式指定读哪个 run 的阶段检查点；**有 `--run` 时优先用 `--run`**，本参数只在没有 `--run` 时生效 |
+
+### coverage 从哪儿来（`brief` 与 `report --with-brief` 规则完全相同）
+
+覆盖率缺口存在每个 run 自己的状态里，不在共享资产库里。读取顺序固定为：
+
+1. 给了 `--run <run_id>`：读该 run 的 coverage；
+2. 没给 `--run` 但显式给了 `--engagement`（且不是默认的 `default`）：读该 run 的 coverage；
+3. 只给了 `--match`：在当前 task 里找 **scope 与 `--match` 有交集、且最新**的那次 run；
+4. 都没找到：`coverage` 写 `{"source": "none", "known": false}`，绝不输出一个看起来像「没有缺口」的空列表。
+
+所以 **有 run_id 时一律用 `brief --run <run_id>`**：只有 `--match` 的调用会退化成「猜最近一次 run」，
+读到的可能不是你以为的那一次。
 
 **输出（stdout 一行 JSON，即整个命令的产物）**：`schema: findinfo.brief/1`、`counts`、`scope`、
-`environment.warnings`、`coverage`（failed/not_run/unavailable）、`top_hosts`（每条含
-`host`/`score`/`priority`/`reasons`/`provenance`）、`internal_services`、`leaks`、`next_steps`、
-`truncated`（被截断数组的 kept/total）。
+`environment.warnings`、`coverage`、`top_hosts`（每条含 `host`/`score`/`priority`/`reasons`/`provenance`）、
+`internal_services`、`leaks`、`next_steps`、`truncated`（被截断数组的 kept/total）。
+
+`coverage` 的字段：
+
+| 字段 | 含义 |
+|---|---|
+| `source` | coverage 来自哪个 run id；没读到任何 run 时为 `"none"` |
+| `known` | `true` = 真的读到了某次 run 的覆盖；`false` = 什么都没读到，**这不等于「没有缺口」** |
+| `failed_stages` | 跑失败了、被记为失败的阶段 |
+| `not_run_stages` / `skipped_stages` | 计划了但没产出结果的阶段 / 被跳过的阶段 |
+| `unavailable` / `unavailable_total` | 逐条缺口（缺凭据、缺工具、额度耗尽等），超过 40 条只留前 40 条 |
+| `blocking` / `blocking_reason` | 只有存在**阻塞性**缺口时出现（缺必需工具等），并附原因 |
+| `note` | 非阻塞缺口的说明（可选） |
+| `hint` | `known=false` 时的补救提示 |
 
 ---
 

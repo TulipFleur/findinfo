@@ -264,17 +264,19 @@ onepass 的 15 个上游源不会算成 15 个工具，`charts.sources` 按工�
 `report` 是给人看的（默认只写 md/html）；`report.json` 是给脚本和下游工具的全量数据（大目标 600 KB 以上），需要时 `report --with-json` 再写。
 
 brief 只含 Agent 决策要用的东西：`counts`、`scope`、`environment.warnings`、
-`coverage`（失败/未执行/不可用的阶段及原因）、`top_hosts`（默认前 20 个高优先级，
+`coverage`（失败/未执行/不可用的阶段及原因；`source` 说明读的是哪次 run，
+`known=false` 表示根本没读到任何 run，**这不等于没有缺口**）、`top_hosts`（默认前 20 个高优先级，
 每条含 `host`/`score`/`priority`/`reasons`/`provenance`）、全部 `internal_services`、
 `leaks` 计数与前若干条、`next_steps`。被截断的数组会在 `truncated` 里写明
 `kept` 和 `total`——**看到 truncated 不等于数据完整，结论要按它说明的缺口表述**。
 
 ```bash
-# Agent 统一读取入口：查库 -> stdout 一行 JSON
+# Agent 统一读取入口：有 run_id 就带上 --run，coverage 才读的是这次 run
+python findinfo.py --task <名> brief --run <run_id>
+# 手上只有目标域时也可以：会自动找该域最新的一次 run
 python findinfo.py --task <名> brief --match <主域>
 # 默认 top 20；目标很大或很小都可以调（字节上限 --max-bytes 同理）
-python findinfo.py brief --match <主域> --top 10
-# 不带 --match 时可用 --run <run_id> 沿用该 run 的 scope
+python findinfo.py brief --run <run_id> --top 10
 ```
 
 确实需要全量数据（写脚本、喂下游扫描器）时用 `assets --export`（JSONL，逐行可流式处理），

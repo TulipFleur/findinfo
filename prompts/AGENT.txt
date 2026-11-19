@@ -266,14 +266,15 @@ python findinfo.py --task {{TASK}} status --run {{RUN_ID}}
 
 ```bash
 # 你自己的读取入口：查资产库，stdout 一行 JSON（≤32 KB），不落文件
-python findinfo.py --task {{TASK}} brief --match {{TARGET}}
+# 有 run_id 就带上 --run：coverage 缺口是按 run 存的，只给 --match 只能猜最近一次
+python findinfo.py --task {{TASK}} brief --run {{RUN_ID}}
 # 人的交付物：md + html（report 默认只写这两个；机器文件要 --with-json/--with-brief 才写）
 python findinfo.py --task {{TASK}} report --match {{TARGET}} --slug "{{TASK}}"
 ```
 
 | 入口/产物 | 给谁 | 用法 |
 |---|---|---|
-| `brief` 命令 | **AI（你）** | 统一读取入口：查库 → stdout 一行 JSON（≤32 KB）；含 counts / coverage 缺口 / top_hosts / internal_services / leaks / next_steps。被截断的数组在 `truncated` 里写明 kept 与 total |
+| `brief` 命令 | **AI（你）** | 统一读取入口：查库 → stdout 一行 JSON（≤32 KB）；含 counts / coverage 缺口 / top_hosts / internal_services / leaks / next_steps。`coverage.source` 是读到的 run id，`known=false` 表示没读到任何 run（不是没有缺口）；被截断的数组在 `truncated` 里写明 kept 与 total |
 | `report.md` / `report.html` | 用户 | report 默认产物；`--print-md` 可回显 md，html 在最终回复里给绝对路径 |
 | `report.json`（需 `--with-json`） | 脚本 / 下游工具 | 全量数据，大目标 600 KB 以上，**不要读进上下文**；需要子集时用 `python -c` |
 
