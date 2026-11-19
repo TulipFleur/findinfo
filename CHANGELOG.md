@@ -92,6 +92,7 @@
   云端，官方文档在现有网络下核实不了，如实标为"待确认"，只保留能确定的结论（Windows 包的
   `.exe` 在 Linux 沙箱里跑不了）。（`c424628`、`3226ebe`）
 - `README.md` 改为面向人的介绍 / 安装 / 快速开始 / 文档索引，不再重复 Agent 规则。（`3226ebe`）
+- 发布包与 `install.py --copy` 共用 `scripts/shipped.py` 的同一份清单，不再各写一套忽略规则；包内去掉运行时读不到的 `<tool>/config.yaml` 与 `subfinder/provider-config.yaml`。（`8518583`）
 - `docs/DEVELOPMENT.md` 补发布包规则表与构建自检说明。（`6ca04ea`）
 
 ### 已知问题

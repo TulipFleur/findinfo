@@ -120,9 +120,13 @@ def test_changelog_covers_every_commit_since_0_7_2():
     hashes = proc.stdout.decode("utf-8", "replace").split()
     if not hashes:
         return
-    # HEAD cannot name itself: the changelog is part of that commit.
-    # Every earlier commit must be named.
-    hashes = hashes[1:]
+    # Only the newest commit may be missing: it is the one that edits this
+    # file, so it cannot contain its own hash. Every older one must be named,
+    # and a later commit can always add the hash of an older one.
+    if hashes:
+        hashes = hashes[1:] if ("`" + hashes[0] + "`") not in text else hashes
+    else:
+        return
     missing = [h for h in hashes if ("`" + h + "`") not in text]
     assert not missing, ("CHANGELOG.md never mentions commit(s) " + repr(missing)
                          + "; every change needs the commit that made it")
