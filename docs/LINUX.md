@@ -2,12 +2,13 @@
 
 > 同一份 skill 代码，Windows 用~~内置~~的 `bin/*.exe`，Linux 需要**原生二进制**。
 > 本文只讲 Linux 侧的准备；命令语义与 Windows 完全一致（见 `docs/TOOLS.md`）。
+> **`scripts/setup-linux.sh` / `build-enscan.sh` 只随 Linux 发布包分发**：Windows 包里没有它们（Windows 用内置 `bin/windows/*.exe`）。
 
 ## 0. 支持矩阵
 
 | 项 | Windows | Linux |
 |---|---|---|
-| 13 个工具 | `bin/windows/*.exe` 已内置 | `scripts/setup-linux.sh` 现场安装 |
+| 全部内置工具 | `bin/windows/*.exe` 已内置 | `scripts/setup-linux.sh` 现场安装 |
 | 装到客户端 | junction | symlink（`install.py` 自动判断） |
 | 端口扫描 / DNS 爆破 | 管理员 + Npcap | `CAP_NET_RAW` + libpcap |
 | 长任务 | 前台 / `nohup` | systemd / tmux |

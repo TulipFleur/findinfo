@@ -9,7 +9,8 @@
 | **DSH / agents** | 扫描 skills 目录 | `~/.agents/skills/findinfo` | 目录存在 + `SKILL.md` 有 frontmatter |
 | **Claude Code** | 扫描 skills 目录 | `~/.claude/skills/findinfo` | 同上（frontmatter 的 `name` 必须等于目录名） |
 | **Codex CLI** | **读 config.toml 注册表** | 任意（建议 `~/.codex/skills/findinfo`） | `~/.codex/config.toml` 的 `[[skills.config]]` + `enabled = true` |
-| **Claude Desktop** | 不读 skills 目录 | — | 只能通过 MCP（filesystem + shell）间接调用 |
+| **Claude Desktop · Code 标签** | 就是 Claude Code，扫描 skills 目录 | `~/.claude/skills/findinfo` | 同 Claude Code |
+| **Claude Desktop · 聊天 / Cowork** | 运行在云端 Linux 沙箱，**不读本机 skills 目录** | — | 本项目跑不了（包含 Windows 二进制，且沙箱出网受限） |
 
 **关键坑（已踩过）**：只往 `~/.codex/skills/` 建链接，Codex 完全看不见；
 而且 `[[skills.config]]` 必须同时有 `path` 和 `enabled`——只写 `path` 会让整份 config 失效（`codex doctor` 报 `invalid data`）。
@@ -58,8 +59,13 @@ python scripts/install.py --enable-instructions   # 全局，影响所有 skill
 - 改完跑 `codex doctor`，`0 fail` 才算配置有效。
 
 ### Claude Desktop
-- 不支持 skills 目录，需要 MCP：filesystem（读 SKILL.md）+ shell/terminal（跑命令）。
-- 没有 MCP 时只能人工贴命令执行。
+桌面端分两种运行位置，行为不同（以 Anthropic 官方 skills 文档为准）：
+
+- **Code 标签** = Claude Code 本体，读 `~/.claude/skills/`，和终端用法一致。
+- **聊天 / Cowork 会话**：跑在**云端 Linux 沙箱**里，不加载本机 skills 目录（只加载 claude.ai 账号同步的 skills）。
+  即使同步了，**本项目也跑不起来**：交付包里是 Windows `.exe`，沙箱是 Linux；
+  而且沙箱出网受限，主动阶段向目标发包也不现实。
+- 要在桌面上用，走 Code 标签；要在云端用，得把 skill 提交到仓库的 `.claude/skills/` 且使用 Linux 二进制。
 
 ## 4. 状态共享
 
