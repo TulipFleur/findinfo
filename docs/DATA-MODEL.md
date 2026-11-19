@@ -1,87 +1,87 @@
-# 数据模型与置信度
+# Data model and confidence
 
-> SKILL.md 只留判读要点；这里是完整的数据形状、置信度算法与报告字段口径。
-> 需要命令参数时看 [TOOLS.md](TOOLS.md)。
+> SKILL.md keeps only the reading essentials; this file holds the full data shapes, the confidence algorithm and the report field conventions.
+> For command parameters see [TOOLS.md](TOOLS.md).
 
-## 1. 资产图（SQLite，`<home>/findinfo.db`）
+## 1. Asset graph (SQLite, `<home>/findinfo.db`)
 
 ```jsonc
-// assets 表
+// assets table
 {
   "kind": "domain|ip|url|endpoint|company|icp",
-  "canonical": "api.example.com",     // 归一化主键（唯一）
+  "canonical": "api.example.com",     // normalized primary key (unique)
   "parent": "example.com",
-  "sources": "crt.sh,dnsx,httpx",     // 谁发现的（provenance）
-  "confidence": 0.95,                 // 置信度，规则见下
+  "sources": "crt.sh,dnsx,httpx",     // who discovered it (provenance)
+  "confidence": 0.95,                 // confidence, rules below
   "passivity": "passive|active",
   "attrs": { "status": 200, "title": "...", "tech": ["nginx"], "ip": "1.2.3.4" },
   "first_seen": "...", "last_seen": "..."
 }
 
-// endpoints 表（漏洞挖掘的输入）
+// endpoints table (input for vulnerability hunting)
 { "asset": "api.example.com", "method": "GET",
   "path": "/api/user/{n}", "params": "id,token", "status": 200 }
 ```
 
-## 2. 置信度规则（自动计算）
+## 2. Confidence rules (computed automatically)
 
-| 来源数 | confidence |
+| Number of sources | confidence |
 |---|---|
-| 1 个来源 | 0.4 ~ 0.5 |
-| 2 个独立来源 | 0.7 |
-| 3 个及以上（CT+测绘+DNS） | 0.95 |
-| ENScan 备案号直出 | 0.9 |
-| vhost 仅状态码不同 | 0.5（需人工复核） |
+| 1 source | 0.4 ~ 0.5 |
+| 2 independent sources | 0.7 |
+| 3 or more (CT + mapping platforms + DNS) | 0.95 |
+| ICP filing number returned directly by ENScan | 0.9 |
+| vhost differing only in status code | 0.5 (needs manual review) |
 
-**阈值**：`>= 0.7` 才进主图；`0.4~0.7` 标 unverified。
-各命令 `--min-conf` 的 CLI 默认值不同：`dns 0.4`、`probe 0.7`、`passive 0.0`
-（`assets` 查询默认 0.0）。所以要让 `probe` 去测低置信资产，必须显式传 `--min-conf 0.4`。
+**Threshold**: only `>= 0.7` enters the main graph; `0.4~0.7` is marked unverified.
+Each command's `--min-conf` CLI default differs: `dns 0.4`, `probe 0.7`, `passive 0.0`
+(the `assets` query defaults to 0.0). So to make `probe` test low-confidence assets you must pass `--min-conf 0.4` explicitly.
 
-**口径说明**：`onepass` 记录自带按「独立源数」算出的置信度（1 源 ≤0.6 / 2 源 ≥0.7 / 3 源+ ≤0.95）；
-落库时统一取 `max(既有, 新值)`，因此 onepass 的高置信度不会被本地规则反向拉低，
-后续 `+dnsx`、`+httpx` 这类真实新增来源再按上表抬升。
-看到 `sources` 是 `onepass:crtsh,rapiddns` 时，别当成「1 个来源」——那条已按 2 源计过分。
+**Convention note**: `onepass` records carry a confidence computed from their "number of independent sources" (1 source ≤0.6 / 2 sources ≥0.7 / 3+ sources ≤0.95);
+on storage we always take `max(existing, new)`, so an onepass high confidence is never pulled back down by local rules,
+and genuinely new sources added later (`+dnsx`, `+httpx`) raise it further per the table above.
+When `sources` reads `onepass:crtsh,rapiddns`, do not treat it as "1 source" — that record was already scored as 2 sources.
 
-## 3. 报告字段口径（`brief` / `report` / `report.json`）
+## 3. Report field conventions (`brief` / `report` / `report.json`)
 
-**范围判定**：不给 `--match` 时自动回退最近一次 `run` 的目标域（`scope.auto=true`）；
-两者都没有则覆盖整库并告警。库里有跨项目残留时，报告把不属于目标域的记录统计成
-`domains_dropped` / `endpoints_noise`，在 HTML 顶部列为"已隔离噪声"，**不计入结论**。
+**Scope determination**: without `--match`, the most recent `run`'s target domain is used automatically (`scope.auto=true`);
+with neither, the whole store is covered and a warning is raised. When the store holds cross-engagement leftovers, the report counts records outside the target domain as
+`domains_dropped` / `endpoints_noise`, lists them at the top of the HTML as "quarantined noise", and **excludes them from conclusions**.
 
-**来源标注（谁发现它）**：每条主机给 `discovered_by`（原始 sources 串）和 `provenance`
-（归一化工具列表 + 中文标签，如 `dnsx 解析`、`onepass 被动聚合/RapidDNS`、`vhost Host 碰撞`）。
-onepass 的 15 个上游源不会算成 15 个工具，`charts.sources` 按工具计数；同一资产被多工具确认时 `confidence` 更高。
+**Provenance annotation (who found it)**: each host gets `discovered_by` (the raw sources string) and `provenance`
+(a normalized tool list + readable labels, e.g. `dnsx resolver`, `onepass passive aggregation/RapidDNS`, `vhost Host collision`).
+onepass's 15 upstream sources are not counted as 15 tools — `charts.sources` counts by tool; an asset confirmed by multiple tools gets a higher `confidence`.
 
-**优先级打分**（`score` 上限 99，`priority` high≥45 / medium≥18 / low≥1）：
-内部服务 +50、标题像管理入口 +20、敏感路径 +25/+10、401/403 +12、产品指纹 +8、参数 +6、
-非标准端口 +6、CDN -8。分数只用于排序，**结论要按 `reasons` 里的判据复核**。
+**Priority scoring** (`score` capped at 99, `priority` high≥45 / medium≥18 / low≥1):
+internal service +50, admin-looking title +20, sensitive path +25/+10, 401/403 +12, product fingerprint +8, parameters +6,
+non-standard port +6, CDN -8. Scores are used only for ordering; **conclusions must be re-checked against the criteria in `reasons`**.
 
-**brief 的字段预算**：`brief` 只含决策要用的东西——`counts`、`scope`、`environment.warnings`、
-`coverage`（失败/未执行/不可用的阶段及原因；`source` 说明读的是哪次 run，`known=false` 表示
-根本没读到任何 run，**这不等于没有缺口**）、`top_hosts`（默认前 20 个高优先级，每条含
-`host`/`score`/`priority`/`reasons`/`provenance`）、全部 `internal_services`、`leaks` 计数与前若干条、
-`next_steps`。被截断的数组在 `truncated` 里写明 `kept` 和 `total`——
-**看到 truncated 不等于数据完整，结论要按它说明的缺口表述**。
+**brief's field budget**: `brief` contains only what decisions need — `counts`, `scope`, `environment.warnings`,
+`coverage` (failed/not-run/unavailable stages with reasons; `source` says which run was read, `known=false` means
+no run was read at all, **which does not mean there are no gaps**), `top_hosts` (the top 20 high-priority hosts by default, each with
+`host`/`score`/`priority`/`reasons`/`provenance`), all `internal_services`, `leaks` counts plus the first few entries,
+`next_steps`. Truncated arrays state their `kept` and `total` in `truncated` —
+**seeing truncated does not mean the data is complete; conclusions must be phrased around the gaps it reports**.
 
-**展示上限 ≠ 处理上限**：`assets` 默认只显示 500 条，全量在库里。
-工具 stdout 里的列表只是展示样本；阶段实际处理的全量都进了库，下游阶段
-（probe/ports/crawl/extract）从库里取完整集合。人为预算（`--max-seed`/`--limit`/`--max-vhost-ips` 等）
-造成的覆盖缺口会在 summary/report 里明说。
+**Display cap ≠ processing cap**: `assets` shows only 500 rows by default; the full set is in the store.
+Lists in tool stdout are display samples only; the full set actually processed by each stage goes into the store, and downstream stages
+(probe/ports/crawl/extract) pull the complete set from it. Coverage gaps caused by deliberate budgets (`--max-seed`/`--limit`/`--max-vhost-ips` etc.)
+are called out explicitly in the summary/report.
 
 ```bash
 python findinfo.py assets --kind domain --min-conf 0.7 --limit 5000
-python findinfo.py assets --export runs/assets.jsonl        # 全量导出（JSONL，逐行可流式）
+python findinfo.py assets --export runs/assets.jsonl        # full export (JSONL, streamable line by line)
 ```
 
-调展示上限：环境变量 `FINDINFO_ROW_LIMIT=2000` 或 `config/config.json` 的 `limits.row_limit`。
-子进程输出是**逐行消费**的（`core.run_stream`），内存不随结果条数增长：实测 12 万行只涨约 0.5 MB。
+To change the display cap: the environment variable `FINDINFO_ROW_LIMIT=2000`, or `limits.row_limit` in `config/config.json`.
+Subprocess output is **consumed line by line** (`core.run_stream`), so memory does not grow with the number of results: measured, 120k lines raise it by only ~0.5 MB.
 
-## 4. 旧数据的读取口径
+## 4. Reading conventions for old data
 
-- **任务名目录**：纯 ASCII 任务名目录不变；旧版把中文名任务都落到 `tasks/default`（混在一个库里）。
-  修复后中文名任务映射到 `task-<hash>` 独立目录。**旧 default 库不会被动过**，
-  要访问它：`python findinfo.py --task default assets`。
-- **来源列**：旧格式 `onepass:crt.sh,rapiddns`（仅首 token 带前缀）在读取/合并时自动归一为
-  `onepass:crt.sh,onepass:rapiddns`，无需手工迁移。
-- **置信度重算**：合并时按独立上游数确定性重算。历史上因前缀 bug 虚高到 0.95、实际只有 2 个上游的
-  分数，在下一次合并时会被压回 ≤0.9；证据齐全的 0.95（≥3 上游）不受影响。不做批量刷库。
+- **Task-name directories**: pure-ASCII task names keep their directories; old versions put every non-ASCII-named task into `tasks/default` (mixed in one store).
+  After the fix, non-ASCII names map to their own `task-<hash>` directories. **The old default store is never touched**;
+  to read it: `python findinfo.py --task default assets`.
+- **Sources column**: the old format `onepass:crt.sh,rapiddns` (prefix only on the first token) is normalized automatically on read/merge to
+  `onepass:crt.sh,onepass:rapiddns`; no manual migration needed.
+- **Confidence recomputation**: on merge, confidence is recomputed deterministically from the number of independent upstreams. Scores historically inflated to 0.95 by the prefix bug but actually backed by only 2 upstreams
+  are pushed back down to ≤0.9 on the next merge; a well-evidenced 0.95 (≥3 upstreams) is unaffected. No bulk store rewrites.

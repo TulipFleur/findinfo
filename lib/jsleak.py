@@ -16,7 +16,7 @@ import re
 # was captured as "service.example.com". Consumers must still validate with a
 # hostname gate (core.canon_domain); this regex only shapes the token.
 # Boundaries are character classes, not \b: \b never fires between a Chinese
-# char and a letter (both are \w in unicode mode), so 域名example.com获取 was
+# char and a letter (both are \w in unicode mode), so a CJK-flanked host was
 # invisible. Excluding "." at the END prevents mid-hostname truncation
 # (example.com.evil.io must not be captured as example.com.evil).
 DOMAIN = re.compile(

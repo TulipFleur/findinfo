@@ -230,7 +230,7 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
     table = bool((out or "").strip())
     blob = (out or "") + (err or "")
     if "cookie" in blob.lower() or "Cookie" in blob:
-        core.log("enscan: 未配置 cookie，请在 bin/config.yaml 填入 aiqicha Cookie")
+        core.log("enscan: no cookie configured; put the aiqicha Cookie into bin/config.yaml")
     merged = {"companies": [], "icp": [], "domains": [], "apps": []}
     files = 0
     for p in sorted(outdir.rglob("*.json")):
@@ -1073,13 +1073,20 @@ def t_vhost(store, ip: str, hosts: list[str], ports: list[int] | None = None,
     by edit-distance similarity instead of raw length.
     """
     ip = core.canon_ip(ip) or ip
-    hosts = _uniq([core.canon_domain(h) for h in hosts if core.canon_domain(h)])
+    # The hosts a caller passes are deliberate input (candidates they named or
+    # derived from scope): canon_user_domain validates them without the
+    # public-suffix de-noiser. Rejections are reported, never dropped --
+    # passing dev.corp.local used to yield tested:0 with ok:true.
+    rejected = [h for h in hosts if not core.canon_user_domain(h)]
+    hosts = _uniq([core.canon_user_domain(h) for h in hosts
+                   if core.canon_user_domain(h)])
     ports = ports or [80, 443]
     live = _live_domains(store, hosts) if skip_live else set()
     todo = [h for h in hosts if h not in live]
     if not todo:
         return {"ip": ip, "tested": 0, "hits": 0, "results": [],
-                "skipped_live": len(live), "tool": "hostCollision"}
+                "skipped_live": len(live), "tool": "hostCollision",
+                **({"rejected_inputs": rejected} if rejected else {})}
 
     urls = [("https" if p in (443, 8443, 9443) else "http") + "://" + ip + ":" + str(p)
             for p in ports]
@@ -1151,7 +1158,8 @@ def t_vhost(store, ip: str, hosts: list[str], ports: list[int] | None = None,
                                           "title": h["title"], "via": "curl-diff"})
     return {"ip": ip, "tested": len(todo), "hits": len(hits),
             "results": hits[:500], "skipped_live": len(live),
-            "tool": tool_used, "rc": hc_rc, "ok": hc_rc == 0 or bool(hits)}
+            "tool": tool_used, "rc": hc_rc, "ok": hc_rc == 0 or bool(hits),
+            **({"rejected_inputs": rejected} if rejected else {})}
 
 
 # ---------------------------------------------------------------- 10. crawl + extract
@@ -1721,7 +1729,10 @@ def _tool_version(name: str, exe: str) -> tuple[str, str, str]:
     """Run the tool's own version recipe; return (version, raw, exec_error).
 
     `raw` is the first 120 characters of the first non-empty invocation, so a
-    human can see what the tool actually said when parsing fails.
+    human can see what the tool actually said when parsing fails. ANSI escape
+    sequences and banner art are stripped: they carry zero diagnostic value
+    and roughly doubled the doctor payload (a 4.7 KB stdout where a third was
+    \x1b[32m banner art from the PD tools).
     """
     spec = _VERSION_SPECS.get(name)
     args_list = spec[0] if spec else VERSION_ARGS
@@ -1733,12 +1744,30 @@ def _tool_version(name: str, exe: str) -> tuple[str, str, str]:
             # of pretending the version is unknown
             return "", "", (err or "")[:200]
         blob = (out or "") + (err or "")
+        blob = _strip_ansi(blob)
         if blob and not last_raw:
             last_raw = blob[:120]
         ver, found = parse_version(name, blob)
         if found:
             return ver, blob[:120], ""
     return "", last_raw, ""
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0b-\x1f]")
+
+
+def _strip_ansi(blob: str) -> str:
+    """Drop ANSI escapes, control chars, and banner-art lines.
+
+    The PD tools and ENScan open with box-drawing logos; whole rows of those
+    characters are pure decoration and were the bulk of the version_raw
+    noise. Keep only lines with at least one alphanumeric character, then
+    collapse the leftover spacing.
+    """
+    cleaned = _ANSI_RE.sub(" ", blob or "")
+    lines = [ln.strip() for ln in cleaned.splitlines()]
+    lines = [ln for ln in lines if re.search(r"[A-Za-z0-9]", ln)]
+    return re.sub(r" {2,}", " ", "\n".join(lines)).strip()[:200]
 
 
 

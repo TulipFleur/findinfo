@@ -1,89 +1,88 @@
-# API Key 配置存档
+# API Key Configuration Reference
 
-> 所有需要凭据的数据源集中登记在这里。**没有 key 也能跑核心链路**（见文末"零配置可用"）。
-> 配置文件：`config/.env`（照 `config/.env.example` 复制填写），兼容 redtools/exploit_server 的变量命名。
+> Every data source that needs credentials is registered here. **The core chain runs without any key** (see "Zero-config capabilities" at the end).
+> Config file: `config/.env` (copy from `config/.env.example` and fill in); variable names are compatible with redtools/exploit_server.
 
-> **不配 key 不影响这次运行的成败。** 没凭据的测绘引擎被记为 `unavailable`（覆盖率缺口），
-> 不会进入 `coverage.failed_stages`，`run` 的退出码也不会是 5；`uncover` 根本不会带着空 key 启动。
-> 补上 key 后重跑同一目标会真正执行 subs（可用引擎集合计入阶段输入哈希，旧断点不会跳过它）。
+> **Missing keys never decide a run's success or failure.** Keyless mapping engines are recorded as `unavailable` (a coverage gap);
+> they never enter `coverage.failed_stages`, `run`'s exit code stays ≠5, and `uncover` is never launched with an empty key.
+> After adding a key, re-running the same target really executes subs (the set of usable engines is part of the stage input hash, so old checkpoints cannot skip it).
 
-## 一、总表
+## 1. Master table
 
-| 变量 | 数据源 | 用在哪一步 | 免费额度 | 申请地址 | 不配的后果 |
+| Variable | Source | Used in which step | Free tier | Signup | Consequence of not configuring |
 |---|---|---|---|---|---|
-| `FOFA_EMAIL` + `FOFA_KEY` | FOFA | 备案号反查、被动子域、org 反查 | 200~300 条/月 | https://fofa.info/userInfo | 备案号反查失效，子域少一路 |
-| `QUAKE_TOKEN` | 360 Quake | 同上 | 3000 条/月 | https://quake.360.net/quake/#/personalInfo | 同上一路失效 |
-| `HUNTER_KEY` | 奇安信鹰图 | 同上 | 100 积分/月 | https://hunter.qianxin.com/home/userInfo | 同上 |
-| `ZOOMEYE_KEY` | ZoomEye | 同上 | 2000 条/月 | https://www.zoomeye.org/profile | 同上 |
-| `CENSYS_ID` + `CENSYS_SECRET` | Censys | 证书/服务测绘 | 250 次/月 | https://search.censys.io/account/api | 少一路证书交叉验证 |
-| `SHODAN_KEY` | Shodan | org 反查 | 极低 | https://account.shodan.io/ | 少一路 |
-| `SECURITYTRAILS_KEY` | SecurityTrails | 被动子域 + 历史 DNS | 50 次/月 | https://securitytrails.com/app/account/credentials | 少一路，历史 DNS 不可用 |
-| `VIRUSTOTAL_KEY` | VirusTotal | 被动子域 | 4 次/分 | https://www.virustotal.com/gui/my-apikey | 少一路 |
-| `URLSCAN_KEY` | urlscan.io | 被动子域 + 已抓页面 | 100 次/天 | https://urlscan.io/user/profile/ | 少一路 |
-| `CHAOS_KEY` | PD Chaos | 企业子域数据集 | 免费 | https://cloud.projectdiscovery.io/ | chaos 那一路跳过 |
-| `GITHUB_TOKEN` | GitHub | 阶段三 代码泄露 | 免费 | https://github.com/settings/tokens | 代码泄露环节跳过 |
-| `MAPPING_API_INTERVAL_MS` | — | 测绘 API 节流 | — | — | 默认 1500ms，被限流时调大 |
-| **ENScan Cookie**（非 API） | 爱企查 | 阶段一 实体锚定 | 免费 | aiqicha.baidu.com 登录后 F12 复制 | **阶段一完全不可用** |
+| `FOFA_EMAIL` + `FOFA_KEY` | FOFA | ICP reverse lookup, passive subdomains, org lookup | 200~300/month | https://fofa.info/userInfo | ICP reverse lookup dead; one fewer subdomain route |
+| `QUAKE_TOKEN` | 360 Quake | same | 3000/month | https://quake.360.net/quake/#/personalInfo | same, one route lost |
+| `HUNTER_KEY` | QAX Hunter | same | 100 credits/month | https://hunter.qianxin.com/home/userInfo | same |
+| `ZOOMEYE_KEY` | ZoomEye | same | 2000/month | https://www.zoomeye.org/profile | same |
+| `CENSYS_ID` + `CENSYS_SECRET` | Censys | certificate/service mapping | 250/month | https://search.censys.io/account/api | one fewer certificate cross-check |
+| `SHODAN_KEY` | Shodan | org lookup | very low | https://account.shodan.io/ | one route lost |
+| `SECURITYTRAILS_KEY` | SecurityTrails | passive subdomains + historical DNS | 50/month | https://securitytrails.com/app/account/credentials | one route lost; historical DNS unavailable |
+| `VIRUSTOTAL_KEY` | VirusTotal | passive subdomains | 4/min | https://www.virustotal.com/gui/my-apikey | one route lost |
+| `URLSCAN_KEY` | urlscan.io | passive subdomains + crawled pages | 100/day | https://urlscan.io/user/profile/ | one route lost |
+| `CHAOS_KEY` | PD Chaos | enterprise subdomain datasets | free | https://cloud.projectdiscovery.io/ | the chaos route is skipped |
+| `MAPPING_API_INTERVAL_MS` | — | mapping-API throttle | — | — | default 1500ms; raise when rate-limited |
+| **ENScan Cookie** (not an API) | aiqicha | Stage 1 entity anchoring | free | log in at aiqicha.baidu.com, copy via F12 | **Stage 1 completely unavailable** |
 
-## 二、特殊：ENScan 的 Cookie
+## 2. Special case: the ENScan Cookie
 
-ENScan 不走 API Key，走浏览器 Cookie。文件位置固定为 **`bin/config.yaml`**（程序读 exe 同目录）：
+ENScan does not use API keys; it uses a browser Cookie. The location is fixed at **`bin/config.yaml`** (the program reads next to the exe):
 
 ```yaml
 cookies:
-  aiqicha: "BAIDUID=...; ..."   # ★ 必填，登录 aiqicha.baidu.com 后从 F12 -> Network -> 任一请求的 Cookie 复制整行
+  aiqicha: "BAIDUID=...; ..."   # * required: log in to aiqicha.baidu.com, then copy the whole Cookie line from F12 -> Network -> any request
 ```
 
-注意：
-- Cookie 有有效期（通常几天到几周），失效后 ENScan 会报无数据，需要重新复制
-- **并发必须为 1**，否则账号会被风控（本 skill 已强制串行）
-- 备选：天眼查 Cookie（`tianyancha`），或填 `app.miit_api` 用 ICP_Query 反查备案
+Notes:
+- The Cookie has a validity period (usually days to weeks); once it expires ENScan reports "no data" and it must be copied again
+- **Concurrency must be 1**, or the account gets risk-controlled (this skill enforces serial access)
+- Alternatives: a tianyancha Cookie (`tianyancha`), or fill `app.miit_api` to reverse-lookup ICP filings via ICP_Query
 
-## 三、配置优先级
+## 3. Configuration priority
 
 ```
-真实环境变量  >  config/.env  >  config/config.json  >  默认值
+real environment variables  >  config/.env  >  config/config.json  >  defaults
 ```
 
-三种用法：
+Three usage patterns:
 
 ```bash
-# A. 文件（推荐，持久）
+# A. file (recommended, persistent)
 cp config/.env.example config/.env && vim config/.env
 
-# B. 临时（单次命令）
+# B. temporary (single command)
 FOFA_KEY=xxx QUAKE_TOKEN=yyy python findinfo.py subs --domain example.com
 
-# C. JSON（程序化调用）
+# C. JSON (programmatic)
 vim config/config.json
 ```
 
-## 四、零配置可用（不需要任何 key）
+## 4. Zero-config capabilities (no key needed at all)
 
-| 能力 | 工具 | 说明 |
+| Capability | Tool | Notes |
 |---|---|---|
-| 15 源并行被动聚合 | onepass（bin/onepass.exe） | 8 个源免 key，一条命令覆盖 CT + 多个公开被动 DNS |
-| 证书透明子域 | crt.sh / CertSpotter | **最有效的被动源，完全免费** |
-| DNS 解析 + 泛解析过滤 | dnsx + 系统 DNS 兜底 | 不依赖公共 DNS 可用性 |
-| 存活/指纹/IP 映射 | httpx | 核心资产富化 |
-| CDN 判别 | cdncheck | 内置数据 |
-| 端口扫描 | naabu | 无需 key |
-| Host 碰撞 | hostCollision（Host 头碰撞）+ curl 差分兜底 | 真正出内部服务的一步 |
-| 爬虫 / JS 泄露 | katana + 内置 jsleak | 无需 key |
-| 企业信息 | ENScan | 只需要 Cookie，不需要 key |
+| 15-source parallel passive aggregation | onepass (bin/onepass.exe) | 8 sources are key-free; one command covers CT + several public passive DNS |
+| Certificate-transparency subdomains | crt.sh / CertSpotter | **the most effective passive source, completely free** |
+| DNS resolution + wildcard filtering | dnsx + system-DNS fallback | independent of public DNS availability |
+| Liveness/fingerprint/IP mapping | httpx | core asset enrichment |
+| CDN detection | cdncheck | bundled data |
+| Port scanning | naabu | no key needed |
+| Host collision | hostCollision (Host-header collision) + curl differential fallback | the step that actually yields internal services |
+| Crawler / JS leaks | katana + built-in jsleak | no key needed |
+| Company information | ENScan | needs only a Cookie, no key |
 
-> 也就是说：**没有 FOFA/Quake 额度也能完成 80% 的资产测绘**，只是少了"备案号反查"这一条最宽的横向扩展路径。
+> In other words: **80% of asset mapping is achievable without any FOFA/Quake quota** — you only lose the "ICP filing reverse lookup", the widest horizontal-expansion route.
 
-## 五、额度与节流约定
+## 5. Quota and throttling conventions
 
-- 测绘类 API（FOFA/Quake/Hunter/ZoomEye）共用 `MAPPING_API_INTERVAL_MS`，默认 1500ms
-- 被限流（返回 429 / "frequently"）时：本 skill 会把该源标记 `degraded` 并继续用其他源，**不会重试烧额度**
-- 单次 `run` 建议上限：`--max-seed 5`（种子域数量），避免一次跑几百个域把额度打光
-- 所有 API 响应本地缓存 7 天（`cache/`），重复跑不重复扣额度
+- Mapping APIs (FOFA/Quake/Hunter/ZoomEye) share `MAPPING_API_INTERVAL_MS`, default 1500ms
+- On rate limiting (HTTP 429 / "frequently"): the source is marked `degraded` and the others continue; **quota is never burned on retries**
+- Recommended per-run cap: `--max-seed 5` (number of seed domains), so one run cannot drain the quota over hundreds of domains
+- Only **certificate transparency (CT)** responses are cached locally (`cache/certs/`, 7 days): re-runs of crt.sh / CertSpotter do not re-spend requests. Other stages (probe/subs/dns...) have no response cache; re-runs re-request
 
-## 六、安全检查清单
+## 6. Security checklist
 
-- [ ] `config/.env` 已在 `.gitignore`（本仓库已配置）
-- [ ] 不要把 Cookie/Key 写进 `SKILL.md`、`docs/`、日志
-- [ ] 日志里若出现 key，检查 `runs/` 产物后删除
-- [ ] 共享机器上把 `config/` 权限收紧
+- [ ] `config/.env` is in `.gitignore` (already configured in this repo)
+- [ ] Never write Cookies/Keys into `SKILL.md`, `docs/`, or logs
+- [ ] If a key shows up in logs, check the `runs/` artifacts and delete them
+- [ ] On shared machines, tighten permissions on `config/`

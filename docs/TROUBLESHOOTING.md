@@ -1,77 +1,77 @@
-# 故障与恢复
+# Troubleshooting and recovery
 
-> SKILL.md §6 是「看到这个现象该查哪一行」；这里是完整表：故障对照、
-> `wait` 返回判读、结果推进分支、来源级结果分支。改代码时同步这里。
+> SKILL.md §6 tells you "which row to check for this symptom"; here are the full tables: fault mapping,
+> how to read `wait` returns, result-advancement branches, per-source outcome branches. Keep this file in sync with code changes.
 
-## 1. 常见故障
+## 1. Common faults
 
-| 现象 | 原因 | 处理 |
+| Symptom | Cause | Fix |
 |---|---|---|
-| `{"error":"tool_missing"}` | `bin/<平台>/` 里没有该工具（不回退 PATH） | `doctor` 看哪个缺：Linux 跑 `scripts/setup-linux.sh`，Windows 补 `bin/windows/*.exe`。不要自己装 |
-| `entity` 返回空 | `bin/config.yaml` 没填 Cookie 或已过期 | `cp bin/config.example.yaml bin/config.yaml` 后重新粘贴 aiqicha Cookie；或改用 `--domain` 直接给种子域 |
-| `subs` 只返回少量结果 | 没配测绘 key（只有 subfinder 一路） | 看 `docs/API-KEYS.md`，或接受现状（crt.sh 仍可用）。这是覆盖缺口，`subs` **不会因此记 failed**，也不要 `--resume` |
-| `passive` 只有少量结果 | 只有免 key 源可用 | 如实报告 `per_source` 状态 |
-| `dns` 大量解析失败 | 公共 DNS 被墙/污染 | 已内置系统 DNS 兜底；仍失败则检查网络环境 |
-| `vhost` 命中 0 | 该 IP 上确实只有一个站点 / 走代理无法直连 IP | 换直连网络环境；确认 IP 不是 CDN |
-| `vhost` 词表"没生效" | 词表里是裸标签（dev/uat），没给基域无法拼成 Host | 加 `--domain 主域`；stderr 会打印 "words -> hosts" 的展开数量 |
-| `probe` 全部超时 | WAF 拦截或网络问题 | 降 `--min-conf` 减少目标，或换出口 IP |
-| `brute` 报 Npcap/socket 错误 | 缺 Npcap 驱动或无管理员权限 | 装 Npcap（勾选 WinPcap 兼容），用管理员终端跑；跑不了就跳过并说明 |
-| `brute` 命中数异常多 | 该域有泛解析 | 用 `--wildcard advanced`，或跑完 `dns` 再过滤 |
-| 泛解析导致假资产 | — | `dns` 阶段已自动过滤并返回 `wildcard`；不要再手工加域名 |
-| 工具失败 | 内部已按 `limits.source_retries`（默认 2 次，退避）重试；仍失败 → `ok: false` | 阶段记 failed、不写 checkpoint（重跑会重试），其它来源成果保留 |
-| 超过展示上限 | `truncated: true` | 只是展示截断，下游用库里全量，别拿展示样本当输入 |
-| 换了会话想接着干 | — | `runs` 找 run_id → `status --run <id>` 恢复上下文（不依赖上次会话记忆） |
-| `run` 退出码 5 | 跑完但有阶段失败（`result.status=partial`） | 看 `coverage.failed_stages`；缺 key 导致的缺口不要 `--resume` |
+| `{"error":"tool_missing"}` | Tool missing from `bin/<platform>/` (no PATH fallback) | `doctor` shows which one: Linux runs `scripts/setup-linux.sh`, Windows adds `bin/windows/*.exe`. Do not install tools yourself |
+| `entity` returns empty | `bin/config.yaml` has no Cookie, or it expired | `cp bin/config.example.yaml bin/config.yaml` and re-paste the aiqicha Cookie; or pass the seed domain directly with `--domain` |
+| `subs` returns only a few results | No mapping-platform key configured (subfinder is the only route) | See `docs/API-KEYS.md`, or accept it (crt.sh still works). This is a coverage gap — `subs` **never records failed** for it, and do not `--resume` |
+| `passive` returns only a few results | Only key-free sources available | Report the `per_source` statuses honestly |
+| `dns` shows mass resolution failures | Public DNS blocked/poisoned | The system-DNS fallback is built in; if it still fails, check the network |
+| `vhost` 0 hits | The IP really hosts a single site / the proxy blocks direct IP access | Switch to a direct egress; confirm the IP is not a CDN |
+| `vhost` wordlist "has no effect" | The wordlist holds bare labels (dev/uat); without a base domain no Host can be built | Add `--domain <base>`; stderr prints the expanded "words -> hosts" count |
+| `probe` times out on everything | WAF interception or a network issue | Lower `--min-conf` to shrink the target set, or change the egress IP |
+| `brute` reports Npcap/socket errors | Npcap driver missing or no admin rights | Install Npcap (with the WinPcap-compatibility option) and run from an admin terminal; if impossible, skip and say so |
+| `brute` yields an abnormal number of hits | The domain has wildcard resolution | Use `--wildcard advanced`, or filter after running `dns` |
+| Wildcards creating fake assets | — | The `dns` stage already filters them and returns `wildcard`; never add domains by hand on top |
+| A tool failed | Already retried internally per `limits.source_retries` (default 2, with backoff); still failing → `ok: false` | The stage is marked failed and writes no checkpoint (a re-run retries); other sources' results are kept |
+| Over the display cap | `truncated: true` | Display-only truncation; downstream uses the full set from the store — never feed display samples back as input |
+| New session, want to continue | — | Find the run_id with `runs` → `status --run <id>` restores the context (no reliance on the previous session's memory) |
+| `run` exit code 5 | Finished but with failed stages (`result.status=partial`) | Read `coverage.failed_stages`; do not `--resume` gaps caused by missing keys |
 
-## 2. `wait` 返回怎么判读（Agent 必守的分支）
+## 2. How to read `wait` returns (branches the agent must follow)
 
-| 返回 | 含义 | 该做什么 |
+| Return | Meaning | What to do |
 |---|---|---|
-| `timed_out: true` + `state: running` | 只是**本次等待窗口**结束，任务仍在跑 | 继续 `wait` 同一个 run_id；**不要重启、不要重复贴同样的状态** |
-| `changed: true` + `state: running` | 有进展 | 可以给用户一句阶段摘要（阶段名/计数），然后继续等 |
-| `state: completed` | 结束 | 读 `result`/`coverage`，进交付 |
-| `state: failed` | 失败 | 读 `coverage.failed_stages` + `last_error`，`run --resume <run_id>` 重试 |
-| `state: cancelled` | 被取消 | 说明已采资产，不再重启 |
-| `interrupted: true` + `reaped_by_host: true` | 宿主回收了脱离会话的子进程，后台模式在本机不可用 | **不要重试后台**：改同会话前台执行（配 `--task-timeout`），或用存活父进程托管 |
-| `interrupted: true` + `reaped_by_host: false` | 工作进程死了（崩溃/断电） | `run --resume <run_id>`，断点续跑 |
+| `timed_out: true` + `state: running` | Only **this wait window** ended; the job is still running | Keep `wait`ing on the same run_id; **do not restart, do not paste the same status again** |
+| `changed: true` + `state: running` | Progress happened | You may give the user a one-line stage summary (stage name/counts), then keep waiting |
+| `state: completed` | Finished | Read `result`/`coverage`, move to delivery |
+| `state: failed` | Failed | Read `coverage.failed_stages` + `last_error`, retry with `run --resume <run_id>` |
+| `state: cancelled` | Cancelled | State what was already collected; do not restart |
+| `interrupted: true` + `reaped_by_host: true` | The host reaped the session-detached subprocess; background mode is unusable here | **Do not retry background**: run in the foreground within the same session (with `--task-timeout`), or host the worker under a surviving parent process |
+| `interrupted: true` + `reaped_by_host: false` | The worker died (crash/power loss) | `run --resume <run_id>` resumes from checkpoints |
 
-- `progress.percent` 为 **null** 表示该阶段总量未知：只能说"已处理 N 条"，**不要编百分比**。
-- 重复提交同一目标时后台模式返回 `reused: true` + 同一个 run_id：直接用，不要再起一个。
-- 定位任务**只用 run_id**（`--run <run_id>`），不要依赖"最近一次运行"。
+- `progress.percent` being **null** means the stage's total is unknown: you can only say "N rows processed", **never invent a percentage**.
+- Re-submitting the same target in background mode returns `reused: true` + the same run_id: use it directly; do not start another.
+- Address jobs **by run_id only** (`--run <run_id>`); never rely on "the most recent run".
 
-## 3. 结果推进规则（按实际结果决定下一步，不要停在"已启动"）
+## 3. Result-advancement rules (decide the next step from the actual result, do not stop at "started")
 
 ```bash
 python findinfo.py --task myproj status --run <run_id>
 ```
 
-| 情况 | 判据 | 动作 |
+| Situation | Criterion | Action |
 |---|---|---|
-| 覆盖充分 | `coverage.complete: true` | 进交付 |
-| 有阶段失败 | `coverage.failed_stages` 非空 | 读错误后 `run --resume <run_id>` 重试（成功阶段会被断点跳过） |
-| 还有可补阶段 | `coverage.not_run_stages` 非空 | 补那个阶段（单阶段命令或 `run` 加开关），再 `status` |
-| 轮数/时间预算用尽 | `stop_reason: max_rounds / time_budget` | 明确告知"覆盖不完整+原因"；必要时加 `--rounds` 续跑 |
-| JS 还有待分析 | `coverage.js_queue.pending > 0` | 继续跑 `extract`，这不是收敛 |
-| 来源不可用 | `coverage.unavailable`（缺 key/工具） | 保留成果，交付里列出缺口，**不要伪装成"没有资产"** |
-| 空结果 | `counts` 空且无 failed | 是有效空结果，不是失败 |
+| Coverage sufficient | `coverage.complete: true` | Move to delivery |
+| Some stage failed | `coverage.failed_stages` non-empty | After reading the errors, retry with `run --resume <run_id>` (succeeded stages are skipped by checkpoints) |
+| Stages still worth adding | `coverage.not_run_stages` non-empty | Fill in that stage (single-stage command, or `run` with switches), then `status` again |
+| Round/time budget exhausted | `stop_reason: max_rounds / time_budget` | State clearly "coverage incomplete + the reason"; add `--rounds` and continue if needed |
+| JS still pending analysis | `coverage.js_queue.pending > 0` | Keep running `extract`; this is not convergence |
+| Sources unavailable | `coverage.unavailable` (missing key/tool) | Keep the results, list the gaps in the delivery, **never disguise them as "no assets"** |
+| Empty result | `counts` empty and nothing failed | A valid empty result, not a failure |
 
-## 4. 来源级结果的分支（照表判断，不要自己发明）
+## 4. Per-source outcome branches (judge by this table, invent nothing)
 
-| 看到什么 | 判据 | 动作 |
+| What you see | Criterion | Action |
 |---|---|---|
-| 来源没发现资产 | 阶段 `found: 0` + `ok: true` | 有效空结果，不是失败 |
-| 来源暂时失败 | `limits.source_retries` 重试后仍 `ok: false` | 阶段记 failed、不写 checkpoint（重跑会重试），其它来源成果保留 |
-| 缺 Key / 额度耗尽 | `coverage.unavailable`、`doctor.api_keys`、`fofa_gateway.remaining` | 记为覆盖缺口，**照常交付**，缺口里写明少哪几路。**不要 `--resume`** —— 重试变不出 key；缺 key 也不计入 `failed_stages` |
-| 泛解析污染 | `dns` 返回 `wildcard` | 已被过滤不入库；写进"数据质量"说明 |
-| 范围内新域名 | `rounds[i].new_domains > 0` | `--rounds` 已自动送入下一轮，无需手工指挥 |
-| 范围外关联资产 | `dropped_out_of_scope` / brief 的 `leaks.domains` | 只记候选，不自动扩面 |
-| 工具失败 | `stages[].failed` + `error` | 保留 rc/错误/已有产物，该阶段不算完成 |
-| 超过展示上限 | `truncated: true` | 只是展示截断，下游用库里全量 |
-| 断点命中 | `skipped: true, resumed: true` | 下游输入已从库重建，不要因内存为空跳过后续阶段 |
+| A source found no assets | Stage `found: 0` + `ok: true` | A valid empty result, not a failure |
+| A source failed transiently | Still `ok: false` after `limits.source_retries` retries | The stage is marked failed and writes no checkpoint (a re-run retries); other sources' results are kept |
+| Key missing / quota exhausted | `coverage.unavailable`, `doctor.api_keys`, `fofa_gateway.remaining` | Record a coverage gap, **deliver as usual**, naming which routes are missing. **Do not `--resume`** — retries cannot conjure a key; a missing key never counts into `failed_stages` either |
+| Wildcard pollution | `dns` returns `wildcard` | Already filtered, not stored; mention it under "data quality" |
+| New in-scope domains | `rounds[i].new_domains > 0` | `--rounds` already feeds them into the next round; no manual steering needed |
+| Related assets out of scope | `dropped_out_of_scope` / the brief's `leaks.domains` | Record as candidates only; never widen scope automatically |
+| A tool failed | `stages[].failed` + `error` | Keep rc/error/existing artifacts; the stage does not count as completed |
+| Over the display cap | `truncated: true` | Display-only truncation; downstream uses the full set from the store |
+| Checkpoint hit | `skipped: true, resumed: true` | Downstream inputs were rebuilt from the store; do not skip later stages just because memory is empty |
 
-## 5. 红线
+## 5. Red lines
 
-1. 只有后台启动成功 ≠ 任务完成。
-2. 没有新进展时不要重复启动、不要反复输出同一状态。
-3. 退出码 5 = 跑完了但有阶段失败（`result.status=partial`），不是成功。
-4. 缺 key 时 `--resume` 永远不好转：缺的是凭证，重试变不出来。
+1. A successful background launch alone ≠ the task is complete.
+2. Without new progress: no relaunching, no repeating the same status output.
+3. Exit code 5 = finished but with failed stages (`result.status=partial`), not a success.
+4. With a missing key, `--resume` never helps: what is missing is a credential; retrying cannot produce one.

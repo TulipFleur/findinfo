@@ -5,10 +5,10 @@ Every subcommand prints one JSON object to stdout (machine-readable for the agen
 and human-readable progress to stderr.
 
     python findinfo.py doctor
-    python findinfo.py entity --name 示例公司
+    python findinfo.py entity --name "Example Corp"
     python findinfo.py subs   --domain example.com
     python findinfo.py probe  --from-store
-    python findinfo.py run    --name 示例公司 --active
+    python findinfo.py run    --name "Example Corp" --active
 """
 from __future__ import annotations
 
@@ -169,7 +169,7 @@ def cmd_icp(args) -> None:
             # The ICP table is shared across engagements, so an unscoped
             # --from-store reverse-lookups another project's filings. Scope it
             # exactly like every other --from-store command does.
-            scope = [core.canon_domain(d) for d in (args.scope or [])]
+            scope = [core.canon_user_domain(d) for d in (args.scope or [])]
             scope = [d for d in scope if d]
             codes = [a["canonical"] for a in
                      store.get_assets(kind="icp", match=scope or None)]
@@ -201,8 +201,13 @@ def _domains_from_store(store, min_conf: float, match: list[str] | None = None) 
     The graph is shared across engagements on purpose (multi-agent merge), so
     every stage that reads it back must pass the current engagement's domains.
     Without `match` a second engagement inherits the first one's targets.
+
+    `match` entries are USER-typed (--domain/--scope), so they go through
+    canon_user_domain: a dev.corp.local scope used to be silently emptied by
+    the strict de-noiser and probe/crawl then reported "0 live / 0 tested"
+    with ok:true -- the user's target simply vanished.
     """
-    scope = [core.canon_domain(d) for d in (match or [])]
+    scope = [core.canon_user_domain(d) for d in (match or [])]
     scope = [d for d in scope if d]
     return [a["canonical"] for a in
             store.get_assets(kind="domain", min_conf=min_conf, match=scope or None)]
@@ -337,11 +342,12 @@ def cmd_extract(args) -> None:
                             pass
         urls = args.url or []
         if args.from_store and not urls:
-            # 回流场景：直接拿库里的 URL 资产（crawl 阶段写进去的），
-            # 不用让 agent 去猜 runs 目录里的文件路径。
-            # --domain 可限定只取属于这些域的 URL：库里往往混着别的目标
-            # 的历史资产，不限域会把无关站点的 JS 也抓一遍。
-            only = core.canon_scope(args.domain or [])
+            # Reflow: take URL assets from the store (written by the
+            # crawl stage) instead of making the agent guess run-dir paths.
+            # --domain scopes them to the given domains: the store usually
+            # mixes other engagements' history, and without it the JS of
+            # unrelated sites would be fetched too.
+            only, _rej = core.canon_user_scope(args.domain or [])
             for a in store.get_assets(kind="url", min_conf=0.4):
                 u = a["canonical"]
                 if not u.startswith("http"):
@@ -488,8 +494,9 @@ def cmd_brief(args) -> None:
     brief = report.build_brief(data, top=args.top,
                                max_bytes=args.max_bytes,
                                coverage=coverage)
-    brief["note"] = ("Agent 统一入口：直接查库不落文件。report 只产出人看的 md/html；"
-                     "全量数据用 assets --export 或 report --with-json。")
+    brief["note"] = ("Unified agent read API: queries the store, writes no "
+                     "files. report produces the human md/html only; full data "
+                     "via assets --export or report --with-json.")
     out(brief)
 
 
@@ -534,7 +541,7 @@ def cmd_report(args) -> None:
     res = {"counts": data["counts"], "scope": data["scope"],
            "paths": paths, "warnings": data["environment"]["warnings"],
            "next_steps": data["next_steps"][:3],
-           "note": "agent 数据请用 brief 命令（stdout 一行 JSON）；机器文件仅在 --with-json/--with-brief 时生成"}
+           "note": "agents read data via the brief command (one JSON line on stdout); machine files are only written with --with-json/--with-brief"}
     if args.print_md:
         res["md"] = report.build_md(data)
     if args.print_json:
@@ -950,7 +957,7 @@ def _plan_stages(args, active) -> list:
         plan.append("brute")
     # icp needs codes harvested from --name/ENScan. With a bare --domain there
     # is nothing to reverse-look-up, so planning it guarantees a phantom gap in
-    # every domain-only run ("icp未执行") that no retry can ever close.
+    # every domain-only run ("icp not run") that no retry can ever close.
     if not getattr(args, "no_icp", False) and getattr(args, "name", ""):
         plan.append("icp")
     return plan + _round_plan(args, active)
@@ -1495,7 +1502,7 @@ def _run_pipeline(args) -> int:
                 if r.get("rc") not in (0, None) and not r.get("json_files"):
                     # rc != 0 with no JSON used to fail the stage outright. But
                     # ENScan can print a complete report table and still not
-                    # write the JSON (observed on a deep 示例公司 query: 35 KB of
+                    # write the JSON (observed on a deep test-company query: 35 KB of
                     # tables, zero files), and it can also die while wrapping up.
                     # Neither is "the entity was not found": report the real
                     # shape -- table seen, JSON missing -- and let the stage
@@ -1515,10 +1522,17 @@ def _run_pipeline(args) -> int:
                               "domains": len(r.get("domains", []))},
                    resume=lambda: {"companies": [], "icp": [], "domains": []})
         if args.domain:
+            # User-typed input: canon_user_domain validates INTENT (private
+            # TLDs like .local, bare IPs, IDN -> punycode are all legitimate
+            # targets). The strict canon_domain de-noiser used to sit here and
+            # silently threw 127.0.0.1:18765 / *.test / dev.corp.local away.
             for d in args.domain:
-                cd = core.canon_domain(d)
+                cd = core.canon_user_domain(d)
                 if not cd:
-                    raise core.FindInfoError("invalid domain: " + str(d))
+                    raise core.FindInfoError(
+                        "invalid domain: " + str(d) +
+                        " (user input is never dropped silently; fix the value "
+                        "or drop the flag explicitly)")
                 domains.append(cd)
         if args.name:
             for a in store.get_assets(kind="domain", min_conf=0.9):

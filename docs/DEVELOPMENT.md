@@ -1,145 +1,145 @@
-# findinfo 开发文档
+# findinfo development documentation
 
-> 本文件面向**开发者/维护者**。日常使用请读 [`../SKILL.md`](../SKILL.md)，
-> 让 Agent 跑完整流程请用 [`../prompts/AGENT.txt`](../prompts/AGENT.txt)。
+> This file targets **developers/maintainers**. For daily use read [`../SKILL.md`](../SKILL.md);
+> to have an agent run the full workflow use [`../prompts/AGENT.txt`](../prompts/AGENT.txt).
 
 ---
-## 1. 目录结构
+## 1. Directory layout
 
 ```
 findinfo/
-├── SKILL.md            ← 本文件（AI 读这个决定怎么用）
-├── findinfo.py         ← CLI 入口（23 个子命令）
-├── prompts/AGENT.txt    ← ★ 复制即用的提示词模板（人工复制，不参与自动加载）
-├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
-│   ├── windows/        ← 12 个 .exe（Windows 预置；doctor 追踪 12 个）
-│   ├── linux/          ← ELF（scripts/setup-linux.sh 安装；该脚本只在 Linux 包）
-│   └── config.example.yaml  ← ENScan Cookie 模板 → 复制成 bin/config.yaml
-├── rust/onepass/       ← onepass 源码（15 源被动聚合，cargo build --release）
-├── deploy/             ← systemd 模板（findinfo@.service / .timer）
+├── SKILL.md            ← the file agents read to decide how to use the skill
+├── findinfo.py         ← CLI entry point (23 subcommands)
+├── prompts/AGENT.txt    ← ★ copy-and-use prompt template (manual copy, never auto-loaded)
+├── bin/                ← per-platform directories: bin/windows/, bin/linux/ (no macOS support)
+│   ├── windows/        ← 12 .exe files (preinstalled on Windows; doctor tracks 12)
+│   ├── linux/          ← ELF files (installed by scripts/setup-linux.sh; that script ships only in the Linux package)
+│   └── config.example.yaml  ← ENScan Cookie template → copy to bin/config.yaml
+├── rust/onepass/       ← onepass source (15-source passive aggregation, cargo build --release)
+├── deploy/             ← systemd templates (findinfo@.service / .timer)
 ├── lib/
-│   ├── core.py         ← 配置/存储/归一化/缓存/限速/执行
-│   ├── tools.py        ← 13 个阶段实现（全部返回结构化数据）
-│   ├── jsleak.py       ← JS 泄露提取·正则引擎（零依赖）
-│   └── report.py       ← 两种最终输出（json 给 AI / html+md 给人）+ 来源标注 + 优先级评分
+│   ├── core.py         ← config/storage/normalization/cache/rate-limiting/execution
+│   ├── tools.py        ← 13 stage implementations (all return structured data)
+│   ├── jsleak.py       ← JS leak extraction · regex engine (zero dependencies)
+│   └── report.py       ← two final outputs (json for AI / html+md for humans) + provenance + priority scoring
 ├── config/
-│   ├── .env.example    ← ★ API Key 存档模板
+│   ├── .env.example    ← ★ API key archive template
 │   └── config.example.json
 ├── docs/
-│   ├── API-KEYS.md     ← ★ 哪些需要 key / 申请地址 / 免费额度
-│   ├── TOOLS.md        ← 每个命令的详细参数与输出示例
-│   ├── LINUX.md        ← Linux 部署（二进制/CAP_NET_RAW/systemd）
-│   └── CLIENTS.md      ← 各客户端加载机制差异与排错
-├── wordlists/          ← 字典（brute / vhost 用，均为裸标签）
-│   ├── sub.txt         ← 174 条高价值前缀（内部系统/中间件，先跑这个）
-│   ├── submin.txt      ← 9990 条 top-10k 全量（mitan submin 归一化去重）
-│   └── vhost.txt       ← 145 条 Host 标签（vhost 用，需 --domain 拼基域）
+│   ├── API-KEYS.md     ← ★ which sources need keys / signup / free tiers
+│   ├── TOOLS.md        ← detailed parameters and output examples for every command
+│   ├── LINUX.md        ← Linux deployment (binaries/CAP_NET_RAW/systemd)
+│   └── CLIENTS.md      ← per-client loading-mechanism differences and debugging
+├── wordlists/          ← dictionaries (for brute / vhost; all bare labels)
+│   ├── sub.txt         ← 174 high-value prefixes (internal systems/middleware; run this first)
+│   ├── submin.txt      ← the full top-10k set, 9990 entries (mitan submin, normalized and deduplicated)
+│   └── vhost.txt       ← 145 Host labels (for vhost; needs --domain to append the base)
 └── scripts/
-    ├── findinfo.sh     ← ★ 固定入口（-t/-n/-a/--vhost/-b/--status）
-    ├── install.py      ← ★ 跨客户端安装/状态/校验
-    ├── build-release.py ← ★ 生成干净发布包 + SHA256SUMS（见第 3 节）
-    ├── setup-linux.sh  ← ★ Linux 装原生二进制 + setcap + 体检（只在 Linux 包）
-    ├── build-onepass.sh← 重编 onepass（需 Rust 工具链）
-    └── build-enscan.sh ← 重编 ENScan_GO（需 Go 1.23+）
+    ├── findinfo.sh     ← ★ fixed entry point (-t/-n/-a/--vhost/-b/--status)
+    ├── install.py      ← ★ cross-client install/status/verify
+    ├── build-release.py ← ★ build clean release packages + SHA256SUMS (see section 2)
+    ├── setup-linux.sh  ← ★ Linux: install native binaries + setcap + health check (Linux package only)
+    ├── build-onepass.sh← rebuild onepass (needs the Rust toolchain)
+    └── build-enscan.sh ← rebuild ENScan_GO (needs Go 1.23+)
 
-状态目录（不在代码目录内，可被多个客户端共用；配置仍留在代码目录）
-~/.findinfo/            ← 可用 FINDINFO_HOME 覆盖
-├── findinfo.db         ← 资产图（SQLite，唯一真值）
-├── runs/               ← 每次运行的产物（JSONL + status.json）
-├── reports/            ← report 产物（json/md/html），latest 指向最近一次
-└── cache/              ← API 响应缓存
+State directory (outside the code tree, shareable by multiple clients; config stays with the code)
+~/.findinfo/            ← override with FINDINFO_HOME
+├── findinfo.db         ← the asset graph (SQLite, the single source of truth)
+├── runs/               ← per-run artifacts (JSONL + status.json)
+├── reports/            ← report artifacts (json/md/html); latest points at the most recent
+└── cache/              ← API response cache
 ```
 
-> 兼容：若 `<skill>/data/findinfo.db` 已存在，会继续就地使用旧位置，不会迁移或丢弃数据。
-> `config/`（`.env`、`bin/config.yaml`）始终跟代码目录走，不会被移动到用户目录，也不会被 `--copy` 复制到别处。
+> Compatibility: if `<skill>/data/findinfo.db` already exists, the old location keeps being used in place — nothing is migrated or discarded.
+> `config/` (`.env`, `bin/config.yaml`) always stays with the code tree; it is never moved to the user directory and never copied elsewhere by `--copy`.
 
 
 
 ---
 
-## 2. 发布流程（生成可复现的发布包）
+## 2. Release process (building reproducible packages)
 
-发布包由脚本生成，不再手工拷目录。**打 tag、建 Release、上传资产由人来做**，
-脚本只负责"目录里该有什么"。
+Packages are generated by a script — no more hand-copying directories. **Tagging, creating the GitHub Release and uploading assets are human jobs**;
+the script only decides "what belongs in the directory".
 
 ```bash
-python scripts/build-release.py                       # 两个平台，输出到 _rel/
-python scripts/build-release.py --platform windows     # 只打一个平台
-python scripts/build-release.py --dry-run              # 只看清单，不写文件
-python scripts/build-release.py --out _rel/next        # 先放旁边，人工对比后再替换
-python scripts/build-release.py --version 0.7.3        # 默认读 VERSION
+python scripts/build-release.py                       # both platforms, output to _rel/
+python scripts/build-release.py --platform windows     # one platform only
+python scripts/build-release.py --dry-run              # manifest only, writes nothing
+python scripts/build-release.py --out _rel/next        # park it beside first, replace after review
+python scripts/build-release.py --version 0.7.3        # defaults to the VERSION file
 ```
 
-产物：`_rel/findinfo-<版本>-<平台>.zip` + `_rel/SHA256SUMS`（每个 zip 一行），
-并对每个平台打印一行 JSON（`version` / `platform` / `files` / `bytes_raw` /
-`bytes_zip` / `sha256` / `audit_ok` / `audit_problems`），可直接贴进 Release 说明。
+Artifacts: `_rel/findinfo-<version>-<platform>.zip` + `_rel/SHA256SUMS` (one line per zip),
+plus one JSON line printed per platform (`version` / `platform` / `files` / `bytes_raw` /
+`bytes_zip` / `sha256` / `audit_ok` / `audit_problems`), ready to paste into Release notes.
 
-**包里有什么，是规则不是记忆**（`scripts/build-release.py` 的 `shipped_files()`）：
+**What ships is rules, not memory** (the `shipped_files()` of `scripts/build-release.py`):
 
-| 规则 | 结果 |
+| Rule | Result |
 |---|---|
-| 只打包 `git ls-files` 的已跟踪文件 | 天然排除 `__pycache__`/`.pyc`、`.env`、`data/`、`runs/`、`cache/` |
-| 加上**当前平台**的 `bin/<platform>/*` | Windows 包只有 `.exe`，Linux 包只有 ELF；另一平台的二进制永不混入 |
-| 排除开发物料 `tests/`、`agent-records/`、`rust/`、`scripts/agent-record.py`、`.gitignore` | 消费者不需要 pytest、源码与协作日志 |
-| 排除工具目录下的 `config.yaml` 与 `subfinder/provider-config.yaml` | 它们是工具在 cwd 生成的默认模板；运行时只从 `cwd=bin/` 或 `$HOME/.config/<tool>/` 读取，仓库根的副本从不起作用 |
-| 按平台排除 | Windows 包不含 `scripts/setup-linux.sh`（POSIX 安装器）和 `deploy/*.service|*.timer`（systemd） |
-| 永不打包密钥 | `bin/config.yaml`（ENScan Cookie）、`config/.env`；只带 `.example` 模板 |
+| package only `git ls-files` tracked files | naturally excludes `__pycache__`/`.pyc`, `.env`, `data/`, `runs/`, `cache/` |
+| add the **current platform's** `bin/<platform>/*` | Windows packages hold only `.exe`, Linux packages only ELF; the other platform's binaries never mix in |
+| drop development material `tests/`, `agent-records/`, `rust/`, `scripts/agent-record.py`, `.gitignore` | consumers do not need pytest, source or collaboration logs |
+| drop `config.yaml` under tool directories and `subfinder/provider-config.yaml` | they are default templates the tools generate in cwd; at runtime they are read only from `cwd=bin/` or `$HOME/.config/<tool>/`, so the repo-root copies never take effect |
+| exclude per platform | Windows packages carry no `scripts/setup-linux.sh` (POSIX installer) or `deploy/*.service|*.timer` (systemd) |
+| never package secrets | `bin/config.yaml` (ENScan Cookie), `config/.env`; only `.example` templates ship |
 
-> `deploy/` 是整个目录排除的：它只有 systemd 单元，Windows 用不到；Linux 需要时从仓库取。
+> `deploy/` is excluded as a whole directory: it holds only systemd units, useless on Windows; Linux fetches them from the repo when needed.
 
-**构建后自检**（脚本自动做，任一不过则 exit 1）：解压到临时目录，确认没有
-`.pyc`/`__pycache__`/`.env`/`bin/config.yaml`、`VERSION` 与 `--version` 一致、
-并在解压目录里跑一次 `python findinfo.py doctor`。**网络探测失败不算构建失败**
-（无出口时 doctor 的 `net_egress` 必然失败）；但如果 doctor 连 `tools_summary` 都产不出来，
-说明包里的 CLI 起不来，构建失败。
+**Post-build self-check** (run by the script; any failure exits 1): unpack into a temp directory, confirm there is no
+`.pyc`/`__pycache__`/`.env`/`bin/config.yaml`, that `VERSION` matches `--version`,
+and run `python findinfo.py doctor` once in the unpacked tree. **A failed network probe is not a build failure**
+(without egress doctor's `net_egress` necessarily fails); but if doctor cannot even produce `tools_summary`,
+the packaged CLI cannot start and the build fails.
 
-**核对 SHA256SUMS**（下载后先验证，再解压）：
+**Verify SHA256SUMS** (verify after download, before unpacking):
 
 ```bash
 # Linux / macOS
 sha256sum -c SHA256SUMS
 
 # Windows PowerShell
-Get-FileHash .indinfo-<版本>-windows.zip -Algorithm SHA256
+Get-FileHash .\findinfo-<version>-windows.zip -Algorithm SHA256
 ```
 
-**人工收尾（脚本不做）**：确认 `_rel/next` 的 file 清单与体积 → 替换 `_rel/` 里的旧包 →
-`git tag v<版本>` 并推送 → 建 GitHub Release、上传 zip 与 SHA256SUMS（上传资产用文件 payload，
-内联 JSON 会被 shell 转义破坏）。
+**Manual finishing (not done by the script)**: review `_rel/next`'s file list and sizes → replace the old packages in `_rel/` →
+`git tag v<version>` and push → create the GitHub Release and upload the zips and SHA256SUMS (upload assets as file payloads;
+inline JSON gets mangled by shell escaping).
 
 ---
 
-## 3. 回归验证（全部为模拟采集器，不碰真实目标、不耗配额）
+## 3. Regression verification (all collectors simulated; no real targets, no quota spent)
 
 ```bash
-pip install pytest       # 一次性：部分用例用 pytest 的 raises/monkeypatch/tmp_path
-python -m tests          # 全套（Windows 与 WSL Kali 均已通过，Python >= 3.10）
+pip install pytest       # one-time: a few cases use pytest's raises/monkeypatch/tmp_path
+python -m tests          # the full suite (passes on Windows and WSL Kali, Python >= 3.10)
 ```
 
-> `tests/` 是**开发期自检**，不在运行时链路上（`findinfo.py`、`lib/`、`scripts/` 都不 import 它），
-> `install.py --copy` 也不会把它装到客户端目录。消费者无需安装 pytest；没有 pytest 时
-> `test_tool_resolution.py` / `test_tool_inventory.py` 会导入失败，其余用例照常运行。
+> `tests/` is a **development-time self-check**, not on the runtime path (`findinfo.py`, `lib/`, `scripts/` never import it),
+> and `install.py --copy` does not install it into client directories. Consumers do not need pytest; without it
+> `test_tool_resolution.py` / `test_tool_inventory.py` fail to import and the rest still runs.
 
-| 验收项 | 用例 | 方式 |
+| Acceptance item | Cases | Method |
 |---|---|---|
-| 1 首次任务：自检→采集→查询→交付 | `test_run_flow:test_first_pass_completes_and_reports_result` / `test_jobs:test_launch_returns_run_id_and_paths_immediately` | 进程内 cmd_run + 假 collector；真实子进程测 launch |
-| 2 多次 wait 返回 running 后拿到完成 | `test_jobs:test_wait_returns_running_on_timeout_then_completes` / `test_progress_change_returns_early` | 假 entry（sleep）驱动的真进程 |
-| 3 重复调用不重复创建 | `test_jobs:test_dedupe_reuses_inflight_job` / `test_run_flow:test_background_launch_reuses_inflight_job` | 同 dedupe_key → `reused: true` |
-| 4 部分来源失败仍保留成果 | `test_run_flow:test_partial_stage_reports_gap_and_exit_5` / `test_missing_engine_key_is_coverage_gap` / `test_source_outcomes:*` | 假 collector ok=false / 无 key |
-| 5 失败续跑 | `test_resume_after_failure:*` / `test_jobs:test_interrupted_detection_and_resume` | 两轮 cmd_run；kill 后 resume |
-| 6 超展示上限仍完整处理 | `test_stages_and_dns:test_dns_501_records_all_reach_downstream` | 501 条结果，展示截断但下游全量 |
-| 7 新资产回流与停止条件 | `test_run_flow:test_rounds_*` / `test_time_budget_stops_rounds_and_marks_partial` | rounds 循环 + 三种停止原因 |
-| 8 多任务并发不串任务 | `test_jobs:test_concurrent_runs_do_not_share_state` | state/日志/产物互不干扰 |
-| 9 会话恢复仅凭 run_id | `test_jobs:test_recovery_by_run_id_only` | 只用 run_id resolve + status |
-| 10 文档与实现一致 | `test_docs_commands:*` | 解析文档命令逐条对 argparse 校验，并禁止 nohup |
+| 1 first task: self-check → collect → query → deliver | `test_run_flow:test_first_pass_completes_and_reports_result` / `test_jobs:test_launch_returns_run_id_and_paths_immediately` | in-process cmd_run + fake collector; real subprocesses for launch |
+| 2 repeated waits return running before completion | `test_jobs:test_wait_returns_running_on_timeout_then_completes` / `test_progress_change_returns_early` | real processes driven by a fake entry (sleep) |
+| 3 repeated calls never duplicate work | `test_jobs:test_dedupe_reuses_inflight_job` / `test_run_flow:test_background_launch_reuses_inflight_job` | same dedupe_key → `reused: true` |
+| 4 results survive partial source failures | `test_run_flow:test_partial_stage_reports_gap_and_exit_5` / `test_missing_engine_key_is_coverage_gap` / `test_source_outcomes:*` | fake collector ok=false / missing key |
+| 5 resume after failure | `test_resume_after_failure:*` / `test_jobs:test_interrupted_detection_and_resume` | two rounds of cmd_run; resume after kill |
+| 6 full processing beyond the display cap | `test_stages_and_dns:test_dns_501_records_all_reach_downstream` | 501 records; display truncated, downstream gets everything |
+| 7 reflow rounds and stop conditions | `test_run_flow:test_rounds_*` / `test_time_budget_stops_rounds_and_marks_partial` | rounds loop + three stop reasons |
+| 8 concurrent tasks never cross-contaminate | `test_jobs:test_concurrent_runs_do_not_share_state` | state/logs/artifacts stay isolated |
+| 9 session recovery by run_id alone | `test_jobs:test_recovery_by_run_id_only` | resolve + status using run_id only |
+| 10 docs match the implementation | `test_docs_commands:*` | every documented command validated against argparse; nohup banned |
 
-**验证边界（如实区分）**：
+**Verification boundaries (state them honestly)**:
 
-- 已模拟验证：生命周期（spawn/wait/cancel/interrupt/resume）、状态机、result/coverage、回流停止条件、并发隔离、文档一致性。
-- 已实测：Windows 与 WSL Kali 上真实 Python 子进程 spawn→wait→completed，以及 `runs`/`status --run` CLI 路径。
-- 已在**真实目标**上跑通全流程（详见 `runs/REAL-TEST-NOTES.md`）：
-  - example.com/example.org：6359 域名 / 359 IP / 5680 端点，`complete: true`（7 阶段）
-  - 含 entity 的重跑：8 阶段全 done，certs 因 crt.sh 超时失败 → 如实标 `partial`
-  - example.com：7001 域名 / 12542 IP / 5083 端点，`complete: true`
-  - 耗时参考：subs+dns+probe 在 7000 个域名规模下约 25~35 分钟；crawl 在 287 站点 depth=3 下约 17 分钟
-- **未验证**：真实宿主保活（关终端/注销/重启）、macOS、小时级真实运行。不承诺"跨客户端退出后自动续跑"。
+- Verified by simulation: lifecycle (spawn/wait/cancel/interrupt/resume), the state machine, result/coverage, reflow stop conditions, concurrency isolation, docs consistency.
+- Verified by real testing: real Python subprocess spawn→wait→completed on Windows and WSL Kali, plus the `runs`/`status --run` CLI paths.
+- The full workflow has been run end to end on **real-world test targets** (see `runs/REAL-TEST-NOTES.md`):
+  - example.com/example.org: 6359 domains / 359 IPs / 5680 endpoints, `complete: true` (7 stages)
+  - a rerun including entity: all 8 stages completed, certs failed on a crt.sh timeout → honestly marked `partial`
+  - example.com: 7001 domains / 12542 IPs / 5083 endpoints, `complete: true`
+  - timing reference: subs+dns+probe took ~25~35 minutes at 7000 domains; crawl took ~17 minutes over 287 sites at depth=3
+- **Not verified**: survival on a real host (terminal close/logoff/reboot), macOS, real multi-hour runs. No promise of "automatic resume after exiting the client".

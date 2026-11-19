@@ -75,10 +75,10 @@ def test_failed_stage_not_counted_as_done():
     steps = {s["step"]: s["status"] for s in data["stages"]}
     assert steps == {"dns": "failed", "probe": "done"}
     # the failed stage must appear in next_steps as "needs retry", and must NOT
-    # silence the "未执行阶段" hint
+    # the "stages not run" hint
     joined = " ".join(data["next_steps"])
     assert "dns" in joined
-    assert "失败" in joined
+    assert "failed stages" in joined or "failed" in joined
     store.close()
 
 

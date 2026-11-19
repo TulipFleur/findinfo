@@ -382,19 +382,57 @@ def _kill_children() -> None:
         return
     except Exception:
         pass
-    # stdlib fallback (Windows: taskkill the children only; POSIX: walk /proc)
+    # stdlib fallback (Windows: taskkill /T walks the tree itself; POSIX: /proc)
+    # WMIC used to be the child-lister here, but Windows 11 24H2 ships without
+    # it: the wmic call failed silently and a task_timeout left naabu/katana
+    # children running -- still probing the target after the authorized window
+    # had closed. taskkill /T /PID <me> kills the whole descendant tree and is
+    # present on every Windows install; killing our own pid is avoided by
+    # listing children first only when wmic exists, else we let taskkill /T
+    # terminate the tree and rely on the worker's own os._exit afterwards.
     if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        children = []
+        # Prefer listing children so we do not taskkill ourselves: try wmic
+        # (present on older Windows), then PowerShell CIM (24H2+), then fall
+        # back to taskkill /T which takes the whole tree including us -- the
+        # caller of _kill_children always follows with os._exit, so dying here
+        # is acceptable, just noisier.
+        for probe in (
+            ["wmic", "process", "where", "ParentProcessId=%d" % me,
+             "get", "ProcessId"],
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter "
+             "'ParentProcessId=%d').ProcessId" % me],
+        ):
+            try:
+                # errors=replace: PowerShell's banner on a Chinese Windows is
+                # GBK and would raise UnicodeDecodeError mid-probe, turning a
+                # kill-path fallback into a silent no-op (the exact bug this
+                # function exists to prevent).
+                out = subprocess.run(probe, capture_output=True, text=True,
+                                     errors="replace", timeout=15,
+                                     creationflags=flags)
+                for tok in (out.stdout or "").split():
+                    if tok.isdigit() and int(tok) != me:
+                        children.append(int(tok))
+                if children or out.returncode == 0:
+                    break
+            except Exception:
+                continue
         try:
-            out = subprocess.run(["wmic", "process", "where",
-                                  "ParentProcessId=%d" % me,
-                                  "get", "ProcessId"],
-                                 capture_output=True, text=True, timeout=15,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
-            for tok in out.stdout.split():
-                if tok.isdigit() and int(tok) != me:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", tok],
+            if children:
+                for pid in children:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                                    capture_output=True, timeout=10,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+                                   creationflags=flags)
+            else:
+                # No child list available: take the whole tree. The worker
+                # exits immediately after (os._exit), so this only races by
+                # milliseconds.
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(me)],
+                               capture_output=True, timeout=10,
+                               creationflags=flags)
         except Exception:
             pass
     else:
@@ -684,6 +722,20 @@ def wait_status(ref, states, timeout: float = 30.0, poll: float = 0.05) -> dict:
         time.sleep(min(poll, max(0.0, deadline - time.time())))
 
 
+# Heartbeat-only writes bump seq without changing any fact an agent acts on.
+# wait() used to report changed:true for those every ~30s, so a caller following
+# the docs ("report changed to the user") narrated progress that did not exist.
+# These are the fields update_state() touches on a real transition; anything
+# else (updated/updated_ts/seq alone) is a heartbeat.
+_SUBSTANTIVE_FIELDS = ("state", "stage", "stage_state", "stage_index", "stage_total",
+                       "counts", "endpoints", "result", "coverage", "last_error",
+                       "attempt", "pid", "planned_stages")
+
+
+def _substantive(state: dict) -> tuple:
+    return tuple(state.get(k) for k in _SUBSTANTIVE_FIELDS)
+
+
 def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict:
     """Bounded wait: return early on progress or terminal state.
 
@@ -693,15 +745,22 @@ def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict
     Without an explicit --since cursor the baseline is the state read *now*, so
     the call blocks until something actually changes (or the timeout fires)
     instead of returning immediately on whatever the worker just wrote.
+
+    `changed` means a SUBSTANTIVE field moved (stage, counts, state...), not a
+    heartbeat: the worker's liveness thread bumps seq every ~30s without any
+    fact changing, and that must not read as progress.
     """
     rd = resolve(ref)
     timeout = max(0.0, float(timeout if timeout is not None else 30.0))
     start = time.time()
+    baseline = read_state(rd)
     if since_seq is None:
-        since_seq = read_state(rd).get("seq")
+        since_seq = baseline.get("seq")
+    baseline_sub = _substantive(baseline)
     while True:
         st = derive(read_state(rd))
-        changed = (since_seq is not None and st.get("seq") != since_seq)
+        seq_moved = (since_seq is not None and st.get("seq") != since_seq)
+        changed = seq_moved and _substantive(st) != baseline_sub
         if st.get("terminal") or changed:
             out = {"run_id": st.get("run_id"), "state": st.get("state"),
                    "changed": bool(changed), "timed_out": False,

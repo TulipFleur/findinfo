@@ -63,7 +63,7 @@ def _safe_task_name(task: str) -> str:
 
     Plain [A-Za-z0-9_-]+ names keep their directory verbatim (existing
     installs stay where they are). Anything else -- Chinese, spaces,
-    punctuation -- would collide after sanitizing (both "示例公司" and "百度"
+    punctuation -- would collide after sanitizing (both "Example Corp" and "Acme Inc."
     used to collapse into tasks/default), so a hash of the original name is
     mixed in. Same name always maps to the same token; different names never
     share a token.
@@ -277,11 +277,20 @@ def emit(obj: Any) -> None:
     just checking progress) repeating them on every call is pure token cost.
     FINDINFO_EMIT=minimal drops the bulky echo fields; behaviour of the data
     itself is unchanged.
+
+    stdout is ASCII-escaped by default (ensure_ascii=True): the JSON line is
+    consumed by scripts and agents, and pure ASCII decodes identically under
+    EVERY console code page -- including PowerShell 5.1 on a Chinese Windows
+    default (code page 936), where raw UTF-8 bytes make ConvertFrom-Json fail
+    on the first CJK string. Set FINDINFO_EMIT_UTF8=1 to emit raw UTF-8 (for
+    humans piping to a UTF-8-aware terminal); the JSON value content is the
+    same either way.
     """
     if (os.environ.get("FINDINFO_EMIT") or "").lower() == "minimal" and isinstance(obj, dict):
         drop = ("progress", "coverage", "summary", "params", "paths")
         obj = {k: v for k, v in obj.items() if k not in drop}
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + chr(10))
+    ascii_safe = (os.environ.get("FINDINFO_EMIT_UTF8") or "").lower() not in ("1", "true", "yes")
+    sys.stdout.write(json.dumps(obj, ensure_ascii=ascii_safe) + chr(10))
     sys.stdout.flush()
 
 
@@ -347,7 +356,6 @@ ENV_MAP = {
     "VIRUSTOTAL_KEY": ("apis", "virustotal.key"),
     "URLSCAN_KEY": ("apis", "urlscan.key"),
     "CHAOS_KEY": ("apis", "chaos.key"),
-    "GITHUB_TOKEN": ("apis", "github.token"),
     "ZOOMEYE_KEY": ("apis", "zoomeye.key"),
     "MAPPING_API_INTERVAL_MS": ("limits", "mapping_interval_ms"),
 }
@@ -1005,6 +1013,48 @@ tg tj tn tz ua ug uy uz ve za zm zw
 """.split())
 
 
+def canon_user_domain(value: str) -> str | None:
+    """Validate a domain the USER explicitly typed (CLI --domain, --match...).
+
+    canon_domain() doubles as the de-noising filter for crawl/JS extraction,
+    so it rejects anything without a known public suffix -- which silently
+    threw away legitimate user input: 127.0.0.1:18765, *.test, dev.corp.local,
+    IDN names. This function validates USER INTENT instead: strip scheme/
+    port/wildcard like canon_domain, accept any syntactically valid hostname
+    (including private TLDs like .local/.test and punycode-able IDN), and let
+    the CALLER decide what to do with a rejection (the CLI surfaces it in
+    rejected_inputs instead of dropping it silently).
+
+    Returns the normalized hostname, or None for a rejection the caller must
+    report -- never a silent drop.
+    """
+    if not value:
+        return None
+    v = str(value).strip().lower().rstrip(".")
+    # IDN (e.g. Chinese-label names) -> punycode so downstream tools get ASCII
+    if any(ord(c) > 127 for c in v):
+        try:
+            v = v.encode("idna").decode("ascii")
+        except Exception:
+            return None
+    v = re.sub(r"^[a-z]+://", "", v)
+    v = v.split("/")[0]
+    v = v.split("@")[-1]
+    if ":" in v and not v.count(":") > 2:
+        v = v.split(":")[0]
+    if v.startswith("*."):
+        v = v[2:]
+    if not v or len(v) > 253:
+        return None
+    # A user-supplied hostname: any dot-separated labels that look like a
+    # DNS name (letters/digits/hyphen), a bare IPv4, or a bracketed IPv6
+    # handled above by the port strip. NO public-suffix check here.
+    if not re.match(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", v):
+        if canon_ip(v) is None:
+            return None
+    return v
+
+
 def canon_domain(value: str) -> str | None:
     if not value:
         return None
@@ -1144,6 +1194,30 @@ def canon_scope(entries: Iterable[str]) -> list[str]:
         if d and d not in out:
             out.append(d)
     return out
+
+
+def canon_user_scope(entries: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Scope from USER-TYPED input, with rejections surfaced.
+
+    Returns (accepted, rejected): accepted uses canon_user_domain (validates
+    intent -- private TLDs, IPs, IDN are fine), rejected carries the raw input
+    the caller must report in rejected_inputs. The strict canon_domain filter
+    stays in place for de-noising crawl/JS output; this is the version for
+    flags a human or agent deliberately typed.
+    """
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for e in entries or []:
+        d = canon_user_domain(e)
+        if not d:
+            rejected.append(str(e))
+        elif d not in accepted:
+            accepted.append(d)
+        # an exact duplicate of an already-accepted value is neither a new
+        # acceptance nor a rejection -- reporting it as rejected would be
+        # worse than dropping it silently (a repeated --domain flag is
+        # normal argparse usage, not a user error).
+    return accepted, rejected
 
 
 def in_scope(host: str | None, scope: list[str] | None) -> bool:

@@ -490,9 +490,14 @@ def test_agent_txt_keeps_brute_in_the_active_section():
             section = line.strip("# ").strip()
         if "python findinfo.py" in line and " brute " in line:
             seen = True
-            if "主动" not in section:
+            if "active" not in section.lower():
                 bad.append((lineno, section))
-        if "被动" in line and "brute" in line:
+        # brute must never be DESCRIBED as passive. Listing brute among the
+        # single-stage commands (which happens in rule 2 and the scoping rule)
+        # is fine — the old "被动 in line" check could not tell these apart in
+        # English, so key on an explicit passive-classification instead.
+        low = line.lower()
+        if "brute" in low and re.search(r"brute (is|are|counts as|属于|是)\s*(a )?passive", low):
             bad.append((lineno, "brute described as passive: " + line.strip()[:60]))
     assert seen, AGENT_TXT + " no longer shows the brute command at all"
     assert not bad, (AGENT_TXT + " files brute under a non-active section: "
@@ -503,7 +508,7 @@ def test_agent_txt_places_authorization_before_active_stages():
     """No active stage may be reachable without the authorization gate."""
     root = Path(__file__).resolve().parent.parent
     text = (root / AGENT_TXT).read_text(encoding="utf-8")
-    gate = text.find("授权与范围确认")
+    gate = text.find("Authorisation and scope confirmation")
     assert gate != -1, AGENT_TXT + " lost its authorization gate section"
     for needle in ("run --domain {{TARGET}} --active", "--active --vhost --crawl"):
         pos = text.find(needle)

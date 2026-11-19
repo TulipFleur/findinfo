@@ -1,32 +1,34 @@
-# findinfo 工具使用说明书
+# findinfo Tool Usage Manual
 
-> 面向 AI agent 的命令级参考。每个命令 = 一个 tool：
-> **stdout 恰好一行 JSON**（可直接 `json.loads`），**stderr 是进度/告警**（不要解析）。
-> 退出码：`0` 成功 / `2` 业务错误 / `4` 工具缺失 / `1` 未知异常。
+> Command-level reference for AI agents. Each command = one tool:
+> **stdout is exactly one line of JSON** (directly `json.loads`-able), **stderr is progress/warnings** (do not parse).
+> Exit codes: `0` success / `2` business error / `4` tool missing / `1` unknown exception.
 >
-> **Agent 调用纪律**：标注（ACTIVE）或耗时 >30s 的命令（run/entity/crawl/probe/ports/vhost/brute/subs）
-> **禁止前台执行**——用 `run --background` 后台起 + `wait`/`status` 有界轮询，前台硬等会被工具超时 kill。
-> 多目标用 `--task <名>` 隔离资产图；`--from-store` 配 `--scope <主域>` 限定读取范围。
+> **Agent invocation discipline**: for commands marked (ACTIVE) or taking >30s (run/entity/crawl/probe/ports/vhost/brute/subs)
+> **long orchestration commands (`run`) must not run in the foreground** — use `run --background` to start in the background + `wait`/`status` bounded polling; hard waiting in the foreground will get killed by the tool timeout.
+> Single-stage commands (`probe`/`crawl`/`vhost`/`ports`/`brute`/`subs`/`entity`) may run in the foreground, but set your own cap with `--tool-timeout`.
+> When the host reaps detached processes (`wait` returns `reaped_by_host:true`), all commands can only run in the foreground.
+> For multiple targets use `--task <name>` to isolate the asset graph; `--from-store` with `--scope <main domain>` limits the read range.
 
-通用约定：
+General conventions:
 
-| 项 | 说明 |
+| Item | Description |
 |---|---|
-| 工作目录 | SKILL.md 所在目录（安装位置随客户端不同，脚本按自身路径定位 `bin/`） |
-| 解释器 | 任意 Python 3.10+（如 `D:/yuyan/python/python.exe`） |
-| 数据落库 | 自动写入 `~/.findinfo/findinfo.db`，可用 `FINDINFO_HOME` 覆盖；`doctor` 的 `db` 字段为准 |
-| 幂等 | 同一资产重复发现只更新 `sources`/`last_seen`，不会重复 |
-| 缓存 | API 响应缓存 `~/.findinfo/cache/`；CT 7 天、httpx 24h |
+| Working directory | The directory containing SKILL.md (install location varies by client; scripts locate `bin/` relative to their own path) |
+| Interpreter | any Python 3.10+ |
+| Data persistence | Automatically written to `~/.findinfo/findinfo.db`, overridable via `FINDINFO_HOME`; the `db` field of `doctor` is authoritative |
+| Idempotency | Re-discovering the same asset only updates `sources`/`last_seen`, no duplicates |
+| Cache | CT responses only (`~/.findinfo/cache/certs/`, 7 days); other stages have no cache |
 
 ---
 
-## doctor — 环境自检
+## doctor — environment self-check
 
 ```bash
 python findinfo.py doctor
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -46,65 +48,65 @@ python findinfo.py doctor
 }
 ```
 
-**`source` / `tools_summary`**：`source` 固定为 `bundle`——`core.tool()` 只查 `bin/<platform>/`，
-**不回退 `PATH`、也不回退扁平 `bin/`**（`outside_bin` 因此恒为空，保留字段仅为兼容旧调用方）。
-`all_in_bin: true` 是“全部内置工具都在 skill 目录且都能执行”的机器可读结论（数量见 ）。
+**`source` / `tools_summary`**: `source` is always `bundle` — `core.tool()` only searches `bin/<platform>/`,
+**with no `PATH` fallback and no flat `bin/` fallback** (`outside_bin` is therefore always empty; the field is kept only for old consumers).
+`all_in_bin: true` is the machine-readable verdict "every bundled tool is in the skill directory AND executable" (count: `tools_summary.total`).
 
-**`environment`（宿主前提）**：`python_ok` = 解释器 ≥3.10（代码用 PEP 604 语法，低版本阶段必 SyntaxError）；
-`not_executable` = 在场但本机**执行不了**的二进制（沙箱剥执行位/拦截未知二进制 → 条目给 `executable:false` + 原因 hint）；
-`net_egress.any_reachable` = 三个被动数据源至少一个可达，全 false 表示本机无出网，被动采集出不了数据。
+**`environment` (host prerequisites)**: `python_ok` = interpreter ≥3.10 (the code uses PEP 604 syntax; older versions die with SyntaxError);
+`not_executable` = binaries present but **not executable** here (sandbox strips the exec bit / blocks unknown binaries → the entry gets `executable:false` + a reason hint);
+`net_egress.any_reachable` = at least one of three passive sources reachable; all false means no egress, so passive collection cannot produce data.
 
-**何时调**：每次会话第一条命令。`api_keys` 全 false 说明只能跑无 key 链路。
+**When to call it**: the first command of every session. All-false `api_keys` means only the key-free chain runs.
 
 ---
 
-## entity — 企业 → 实体树/备案号/域名
+## entity — company → entity tree / ICP filings / domains
 
 ```bash
-python findinfo.py entity --name "示例公司" --invest 51 --deep 2
+python findinfo.py entity --name "Example Corp" --invest 51 --deep 2
 ```
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--name` | 必填 | 企业/品牌名 |
-| `--invest` | 51 | 只保留控股比例 ≥ 该值的子公司 |
-| `--deep` | 2 | 股权穿透层数 |
-| `--out` | runs/enscan | 产物目录 |
+| `--name` | required | company / brand name |
+| `--invest` | 51 | keep only subsidiaries held at ≥ this ratio |
+| `--deep` | 2 | equity penetration depth |
+| `--out` | runs/enscan | output directory |
 
-**输出**
+**Output**
 
 ```json
 {
   "rc": 0, "json_files": 3,
-  "companies": ["北京三快在线科技有限公司", "..."],
+  "companies": ["Example Corp Online Technology Co., Ltd.", "..."],
   "icp": ["京ICP备10210538号", "..."],
   "domains": ["example.com", "example.org", "..."],
-  "apps": ["示例公司"]
+  "apps": ["Example Corp"]
 }
 ```
 
-**前置**：`bin/config.yaml` 必须填 `cookies.aiqicha`。失败时 stderr 会提示未配置 Cookie。
-**注意**：`companies` 需人工过一遍再继续（同名公司噪音）。
+**Prerequisite**: `bin/config.yaml` must carry `cookies.aiqicha`. On failure stderr says the Cookie is not configured.
+**Note**: eyeball `companies` before continuing (same-name noise).
 
 ---
 
-## passive — 15 源被动聚合（阶段一B ⓪ 路，onepass）
+## passive — 15-source passive aggregation (route 0 of stage 1B, onepass)
 
 ```bash
 python findinfo.py passive --domain example.com
 python findinfo.py passive --from-store --min-conf 0.7
 python findinfo.py passive --domain example.com --sources crtsh,certspotter,rapiddns
-bin/onepass.exe sources                 # 看 15 个源的 id / 是否需要 key / 当前是否 ready
+bin/windows/onepass.exe sources   # Linux: bin/linux/onepass                 # list the 15 sources: id / key needed / ready
 ```
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--domain` | — | 可重复；省略时用库内 ≥0.7 域名 |
-| `--from-store` | false | 显式从库内取域 |
-| `--sources` | 全部可用源 | 逗号分隔 id，见 `onepass sources` |
-| `--min-conf` | 0.0 | 过滤低于该值的记录 |
+| `--domain` | — | repeatable; omitted = use store domains ≥0.7 |
+| `--from-store` | false | explicitly take domains from the store |
+| `--sources` | all usable sources | comma-separated ids, see `onepass sources` |
+| `--min-conf` | 0.0 | drop records below this confidence |
 
-**输出**
+**Output**
 
 ```json
 {"domains": [{"domain": "example.com", "count": 214,
@@ -115,22 +117,22 @@ bin/onepass.exe sources                 # 看 15 个源的 id / 是否需要 key
  "total": 214}
 ```
 
-**数据源（15）**：crtsh / certspotter / hackertarget / rapiddns / anubis / alienvault /
-threatminer / subdomain.center 共 8 个免 key；urlscan / virustotal / securitytrails /
-chaos / fofa / quake / hunter 需 key（缺 key 自动跳过，不报错，`per_source` 里标 `missing_key`）。
+**Sources (15)**: crtsh / certspotter / hackertarget / rapiddns / anubis / alienvault /
+threatminer / subdomain.center — 8 key-free; urlscan / virustotal / securitytrails /
+chaos / fofa / quake / hunter need keys (a missing key auto-skips without error; `per_source` marks it `missing_key`).
 
-**置信度**：按**独立源数**算（1 源 ≤0.6、2 源 ≥0.7、3 源以上 ≤0.95），随 `sources` 一起落库。
-**价值**：一条命令覆盖 8 个免费源，冷启动比串 `certs` + `subs` 快得多；`per_source` 能直接看出哪个源今天挂了。
+**Confidence**: computed from the **number of independent sources** (1 ≤0.6, 2 ≥0.7, 3+ ≤0.95), stored with `sources`.
+**Value**: one command covers 8 free sources, much faster on cold start than chaining `certs` + `subs`; `per_source` shows immediately which source is down today.
 
 ---
 
-## certs — 证书透明（阶段一B ① 路）
+## certs — certificate transparency (route 1 of stage 1B)
 
 ```bash
 python findinfo.py certs --domain example.com
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -141,25 +143,25 @@ python findinfo.py certs --domain example.com
 }
 ```
 
-**数据源**：crt.sh（主）→ CertSpotter（备）。失败自动降级。
-**价值**：完全被动、零额度、零接触目标，**最该优先跑的一步**。`-dev/-test/-uat` 命名是重点。
+**Sources**: crt.sh (primary) → CertSpotter (backup), with automatic failover.
+**Value**: fully passive, zero quota, zero target contact — **the step to run first**. `-dev/-test/-uat` naming is the gold.
 
 ---
 
-## subs — 多源被动子域（阶段一B ③ 路）
+## subs — multi-source passive subdomains (route 3 of stage 1B)
 
 ```bash
 python findinfo.py subs --domain example.com
-python findinfo.py subs --from-store        # 对库内所有 ≥0.7 域名跑
+python findinfo.py subs --from-store        # runs against every store domain >= 0.7
 ```
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--domain` | — | 可重复 |
-| `--from-store` | false | 用库内域名 |
-| `--engines` | fofa,quake,hunter,shodan,censys | uncover 的引擎列表 |
+| `--domain` | — | repeatable |
+| `--from-store` | false | use store domains |
+| `--engines` | fofa,quake,hunter,shodan,censys | engine list for uncover |
 
-**输出**
+**Output**
 
 ```json
 {
@@ -171,80 +173,80 @@ python findinfo.py subs --from-store        # 对库内所有 ≥0.7 域名跑
 }
 ```
 
-**降级行为**：没有测绘 key 时 `uncover` 会失败 → 只剩 subfinder（+chaos，若有 key），**不会报错中断**。
+**Degradation**: without mapping keys `uncover` fails → only subfinder remains (+chaos if keyed); **it never errors out**.
 
 ---
 
-## brute — DNS 爆破（阶段一B ④ 路，**主动**）
+## brute — DNS brute force (route 4 of stage 1B, **ACTIVE**)
 
-快速补充被动源覆盖不到的子域。基于 ksubdomain 的无状态裸包引擎，比 dnsx 逐条爆破快 1~2 个数量级。
+Quickly fills in subdomains that passive sources miss. A stateless raw-packet engine based on ksubdomain, 1~2 orders of magnitude faster than per-query dnsx brute forcing.
 
     python findinfo.py brute --domain example.com
     python findinfo.py brute --domain example.com --wordlist wordlists/sub.txt --bandwidth 3m
     python findinfo.py brute --domain example.com --wordlist wordlists/submin.txt --bandwidth 5m
     python findinfo.py brute --domain example.com --wildcard advanced
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| --domain | 必填 | 目标域 |
-| --wordlist | wordlists/sub.txt | 字典；可写路径，或裸名字 `sub`/`submin`/`vhost`（自动解析到 wordlists/） |
-| --bandwidth | 3m | 发包容忍带宽；越小越低调，建议 2m~5m |
-| --wildcard | basic | 泛解析过滤基础模式，严格场景用 advanced |
+| --domain | required | target domain |
+| --wordlist | wordlists/sub.txt | dictionary; a path, or a bare name `sub`/`submin`/`vhost` (auto-resolved under wordlists/) |
+| --bandwidth | 3m | send-rate budget; lower is quieter, 2m~5m recommended |
+| --wildcard | basic | wildcard-filter mode; use advanced in strict cases |
 
-输出
+Output
 
     {"domain": "example.com", "count": 1,
      "records": [{"domain": "www.example.com", "a": ["172.66.147.243"]}]}
 
-前置条件（重要）
+Prerequisites (important)
 
-- Windows 需装 Npcap（安装时勾选 WinPcap 兼容模式），Linux 需 libpcap
-- 通常需要管理员/root 权限（裸包发送）
-- 内置速率上限 25000 pps，实际按 --bandwidth 控制
+- Windows needs Npcap (check the WinPcap-compatible option during install); Linux needs libpcap
+- Usually requires administrator/root (raw-packet sending)
+- Built-in rate cap of 25000 pps; effectively governed by --bandwidth
 
-**内置字典（两级）**
+**Bundled dictionaries (two tiers)**
 
-| 文件 | 条数 | 定位 | 典型耗时（单域，3m 带宽） |
+| File | Entries | Positioning | Typical time (one domain, 3m) |
 |---|---|---|---|
-| `wordlists/sub.txt` | 174 | **高价值前缀**：内部系统 / 中间件 / 国内常见（k8s、kibana、nacos、consul、harbor、sso、skywalking…），这些词不在通用 top-10k 里 | 10~30s |
-| `wordlists/submin.txt` | 9990 | **top-10k 全量**（mitan 字典归一化：小写、去重、剔除非法标签） | 2~5min |
-| `wordlists/vhost.txt` | 145 | 不是子域字典，是 vhost 用的 Host 标签（需配合 `--domain` 拼基域） | — |
+| `wordlists/sub.txt` | 174 | **high-value prefixes**: internal systems / middleware / CN-common (k8s, kibana, nacos, consul, harbor, sso, skywalking...) — words that are NOT in the generic top-10k | 10~30s |
+| `wordlists/submin.txt` | 9990 | **full top-10k** (mitan dictionary normalized: lowercased, deduplicated, invalid labels dropped) | 2~5min |
+| `wordlists/vhost.txt` | 145 | not a subdomain list — Host labels for vhost (needs `--domain` to append the base) | — |
 
-建议顺序：先 `brute --wordlist wordlists/sub.txt`（快，捞内部系统），确认 `--bandwidth` 与泛解析表现正常后，
-再上 `submin.txt` 跑全量。两级字典有 157 条重叠，重复跑由 `Store` 幂等吸收，不会产生重复资产。
+Recommended order: run `brute --wordlist wordlists/sub.txt` first (fast, catches internal systems); once `--bandwidth` and wildcard behaviour look sane,
+go full with `submin.txt`. The two tiers overlap on 157 entries; re-runs are absorbed idempotently by `Store`, producing no duplicate assets.
 
-与 subs 的分工：subs 找"已存在且被收录"的子域；brute 找"存在但没人收录"的子域。两者互补，先跑 subs 再跑 brute。
+Division of labour with subs: subs finds subdomains that exist AND are indexed; brute finds ones that exist but nobody indexed. Complementary — run subs first, then brute.
 
 ---
 
-## icp — 备案号反查（阶段一B ② 路）
+## icp — ICP filing reverse lookup (route 2 of stage 1B)
 
 ```bash
 python findinfo.py icp --code "京ICP备10210538号"
-python findinfo.py icp --from-store           # 用 ENScan 存下的备案号
+python findinfo.py icp --from-store           # reuses the ICP numbers ENScan stored
 ```
 
-**输出**
+**Output**
 
 ```json
 {"codes": ["京ICP备10210538号"], "rows": 156, "domains": ["..."], "ips": ["..."]}
 ```
 
-**依赖**：至少一个测绘 key。查询语法：`icp="京ICP备10210538号"`。
-**注意**：备案号常带 `-1` `-2` 后缀，主体号一起查更全。
-**落库**：备案号本身写成 `assets(kind=icp, canonical="京ICP备…")`（来源 `enscan`/`icp-seed`），
-所以 `icp --from-store` 能复用 ENScan 存下的号码；反查出的域名/IP 分别落 `kind=domain`/`kind=ip`，置信度 0.9/0.5。
+**Dependency**: at least one mapping-platform key. Query syntax: `icp="京ICP备10210538号"`.
+**Note**: filing numbers often carry `-1`/`-2` suffixes — query the principal number for full coverage.
+**Storage**: the filing number itself is stored as `assets(kind=icp, canonical="京ICP备…")` (sources `enscan`/`icp-seed`),
+which is why `icp --from-store` can reuse numbers ENScan saved; domains/IPs from the reverse lookup land as `kind=domain`/`kind=ip` with confidence 0.9/0.5.
 
 ---
 
-## dns — 解析 + 泛解析过滤（阶段一C）
+## dns — resolution + wildcard filtering (stage 1C)
 
 ```bash
 python findinfo.py dns --from-store
 python findinfo.py dns --domain example.com --min-conf 0.4
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -255,19 +257,19 @@ python findinfo.py dns --domain example.com --min-conf 0.4
 }
 ```
 
-- `wildcard` 非空 = 该域有泛解析，命中的 IP 已被自动剔除（否则资产会膨胀百倍）
-- `system_fallback` = 公共 DNS 不可用时用系统 DNS 补解析的条数（国内网络常见）
+- non-empty `wildcard` = the domain has wildcard resolution; matching IPs were auto-removed (otherwise assets inflate a hundredfold)
+- `system_fallback` = rows resolved via system DNS when public DNS failed (common on CN networks)
 
 ---
 
-## probe — 存活/指纹/IP 映射（阶段二，**主动**）
+## probe — liveness / fingerprint / IP mapping (stage 2, **ACTIVE**)
 
 ```bash
 python findinfo.py probe --from-store
 python findinfo.py probe --host a.example.com --host b.example.com
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -281,18 +283,18 @@ python findinfo.py probe --host a.example.com --host b.example.com
 }
 ```
 
-**核心价值**：`ip` 字段建立 `域名↔IP` 映射（`ipagg`/`vhost` 的输入）。
-同时把 `status/title/tech` 写回 `assets.attrs`，并把首页写成 `endpoints` 记录。
+**Core value**: the `ip` field builds the `domain↔IP` mapping (input for `ipagg`/`vhost`).
+It also writes `status/title/tech` back into `assets.attrs` and records the landing page as an `endpoints` row.
 
 ---
 
-## ipagg — IP 聚合与 CDN 剔除
+## ipagg — IP aggregation and CDN removal
 
 ```bash
 python findinfo.py ipagg
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -305,49 +307,49 @@ python findinfo.py ipagg
 }
 ```
 
-**判据**：同一 IP 上挂了 **≥2 个自有域名** → 强 vhost 信号。CDN IP 被剔除（对其碰撞只会打到别人的站）。
-**输出即 `vhost` 的输入**。
+**Criterion**: an IP carrying **≥2 of your own domains** is a strong vhost signal. CDN IPs are removed (colliding on them only hits someone else's site).
+**The output is `vhost`'s input.**
 
 ---
 
-## ports — 端口扫描（**主动**）
+## ports — port scanning (**ACTIVE**)
 
 ```bash
 python findinfo.py ports --ip 1.2.3.4 --top-ports 1000
 ```
 
-**输出**
+**Output**
 
 ```json
 {"targets": ["1.2.3.4"], "count": 4,
  "rows": [{"ip": "1.2.3.4", "port": 80}, {"ip": "1.2.3.4", "port": 443}]}
 ```
 
-每个开放端口写入 `assets(kind=endpoint, canonical="1.2.3.4:8080")`。
+Every open port is stored as `assets(kind=endpoint, canonical="1.2.3.4:8080")`.
 
 ---
 
-## vhost — Host 头碰撞（阶段二核心，**主动**）
+## vhost — Host-header collision (core of stage 2, **ACTIVE**)
 
 ```bash
 python findinfo.py vhost --ip 1.2.3.4 --from-store
 python findinfo.py vhost --ip 1.2.3.4 --wordlist wordlists/vhost.txt --domain example.com        --ports 80,443,8080,8443
 ```
 
-| 参数 | 默认 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `--ip` | 必填 | 目标 IP |
-| `--host` / `--from-store` | — | 候选 Host（库内域名） |
-| `--wordlist` | — | 字典；裸标签按 `--domain` 展开 |
-| `--domain` | 库内父域/基域 | 裸标签的基域，可重复 |
-| `--ports` | 80,443 | 逗号分隔 |
-| `--threads` | 20 | 并发 |
+| `--ip` | required | target IP |
+| `--host` / `--from-store` | — | candidate Hosts (store domains) |
+| `--wordlist` | — | dictionary; bare labels expand via `--domain` |
+| `--domain` | store parent/base domain | base domain for bare labels, repeatable |
+| `--ports` | 80,443 | comma-separated |
+| `--threads` | 20 | concurrency |
 
-**字典语义**：`wordlists/vhost.txt` 里是**裸标签**（`dev`/`uat`/`jenkins`），单独一个标签不是合法 hostname。
-`--domain example.com` 会把每条展开成 `dev.example.com`、`uat.example.com`…；不传 `--domain` 时
-自动用库内域名的父域。含点的条目（`admin.example.com`）原样使用，不会被二次拼接。
+**Wordlist semantics**: `wordlists/vhost.txt` holds **bare labels** (`dev`/`uat`/`jenkins`); a lone label is not a valid hostname.
+`--domain example.com` expands each into `dev.example.com`, `uat.example.com`...; without `--domain`
+the store domains' parents are used. Entries containing dots (`admin.example.com`) are used verbatim, never double-appended.
 
-**输出**
+**Output**
 
 ```json
 {
@@ -360,48 +362,48 @@ python findinfo.py vhost --ip 1.2.3.4 --wordlist wordlists/vhost.txt --domain ex
 }
 ```
 
-**原理**：调用内置 `hostCollision`（alwaystest18/hostCollision，3 次请求差分）：
-无 Host 基线 → 随机标签 Host 基线 → 真实候选；两个隐性基线一致才认为基线稳定，
-再比对候选差异。正文 >2000 字符用编辑距离相似度（<85% 判不同），并剔除页面回显 hostname 的噪声。
-**候选剔除**：probe 已确认存活（2xx~4xx）的域名自动跳过（结果里 `skipped_live` 计数）。
-**HTTPS 会同步修改 SNI**（只改 Host 头不够，TLS 握手就落到默认证书）。
-**环境要求**：需要能直连目标 IP；走 HTTP 代理/TUN 的网络下会失败，此时自动降级 curl `--resolve`。
-**这是最容易挖到内部系统的位置**：Jenkins/GitLab/Nexus/Swagger/各类后台。
+**How it works**: drives the bundled `hostCollision` (alwaystest18/hostCollision, 3-request differential):
+no-Host baseline → random-label Host baseline → the real candidate; the two hidden baselines must agree before
+the candidate's difference is judged. Bodies over 2000 chars are compared by edit-distance similarity (<85% counts as different), and hostname-echo noise is dropped.
+**Candidate removal**: domains already confirmed live by probe (2xx~4xx) are skipped automatically (counted as `skipped_live`).
+**HTTPS also rewrites SNI** (changing only the Host header is not enough — the TLS handshake would land on the default certificate).
+**Environment**: requires direct connectivity to the target IP; behind an HTTP proxy/TUN it fails and automatically falls back to curl `--resolve`.
+**This is where internal systems surface most easily**: Jenkins/GitLab/Nexus/Swagger and every kind of admin console.
 
 ---
 
-## crawl — 爬取（阶段三，**主动**）
+## crawl — crawling (stage 3, **ACTIVE**)
 
 ```bash
 python findinfo.py crawl --from-store --depth 3
 python findinfo.py crawl --url https://app.example.com
 ```
 
-**输出**
+**Output**
 
 ```json
 {"count": 318, "rows": [{"url": "https://app.example.com/api/v1/user", "host": "app.example.com", "path": "/api/v1/user", "params": ["id"]}]}
 ```
 
-每个 URL → `endpoints(method, path_template, params)`，路径中的数字/UUID 归一化成 `{n}`/`{uuid}`。
+Each URL becomes `endpoints(method, path_template, params)`; digits/UUIDs in paths normalize to `{n}`/`{uuid}`.
 
 ---
 
-## extract — 页面/JS 泄露提取（阶段三）
+## extract — page/JS leak extraction (stage 3)
 
 ```bash
 python findinfo.py extract --url https://app.example.com/static/app.js
 python findinfo.py extract --from-run runs/xxx/crawl.jsonl
-python findinfo.py extract --from-store        # 回流：直接用库里的 URL 资产（推荐）
+python findinfo.py extract --from-store        # reflow: use the store URL assets directly (recommended)
 ```
 
-**三种来源**：`--url` 指定单个 JS/页面；`--from-run` 读 crawl 的 JSONL 产物；
-`--from-store` 直接用库里 `kind=url` 的资产（回流循环里用它，不必关心 runs 目录路径）。
-每次最多抓 40 个 JS/JSON/map 文件，扫描文本有 4 MB 预算（防内存爆）。
+**Three inputs**: `--url` names one JS/page; `--from-run` reads a crawl JSONL artifact;
+`--from-store` uses the store's `kind=url` assets directly (use this in the reflow loop — no need to know run-dir paths).
+At most 40 JS/JSON/map files fetched per call, with a 4 MB text budget (memory safety).
 
-**引擎**：纯 Python 正则（`lib/jsleak.py`）提取 API 路径、域名、IP、密钥和 sourcemap，零依赖、任何平台可跑。
+**Engine**: pure-Python regexes (`lib/jsleak.py`) extracting API paths, domains, IPs, secrets and sourcemaps — zero dependencies, runs anywhere.
 
-**输出**
+**Output**
 
 ```json
 {
@@ -413,20 +415,20 @@ python findinfo.py extract --from-store        # 回流：直接用库里的 URL
 }
 ```
 
-提取内容：域名、IPv4、API 路径、sourcemap 引用、常见密钥模式（AWS/Aliyun/Tencent/GitHub/JWT/私钥/内网 IP）。
-**输出必须回流**：新域名 → 重跑 `certs`/`subs`/`dns`；新 IP → 重跑 `ipagg`/`vhost`。
+Extracts: domains, IPv4s, API paths, sourcemap references, common secret patterns (AWS/Aliyun/Tencent/GitHub/JWT/private keys/internal IPs).
+**Output must reflow**: new domains → re-run `certs`/`subs`/`dns`; new IPs → re-run `ipagg`/`vhost`.
 
 ---
 
-## assets — 查询/导出资产图
+## assets — query / export the asset graph
 
 ```bash
 python findinfo.py assets --kind domain --limit 50
-python findinfo.py assets --kind icp                  # 看 ENScan 存下的备案号
+python findinfo.py assets --kind icp                  # see the ICP numbers ENScan stored
 python findinfo.py assets --min-conf 0.7 --export runs/assets.jsonl
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -436,18 +438,18 @@ python findinfo.py assets --min-conf 0.7 --export runs/assets.jsonl
 }
 ```
 
-`--export` 写 JSONL，适合直接喂给漏洞扫描器。
+`--export` writes JSONL, ready to feed vulnerability scanners.
 
 ---
 
-## status — 长任务进度（轮询用）
+## status — long-job progress (for polling)
 
 ```bash
-python findinfo.py status                       # 最近一次 run
+python findinfo.py status                       # the most recent run
 python findinfo.py status --run runs/20261117-131500-example.com
 ```
 
-**输出**
+**Output**
 
 ```json
 {
@@ -460,34 +462,34 @@ python findinfo.py status --run runs/20261117-131500-example.com
 }
 ```
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `state` | 整个 run 的状态：`running` / `done` / `failed` |
-| `stage` + `stage_state` | 当前阶段；阶段态可为 `running`/`done`/`skipped`/`failed` |
-| `alive` | `state=running` 且心跳 < 300s → 进程还活着；长任务卡死时它会变 false |
-| `heartbeat_age_sec` | 距上次心跳秒数（每完成一个阶段/开始一个阶段都会刷新）|
-| `counts` / `endpoints` | 库内资产数，可直接判断有没有新增 |
-| `summary` | 完成后与 run 的 stdout 相同 |
+| `state` | the whole run's state: `running` / `queued` / `completed` / `failed` / `cancelled` (no `done` terminal state) |
+| `stage` + `stage_state` | current stage; stage states are `running`/`done`/`skipped`/`failed` |
+| `alive` | `state=running` AND heartbeat < 90s (pid also alive) → the process is alive; goes false when a long job hangs |
+| `heartbeat_age_sec` | seconds since the last heartbeat (refreshed at every stage start/finish) |
+| `counts` / `endpoints` | store asset counts — a direct read on whether anything was added |
+| `summary` | after completion, identical to the run's stdout |
 
-**给 agent 的用法**：`run --background` 拿 run_id，然后 `wait --run <id> --timeout 30` 循环（超时只是本次窗口结束），
-直到 `state=completed`（终态只有 `completed`/`failed`/`cancelled`，**没有 `done`**）再取 `summary`；`state=failed` 时看 `last_error`。
+**Agent usage**: `run --background` returns a run_id, then loop `wait --run <id> --timeout 30` (a timeout only ends that window)
+until `state=completed` (terminal states are only `completed`/`failed`/`cancelled`, **there is no `done`**) and take `summary`; on `state=failed` read `last_error`.
 
 ---
-## wait — 有界等待（长任务的标准等待方式）
+## wait — bounded wait (the standard way to wait on long jobs)
 
 ```bash
 python findinfo.py wait --run <run_id> --timeout 30
-python findinfo.py wait --run <run_id> --timeout 30 --since 12   # 只看 seq 变化
+python findinfo.py wait --run <run_id> --timeout 30 --since 12   # only react to seq changes
 ```
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| `--run` | 必填，后台启动返回的 run_id（也接受 run 目录或前缀） |
-| `--timeout` | 单次等待上限秒数，默认 30；到点返回，不代表失败 |
-| `--since` | 与某个 `seq` 比较；不给则以"进入 wait 时的状态"为基线 |
-| `--full` | 返回完整载荷（含 coverage/run_dir）；默认精简，减少轮询时的 token 与延迟 |
+| `--run` | required; the run_id from the background launch (also accepts a run dir or prefix) |
+| `--timeout` | per-call wait ceiling in seconds, default 30; returning on time is not failure |
+| `--since` | compare against a given `seq`; without it the baseline is the state at wait entry |
+| `--full` | return the full payload (incl. coverage/run_dir); default is trimmed to cut polling tokens and latency |
 
-**返回**（一行 JSON，默认精简版 ~340 字节）
+**Return** (one JSON line, trimmed default ~340 bytes)
 
 ```json
 {"run_id":"20261118-010612-example.com","state":"running","changed":true,"timed_out":false,
@@ -496,70 +498,70 @@ python findinfo.py wait --run <run_id> --timeout 30 --since 12   # 只看 seq �
  "counts":{"domain":128,"ip":64},"endpoints":37}
 ```
 
-`--full` 额外给出 `progress.elapsed_sec`、`coverage`、`run_dir`、`note`。
+`--full` additionally returns `progress.elapsed_sec`, `coverage`, `run_dir`, `note`.
 
-**`reaped_by_host`**（interrupted 时才有意义）：`true` = worker 没执行到任何 Python 就被宿主回收
-（stderr.log 空），该环境下后台模式不可用，改前台 `--task-timeout` 或由存活父进程托管；
-`false` = 普通崩溃，`run --resume` 断点续跑即可。
+**`reaped_by_host`** (only meaningful when interrupted): `true` = the worker was reaped by the host before
+running any Python (empty stderr.log) — background mode is unusable in that environment; switch to foreground `--task-timeout` or a live-parent-held worker;
+`false` = an ordinary crash; `run --resume` continues from checkpoints.
 
-- `timed_out: true` → **只是本次等待窗口结束**，继续等同一个 run_id。
-- `changed: true` / `terminal: true` → 提前返回（有进展或已结束）。
-- `percent` 为 `null` = 该阶段总量未知（如爆破/爬取），不要换算成百分比。
-- 退出码恒为 `0`（等待超时不是错误）；run_id 不存在时 `2`。
-- 实现：50ms 轮询 `seq`，**有变化立即返回**，不做固定 sleep，所以频繁短 wait 不会拖慢流程。
+- `timed_out: true` → **only this wait window ended**; keep waiting on the same run_id.
+- `changed: true` / `terminal: true` → returned early (progress or terminal).
+- `percent` being `null` = the stage's total is unknown (brute/crawl); never convert it to a percentage.
+- Exit code is always `0` (a wait timeout is not an error); `2` when the run_id does not exist.
+- Implementation: polls `seq` every 50ms and **returns the instant it moves** — no fixed sleeps, so frequent short waits never slow the flow.
 
 ---
 
-## cancel — 取消在跑的任务
+## cancel — cancel a running job
 
 ```bash
 python findinfo.py cancel --run <run_id>
 python findinfo.py cancel --run <run_id> --reason "user asked"
 ```
 
-写 `cancel` 标记后杀进程树（Windows `taskkill /T`、POSIX 进程组），状态置 `cancelled`，
-已采到的资产留在库里。
+Writes a `cancel` marker then kills the process tree (Windows `taskkill /T`, POSIX process group), sets state to `cancelled`;
+assets already collected stay in the store.
 
 ---
 
-## runs — 列出最近的运行（会话恢复入口）
+## runs — list recent runs (the session-recovery entry)
 
 ```bash
-python findinfo.py runs --limit 10          # 全部最近运行
-python findinfo.py runs --active            # 只看在跑的（启动前先查，避免重复采集）
-python findinfo.py runs --state failed      # 只看失败的
+python findinfo.py runs --limit 10          # all recent runs
+python findinfo.py runs --active            # only running jobs (check before launching to avoid duplicates)
+python findinfo.py runs --state failed      # only failed ones
 ```
 
-返回 `{"runs":[{"run_id","state","stage","alive","target","created","updated","exit_code","run_dir"}],"active":[...]}`。
-**新会话恢复靠它**：找到 run_id 后 `status --run <id>` 取回目标/范围/参数/阶段/产物/下一步。
+Returns `{"runs":[{"run_id","state","stage","alive","target","created","updated","exit_code","run_dir"}],"active":[...]}`.
+**New-session recovery starts here**: once you have the run_id, `status --run <id>` restores target/scope/params/stages/artifacts/next steps.
 
 ---
 
-## run — 全流程
+## run — the full pipeline
 
 ```bash
-python findinfo.py run --name "企业名"                          # 纯被动
-python findinfo.py run --name "企业名" --active                  # + 存活探测
-python findinfo.py run --name "企业名" --active --vhost --crawl  # + 内部服务 + 泄露回流
+python findinfo.py run --name "Example Corp"                          # passive only
+python findinfo.py run --name "Example Corp" --active                  # + liveness
+python findinfo.py run --name "Example Corp" --active --vhost --crawl  # + internal services + leak reflow
 python findinfo.py run --domain example.com --active --ports
 ```
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| `--name` | 企业名（走 ENScan） |
-| `--domain` | 直接给种子域（可重复，跳过 ENScan） |
-| `--active` | 启用产生流量的阶段 |
-| `--ports` / `--vhost` / `--crawl` / `--brute` | 追加阶段（隐含 `--active`；`--brute` 需 Npcap） |
-| `--max-seed` | 最多对几个种子域做证书/子域扩线（默认 5） |
-| `--top-ports` | 端口扫描范围（默认 1000） |
-| `--max-vhost-ips` | 最多碰撞几个候选 IP（默认 10） |
+| `--name` | company name (goes through ENScan) |
+| `--domain` | seed domains directly (repeatable; skips ENScan) |
+| `--active` | enable the traffic-generating stages |
+| `--ports` / `--vhost` / `--crawl` / `--brute` | append stages (imply `--active`; `--brute` needs Npcap) |
+| `--max-seed` | cap on seed domains for certs/subs expansion (default 5) |
+| `--top-ports` | port-scan range (default 1000) |
+| `--max-vhost-ips` | cap on candidate IPs to collide (default 10) |
 
-**输出（汇总）**
+**Output (summary)**
 
 ```json
 {
   "engagement": "demo", "active": false,
-  "run_dir": "...\\runs\\20261117-131500-示例公司",
+  "run_dir": "...\\runs\\20261117-131500-example-corp",
   "seed_domains": ["example.com"],
   "stages": [
     {"stage": "entity", "companies": 12, "icp": 3, "domains": 8},
@@ -574,7 +576,7 @@ python findinfo.py run --domain example.com --active --ports
 ```
 
 
-**后台模式（长任务的推荐用法）**
+**Background mode (recommended for long jobs)**
 
 ```bash
 python findinfo.py --task example-com run --domain example.com --active --vhost --crawl \
@@ -591,15 +593,15 @@ python findinfo.py --task example-com run --domain example.com --active --vhost 
  "next":"python findinfo.py wait --run 20261118-003129-example.com --timeout 30"}
 ```
 
-- 独立 Python 工作进程（POSIX `setsid` / Windows `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`），
-  **不依赖发起它的那次终端调用**；每次运行的 `status.json`/`summary.jsonl`/`stdout.log`/`stderr.log` 独立。
-- 同一目标（同 task + 同参数）已在跑时返回 `reused: true` + 原 `run_id`，不会重复采集。
-- `--resume <run_id>` 续跑已有运行（复用断点）；工作进程已死（`interrupted` 且 `reaped_by_host:false`）时用它。
-  **`reaped_by_host:true` 时不要 resume**——resume 仍会 spawn 一个脱离进程，在会回收它的宿主上同样死掉，改前台执行。
-- 边界：进程存活 ≠ 会话存活。已结束的 Agent 会话不会被自动唤醒，需重新进入会话用 `runs`/`status` 接续；
-  机器重启后能否自动续跑取决于宿主是否注册为系统服务，本 skill 不作保证。
+- A standalone Python worker process (POSIX `setsid` / Windows `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`)
+  that **does not depend on the tool call that launched it**; each run gets its own `status.json`/`summary.jsonl`/`stdout.log`/`stderr.log`.
+- Re-submitting the same target (same task + params) while it runs returns `reused: true` + the original `run_id` — no duplicate collection.
+- `--resume <run_id>` continues an existing run (reuses checkpoints); use it when the worker died (`interrupted` with `reaped_by_host:false`).
+  **Never resume when `reaped_by_host:true`** — resume spawns another detached process that dies the same way on a reaping host; run in the foreground instead.
+- Boundary: process survival ≠ session survival. A finished agent session is never woken automatically; re-enter the session and continue via `runs`/`status`;
+  whether a run survives a reboot depends on the host registering it as a service — not guaranteed by this skill.
 
-**结果与覆盖（`result` / `coverage`）**
+**Result and coverage (`result` / `coverage`)**
 
 ```json
 "result": {"status":"complete|partial|failed","reason":"all_stages_done|stage_failed|
@@ -615,97 +617,97 @@ python findinfo.py --task example-com run --domain example.com --active --vhost 
 ```
 
 
-**来源层的失败与缺口（不是"没资产"）**
+**Source-level failures and gaps (never "no assets")**
 
-| 情况 | 返回/字段 | 说明 |
+| Situation | Return/field | Notes |
 |---|---|---|
-| 暂时失败（超时/限流/5xx） | 自动重试 `limits.source_retries` 次（默认 2，退避 1.5s→3s）；仍失败则阶段 `ok: false` | 该阶段记 failed、不写 done checkpoint；其它来源成果保留 |
-| 缺 Key | `coverage.unavailable.engines_without_key`、`doctor.api_keys` | 标 `unavailable`，不伪装成"未发现资产" |
-| 额度耗尽 | `doctor.fofa_gateway.remaining` 归零 | 标 `quota_exhausted`，写进交付缺口 |
-| 泛解析污染 | `dns` 的 `wildcard: [{parent, ip}]` | 命中的名字已过滤、不入库；把该列表写进"数据质量" |
-| 空结果 | 阶段 `found: 0` 且 `ok: true` | 有效结果，不是失败 |
-| 展示截断 | `truncated: true` | 仅展示；下游阶段与 report 均取库里全量 |
+| Transient failure (timeout/rate-limit/5xx) | auto-retried `limits.source_retries` times (default 2, backoff 1.5s→3s); still failing → stage `ok: false` | the stage is marked failed and writes no done checkpoint; other sources' results are kept |
+| Missing key | `coverage.unavailable.engines_without_key`, `doctor.api_keys` | marked `unavailable`, never disguised as "nothing found" |
+| Quota exhausted | `doctor.fofa_gateway.remaining` at zero | marked `quota_exhausted`, written into delivery gaps |
+| Wildcard pollution | `dns`'s `wildcard: [{parent, ip}]` | matching names filtered, not stored; report the list under "data quality" |
+| Empty result | stage `found: 0` with `ok: true` | a valid result, not a failure |
+| Display truncation | `truncated: true` | display only; downstream stages and report both use the full store |
 
-重试预算可调：`config/config.json` → `limits.source_retries`（默认 2，即最多 3 次尝试）。
+The retry budget is tunable: `config/config.json` → `limits.source_retries` (default 2, i.e. at most 3 attempts).
 
-**退出码**：`0` 覆盖充分完成 ｜ `5` 跑完但覆盖不完整（有阶段失败/预算耗尽/必需能力缺失） ｜
-`1` 全部阶段失败 ｜ `4` 工具缺失 ｜ `2` 参数/业务错误 ｜ `130` 被取消。
+**Exit codes**: `0` completed with sufficient coverage | `5` finished but coverage incomplete (failed stages / exhausted budget / missing required capability) |
+`1` every stage failed | `4` tool missing | `2` argument/business error | `130` cancelled.
 
-**回流轮次**：`--rounds N` 让 `dns→验证→提取` 循环到"没有新的范围内资产"或跑满 N 轮；
-`--time-budget` 秒到达后不再开新一轮；停止原因写进 `coverage.stop_reason`。
+**Reflow rounds**: `--rounds N` loops `dns→verify→extract` until "no new in-scope assets" or N rounds are used;
+once `--time-budget` seconds pass no new round starts; the stop reason lands in `coverage.stop_reason`.
 
-**长任务**：`run` 典型耗时 5~40 分钟。前台运行会阻塞；标准做法是 `--background` + `wait`。
-**断点**：每阶段完成后写 `steps` 表（engagement+stage+输入哈希），相同输入再跑会自动跳过（下游输入从限定范围的库查询重建），`--force-stage` 强制重跑。
-**追加阶段**：先跑被动，再 `--active` / `--crawl` 只补对应主动阶段（已完成的按 checkpoint 跳过）。
-**失败语义**：工具失败（rc≠0/超时）的阶段记 `steps.status=failed`、summary 带 `failed:true`，**重跑自动重试**；部分产出已入库、下游照常用。退出码 5 表示存在失败阶段。
-**范围**：`run` 的主动阶段只触达 `--domain`/企业锚点种子；ICP 反查、JS 泄露等发现的范围外域名只入库报告，不自动进入主动阶段。
-**明细上限**：所有阶段默认只回 500 条明细并置 `truncated: true`——这是**展示**上限；全量数据在库里，下游阶段（probe/crawl/extract）也从库取全量，与该上限无关（`assets --export` 导出）；
-上限可用 `FINDINFO_ROW_LIMIT` 或 `config/config.json` 的 `limits.row_limit` 调整。人为预算（`--max-seed` 只扫前 N 个种子等）造成的覆盖缺口会记入 summary 的 `coverage_limits`。
-
----
-
+**Long jobs**: a typical `run` takes 5~40 minutes. Foreground execution blocks; the standard pattern is `--background` + `wait`.
+**Checkpoints**: each finished stage writes a `steps` row (engagement+stage+input hash); the same input auto-skips on re-run (downstream inputs are rebuilt from scoped store queries); `--force-stage` forces a redo.
+**Appending stages**: run passive first, then `--active` / `--crawl` only adds those active stages (completed ones skip via checkpoints).
+**Failure semantics**: a stage whose tool failed (rc≠0/timeout) records `steps.status=failed` and a summary with `failed:true`; **a re-run retries it automatically**. Partial output is already stored and usable downstream. Exit code 5 means failed stages exist.
+**Scope**: `run`'s active stages only touch `--domain`/entity-anchor seeds; out-of-scope domains found via ICP reverse lookup or JS leaks are stored and reported, never auto-promoted into active stages.
+**Detail cap**: every stage returns at most 500 detail rows with `truncated: true` — a **display** cap; the full data is in the store and downstream stages (probe/crawl/extract) also read the full set (export via `assets --export`);
+raise the cap with `FINDINFO_ROW_LIMIT` or `limits.row_limit` in `config/config.json`. Coverage gaps caused by deliberate budgets (e.g. `--max-seed` scanning only the first N seeds) are recorded in the summary's `coverage_limits`.
 
 ---
 
-## clean — 清理共享资产图
 
-资产图在**不带 `--task` 时全局共享**，跑过多个目标后 `--from-store`
-会把别的目标的资产一起读回来。清理/隔离命令：
+---
+
+## clean — trim the shared asset graph
+
+The asset graph is **globally shared without `--task`**; after several targets, `--from-store`
+reads the previous targets' assets back in. Trim/isolate:
 
 ```bash
-python findinfo.py clean --keep example.com --keep example.org --vacuum   # 只留本目标
-python findinfo.py clean --match example.com                       # 只删某目标
-python findinfo.py clean --all --vacuum                            # 全清
+python findinfo.py clean --keep example.com --keep example.org --vacuum   # keep only this target
+python findinfo.py clean --match example.com                       # delete only one target
+python findinfo.py clean --all --vacuum                            # wipe everything
 ```
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| `--keep X` | 保留 X 及其子域，其余全删（可重复） |
-| `--match X` | 反向：只删 X 及其子域 |
-| `--kind` | 限定资产类型（默认全部）。**端点表按主机名键控**：只有 kinds 含 `domain`/`endpoint`（或不传）时才连带删除对应主机名端点；`--kind ip` 只删 IP 资产行，别的资产的端点不动 |
-| `--all` | 删除所有资产与端点 |
-| `--vacuum` | 回收磁盘（163MB → 5MB 实测） |
+| `--keep X` | keep X and its subdomains, delete the rest (repeatable) |
+| `--match X` | inverse: delete only X and its subdomains |
+| `--kind` | limit to asset kinds (default all). **The endpoint table is hostname-keyed**: host-keyed endpoints are only deleted when kinds include `domain`/`endpoint` (or are omitted); `--kind ip` deletes only IP asset rows, leaving other assets' endpoints alone |
+| `--all` | delete every asset and endpoint |
+| `--vacuum` | reclaim disk (measured 163MB → 5MB) |
 
-**防止污染**：`passive/subs/dns/probe/vhost/extract --from-store` 都支持 `--scope X`
-（vhost 用 `--domain`），只读该域下的资产。**开新任务时务必带上**，否则会继承上一个目标的资产。
+**Preventing pollution**: `passive/subs/dns/probe/vhost/extract --from-store` all accept `--scope X`
+(vhost uses `--domain`) to read only that domain's assets. **Always pass it on a new task**, or you inherit the previous target's assets.
 
-## report — 人的交付物（md / html）
+## report — human deliverables (md / html)
 
-把资产图整理成给人看的最终产物。**不改库、不发包**，纯读 SQLite。
-Agent 读数用 `brief` 命令（stdout 一行 JSON，不落文件）；脚本要全量数据用 `assets --export`。
+Shapes the asset graph into human-facing deliverables. **No store writes, no packets** — a pure SQLite read.
+Agents read data via the `brief` command (one JSON line on stdout, no files); scripts wanting everything use `assets --export`.
 
-**范围判定按资产类型**：域名按后缀；URL 先解析出主机名再判；IP 按其归属域名（assets.parent）判——共享 IP 只表示"该范围内有域名解析到它"，不是独占归属。**显式传入非法 `--match`（没有一个是合法域名）会直接报错退出**，不会静默退化成整库报告。未传 `--match` 时回落到最近一次 run 的目标并给出告警。
+**Scope is judged per asset kind**: domains by suffix; URLs by their parsed hostname; IPs by their owning domain (assets.parent) — a shared IP only means "some in-scope domain resolves to it", not exclusive ownership. **An explicit `--match` with no valid domain among it is a hard error** — never a silent full-store report. Without `--match` the latest run's target is used and a warning is emitted.
 
 ```bash
-python findinfo.py report                                  # 范围 = 最近一次 run 的目标域
+python findinfo.py report                                  # scope = the latest run's target
 python findinfo.py report --match example.com --match example.org --slug example
-python findinfo.py report --print-md                       # 额外回显 markdown 正文
-python findinfo.py report --with-json --json-limit 40      # 顺便写 report.json（脚本用）
+python findinfo.py report --print-md                       # also echo the markdown text
+python findinfo.py report --with-json --json-limit 40      # also write report.json (for scripts)
 python findinfo.py report --out ./out --limit 80 --ep-limit 200
 ```
 
-**产物**（默认 `~/.findinfo/reports/<时间戳>-<slug>/`，并维护 `reports/latest` 指向最近一次；
-Windows 无软链权限时退化为 `reports/latest.txt`）
+**Artifacts** (default `~/.findinfo/reports/<timestamp>-<slug>/`, with a `reports/latest` pointer to the most recent;
+falls back to `reports/latest.txt` where Windows lacks symlink rights)
 
-| 文件 | 读者 | 说明 |
+| File | Reader | Notes |
 |---|---|---|
-| `report.md` | 人 / 对话 | 分级清单（高价值主机、内部服务、端点、泄露、下一步）——**默认必写** |
-| `report.html` | 人 | 自包含深色看板，无外部 JS/CSS/字体，带打印样式——**默认必写** |
-| `report.json` | 脚本 | 完整 digest + 来源标注 + `charts`；**仅 `--with-json` 时写** |
-| `report.brief.json` | 脚本 | 32 KB 摘要；**仅 `--with-brief` 时写**（agent 常规读取走 `brief` 命令） |
+| `report.md` | humans / chat | tiered listing (high-value hosts, internal services, endpoints, leaks, next steps) — **always written** |
+| `report.html` | humans | self-contained dark dashboard, no external JS/CSS/fonts, print styles — **always written** |
+| `report.json` | scripts | full digest + provenance + `charts`; **written only with `--with-json`** |
+| `report.brief.json` | scripts | 32 KB digest; **written only with `--with-brief`** (routine agent reads use the `brief` command) |
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| `--match X` | 目标域后缀，可重复；不给则回退最近一次 `run` 的 target |
-| `--min-conf` | 入库主机的置信度门槛（默认 0.4） |
-| `--limit` / `--ep-limit` | 主机 / 端点明细上限（默认 300 / 400） |
-| `--json-limit` | cap `report.json` 里的数组（0 = 不额外截断） |
-| `--out` / `--slug` | 输出目录 / 目录名标签 |
-| `--engagement` | 读哪个 run 的阶段检查点（`stages` 字段） |
-| `--with-json` / `--with-brief` | 补写机器文件 report.json / report.brief.json（默认不写） |
-| `--print-md` / `--print-json` | 顺便把 md 正文 / 完整 digest 回显到 stdout |
+| `--match X` | target domain suffixes, repeatable; defaults to the latest `run`'s target |
+| `--min-conf` | confidence floor for included hosts (default 0.4) |
+| `--limit` / `--ep-limit` | host / endpoint detail caps (default 300 / 400) |
+| `--json-limit` | cap arrays inside `report.json` (0 = no extra truncation) |
+| `--out` / `--slug` | output directory / label |
+| `--engagement` | which run's stage checkpoints to read (`stages` field) |
+| `--with-json` / `--with-brief` | also write the machine files report.json / report.brief.json (off by default) |
+| `--print-md` / `--print-json` | also echo the md text / full digest to stdout |
 
-**输出（stdout 一行 JSON）**
+**Output (one JSON line on stdout)**
 
 ```json
 {
@@ -713,101 +715,101 @@ Windows 无软链权限时退化为 `reports/latest.txt`）
              "endpoints_in_scope": 6379, "endpoints_interesting": 153, "leak_domains": 8},
   "scope": {"match": ["example.com"], "auto": false},
   "paths": {"md": ".../report.md", "html": ".../report.html"},
-  "warnings": ["检测到 4 个域名解析到 198.18.0.0/15（Clash/TUN fake-IP）…"],
-  "next_steps": ["关闭 TUN 后重跑 dns/probe…"]
+  "warnings": ["detected 4 domains resolving into 198.18.0.0/15 (Clash/TUN fake-IP)..."],
+  "next_steps": ["disable TUN and re-run dns/probe..."]
 }
 ```
 
-**report.json 结构**：`schema` / `scope` / `counts` / `hosts[]`（`host`,`ip`,`status`,`title`,`tech`,
-`priority`,`score`,`reasons[]`,`provenance[]`,`discovered_by`,`sensitive[]`,`params[]`）/ `endpoints[]` /
-`signals`（泄露密钥等）/ `ip_groups` / `provenance`（工具→资产数）/ `stages` / `next_steps` / `charts` / `truncated`。
+**report.json shape**: `schema` / `scope` / `counts` / `hosts[]` (`host`,`ip`,`status`,`title`,`tech`,
+`priority`,`score`,`reasons[]`,`provenance[]`,`discovered_by`,`sensitive[]`,`params[]`) / `endpoints[]` /
+`signals` (leaked secrets) / `ip_groups` / `provenance` (tool→asset counts) / `stages` / `next_steps` / `charts` / `truncated`.
 
 ---
 
-## brief — Agent 统一读取入口（查库 → stdout 一行 JSON）
+## brief — the unified agent read API (store query → one JSON line on stdout)
 
-Agent 想看"这次收成了什么"就用它：直接查资产库，把与 `report.brief.json` 相同的摘要
-（counts / coverage 缺口 / top_hosts / internal_services / leaks / next_steps）以**一行 JSON 打到 stdout**，
-**不写任何文件**。范围语义与 `report` 完全一致（`--match` 校验、`--run` 回退 scope、跨 task 拒绝）。
+Whenever an agent wants to know "what did this collection yield": query the store directly and print the same digest as
+`report.brief.json` (counts / coverage gaps / top_hosts / internal_services / leaks / next_steps) as **one JSON line on stdout**,
+**writing no files**. Scope semantics are identical to `report` (`--match` validation, `--run` scope fallback, cross-task refusal).
 
 ```bash
-python findinfo.py --task <名> brief --match 主域      # 常规用法
-python findinfo.py brief --run <run_id>                # 不带 --match，沿用 run 的 scope
-python findinfo.py brief --match 主域 --top 10         # top_hosts 上限（默认 20）
-python findinfo.py brief --match 主域 --max-bytes 8192 # 字节上限（默认 32 KB）
+python findinfo.py --task <name> brief --match example.com      # the usual call
+python findinfo.py brief --run <run_id>                # no --match: reuse the run's scope
+python findinfo.py brief --match example.com --top 10         # top_hosts cap (default 20)
+python findinfo.py brief --match example.com --max-bytes 8192 # byte ceiling (default 32 KB)
 ```
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| `--match X` | 目标域后缀，可重复；语义与 report 的 `--match` 一致 |
-| `--run <run_id>` | 不给 `--match` 时沿用该 run 的 scope |
-| `--top` / `--max-bytes` | top_hosts 条数（默认 20）/ payload 字节上限（默认 32768） |
-| `--min-conf` / `--limit` / `--ep-limit` | 同 report |
-| `--engagement <run_id>` | 显式指定读哪个 run 的阶段检查点；**有 `--run` 时优先用 `--run`**，本参数只在没有 `--run` 时生效 |
+| `--match X` | target domain suffixes, repeatable; same semantics as report's `--match` |
+| `--run <run_id>` | without `--match`, use that run's scope |
+| `--top` / `--max-bytes` | top_hosts count (default 20) / payload byte ceiling (default 32768) |
+| `--min-conf` / `--limit` / `--ep-limit` | same as report |
+| `--engagement <run_id>` | explicitly pick which run's checkpoints to read; **`--run` wins when both are given** — this only applies without `--run` |
 
-### coverage 从哪儿来（`brief` 与 `report --with-brief` 规则完全相同）
+### Where coverage comes from (identical rules for `brief` and `report --with-brief`)
 
-覆盖率缺口存在每个 run 自己的状态里，不在共享资产库里。读取顺序固定为：
+Coverage gaps live in each run's own state, not in the shared store. The read order is fixed:
 
-1. 给了 `--run <run_id>`：读该 run 的 coverage；
-2. 没给 `--run` 但显式给了 `--engagement`（且不是默认的 `default`）：读该 run 的 coverage；
-3. 只给了 `--match`：在当前 task 里找 **scope 与 `--match` 有交集、且最新**的那次 run；
-4. 都没找到：`coverage` 写 `{"source": "none", "known": false}`，绝不输出一个看起来像「没有缺口」的空列表。
+1. `--run <run_id>` given: that run's coverage;
+2. no `--run` but an explicit `--engagement` (other than the default `default`): that run's coverage;
+3. only `--match` given: the newest run **in the current task whose scope intersects `--match`**;
+4. nothing found: `coverage` becomes `{"source": "none", "known": false}` — never an empty list that looks like "no gaps".
 
-所以 **有 run_id 时一律用 `brief --run <run_id>`**：只有 `--match` 的调用会退化成「猜最近一次 run」，
-读到的可能不是你以为的那一次。
+So **whenever you have a run_id, use `brief --run <run_id>`**: a match-only call degrades to "guess the latest run"
+and may read a different one than you think.
 
-**输出（stdout 一行 JSON，即整个命令的产物）**：`schema: findinfo.brief/1`、`counts`、`scope`、
-`environment.warnings`、`coverage`、`top_hosts`（每条含 `host`/`score`/`priority`/`reasons`/`provenance`）、
-`internal_services`、`leaks`、`next_steps`、`truncated`（被截断数组的 kept/total）。
+**Output (one JSON line on stdout — the entire product of the command)**: `schema: findinfo.brief/1`, `counts`, `scope`,
+`environment.warnings`, `coverage`, `top_hosts` (each with `host`/`score`/`priority`/`reasons`/`provenance`),
+`internal_services`, `leaks`, `next_steps`, `truncated` (kept/total of cut arrays).
 
-`coverage` 的字段：
+`coverage` fields:
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `source` | coverage 来自哪个 run id；没读到任何 run 时为 `"none"` |
-| `known` | `true` = 真的读到了某次 run 的覆盖；`false` = 什么都没读到，**这不等于「没有缺口」** |
-| `failed_stages` | 跑失败了、被记为失败的阶段 |
-| `not_run_stages` / `skipped_stages` | 计划了但没产出结果的阶段 / 被跳过的阶段 |
-| `unavailable` / `unavailable_total` | 逐条缺口（缺凭据、缺工具、额度耗尽等），超过 40 条只留前 40 条 |
-| `blocking` / `blocking_reason` | 只有存在**阻塞性**缺口时出现（缺必需工具等），并附原因 |
-| `note` | 非阻塞缺口的说明（可选） |
-| `hint` | `known=false` 时的补救提示 |
+| `source` | which run id the coverage came from; `"none"` when no run was read |
+| `known` | `true` = a run's coverage was really read; `false` = nothing was read, **which does NOT mean "no gaps"** |
+| `failed_stages` | stages that ran and failed |
+| `not_run_stages` / `skipped_stages` | planned stages with no results / stages skipped |
+| `unavailable` / `unavailable_total` | per-item gaps (missing credentials, missing tools, exhausted quota...); only the first 40 are kept |
+| `blocking` / `blocking_reason` | present only when a **blocking** gap exists (e.g. a required tool is missing), with the reason |
+| `note` | explanation of non-blocking gaps (optional) |
+| `hint` | remediation hint when `known=false` |
 
 ---
 
-**来源标注**：同一资产的 `discovered_by` 保留原始 sources 串（如 `onepass:rapiddns,subfinder`），
-`provenance` 归一化成工具列表并配中文标签；onepass 的多个上游源只算一个工具。
+**Provenance**: a host's `discovered_by` keeps the raw sources string (e.g. `onepass:rapiddns,subfinder`),
+and `provenance` normalizes it into a tool list with labels; onepass's many upstreams count as one tool.
 
 ---
 
-## 组合用法（推荐给 agent 的工作流）
+## Combined usage (the recommended agent workflow)
 
 ```bash
-# 1. 自检
+# 1. self-check
 python findinfo.py doctor
 
-# 2. 被动扩张（零风险，先跑满）
-python findinfo.py entity --name "企业名"
-python findinfo.py passive --from-store           # 15 源并行，最快的一条
-python findinfo.py certs --domain 主域
+# 2. passive expansion (zero risk, run it fully first)
+python findinfo.py entity --name "Example Corp"
+python findinfo.py passive --from-store           # 15 sources in parallel, the fastest route
+python findinfo.py certs --domain example.com
 python findinfo.py icp  --from-store
 python findinfo.py subs --from-store
 python findinfo.py dns  --from-store
 
-# 3. 看一眼资产图，判断是否继续
+# 3. glance at the asset graph, decide whether to continue
 python findinfo.py assets --kind domain --limit 20
 
-# 4. 主动
+# 4. active
 python findinfo.py probe --from-store --min-conf 0.7
 python findinfo.py ipagg
-python findinfo.py vhost --ip <候选IP> --from-store
+python findinfo.py vhost --ip <candidate-ip> --from-store
 
-# 5. 回流
+# 5. reflow
 python findinfo.py crawl --from-store
 python findinfo.py extract --url <js>
 
-# 6. 交付（brief 给 agent 读，report 出 md/html 给人看）
-python findinfo.py brief --match 主域
-python findinfo.py report --match 主域
+# 6. delivery (brief for the agent to read; report emits md/html for humans)
+python findinfo.py brief --match example.com
+python findinfo.py report --match example.com
 ```

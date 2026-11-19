@@ -318,7 +318,7 @@ def cmd_status(project: str | None) -> int:
     out = {"source": str(SOURCE), "targets": rows, "codex_config": _codex_state()}
     if out["codex_config"].get("include_instructions") is False:
         out["codex_config"]["warning"] = ("[skills].include_instructions = false，"
-                                          "Codex 不会把 skill 说明注入上下文")
+                                          "Codex will not inject skill instructions into context")
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -391,10 +391,19 @@ def cmd_install(project: str | None, targets_wanted: list[str], mode: str,
             continue
         results.append(_install_one(kind, dst, mode, force, dry))
 
-    # Codex 只认 config.toml 里的 [[skills.config]]，链接不够
+    # Codex (CLI 0.166+) does NOT scan ~/.codex/skills: it reads explicit
+    # [[skills.config]] entries from ~/.codex/config.toml. Installing only a
+    # link there leaves the skill invisible to Codex, so registration is part
+    # of install -- but ONLY when Codex is actually installed. Registering
+    # without the check created ~/.codex/config.toml out of thin air on
+    # machines that never had Codex (and the output then claimed both
+    # "skipped: client not installed" and "registered" for the same client).
     codex_reg = None
     if any(k in ("codex", "project-codex") for k in all_targets) and _selected("codex", targets_wanted, project):
-        codex_reg = codex_register(dry=dry)
+        if _client_present("codex", None) or _client_present("project-codex", project):
+            codex_reg = codex_register(dry=dry)
+        else:
+            codex_reg = {"action": "skipped", "reason": "codex not installed"}
 
     refused = [r for r in results if r.get("action") == "refused"]
     print(json.dumps({"source": str(SOURCE), "mode": mode, "dry_run": dry,
@@ -452,7 +461,7 @@ def cmd_verify(project: str | None) -> int:
             checks.append({"client": kind, "ok": False,
                            "reason": "doctor did not return JSON: " + repr(exc),
                            "stdout": proc.stdout[-300:], "stderr": proc.stderr[-300:]})
-    # Codex 的可用性取决于 config.toml 里的注册，不是目录是否存在
+    # Codex availability depends on the config.toml registration, not the directory
     cs = _codex_state()
     codex_ok = (not cs["exists"]) or cs["registered"]
     checks.append({"client": "codex-config", "ok": codex_ok,

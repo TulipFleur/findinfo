@@ -1,49 +1,49 @@
-# 跨客户端安装与差异
+# Cross-client install and differences
 
-> 同一份 skill 目录，三个本地客户端两种加载机制。装错了会「目录里有、agent 看不见」。
+> One skill directory, three local clients, two loading mechanisms. Getting it wrong produces "it's in the directory but the agent cannot see it".
 
-## 1. 机制矩阵
+## 1. Mechanism matrix
 
-本 skill 只在**本地客户端 Agent** 里用：Agent 进程与 `bin/<platform>/` 的二进制跑在同一台机器上。
-会话若落到远端沙箱（云端 Linux、远程容器），`bin/` 里的二进制就不是那个系统的，不在支持范围内。
+This skill is used only inside **local client agents**: the agent process runs on the same machine as the `bin/<platform>/` binaries.
+If a session lands in a remote sandbox (cloud Linux, remote container), the binaries in `bin/` do not belong to that system — out of scope.
 
-| 客户端 | 加载机制 | 安装位置 | 真正生效的开关 |
+| Client | Loading mechanism | Install location | What actually makes it work |
 |---|---|---|---|
-| **DSH / agents** | 扫描 skills 目录 | `~/.agents/skills/findinfo` | 目录存在 + `SKILL.md` 有 frontmatter |
-| **Claude Code** | 扫描 skills 目录 | `~/.claude/skills/findinfo` | 同上（frontmatter 的 `name` 必须等于目录名） |
-| **Codex CLI** | **读 config.toml 注册表** | 任意（建议 `~/.codex/skills/findinfo`） | `~/.codex/config.toml` 的 `[[skills.config]]` + `enabled = true` |
+| **DSH / agents** | scans a skills directory | `~/.agents/skills/findinfo` | directory exists + `SKILL.md` has frontmatter |
+| **Claude Code** | scans a skills directory | `~/.claude/skills/findinfo` | same (frontmatter `name` must equal the directory name) |
+| **Codex CLI** | **reads a config.toml registry** | anywhere (recommend `~/.codex/skills/findinfo`) | `[[skills.config]]` in `~/.codex/config.toml` + `enabled = true` |
 
-**关键坑（已踩过）**：只往 `~/.codex/skills/` 建链接，Codex 完全看不见；
-而且 `[[skills.config]]` 必须同时有 `path` 和 `enabled`——只写 `path` 会让整份 config 失效（`codex doctor` 报 `invalid data`）。
+**Known pitfall (hit before)**: creating only a link in `~/.codex/skills/` leaves Codex completely blind;
+and `[[skills.config]]` must carry BOTH `path` and `enabled` — a `path`-only entry invalidates the whole config (`codex doctor` reports `invalid data`).
 
-## 2. 一条命令搞定（推荐）
+## 2. One command does it (recommended)
 
 ```bash
-python scripts/install.py            # 三客户端建链接 + Codex 自动注册
-python scripts/install.py --status   # 每个客户端状态 + Codex 是否注册
-python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
-python scripts/install.py --uninstall# 只删自己创建的（含 Codex 反注册）
-python scripts/install.py --copy     # 真实拷贝（= --mode copy）而不是链接
+python scripts/install.py            # links for all three clients + automatic Codex registration
+python scripts/install.py --status   # per-client status + whether Codex is registered
+python scripts/install.py --verify   # runs doctor on every client path
+python scripts/install.py --uninstall# removes only what it created (incl. Codex de-registration)
+python scripts/install.py --copy     # a real copy (= --mode copy) instead of a link
 ```
 
-**copy 模式包含什么**：代码、wordlists、config 模板，以及**当前平台**的 `bin/<platform>/` 全部二进制（自包含，可拷去别的机器）；排除 `.env`、`bin/config.yaml`（密钥不外带）、`rust/target`（构建产物）、**其它平台**的 bin 目录和 `data/cache/runs` 运行态。旧版把三个平台目录全排除，拷出来的目录一个二进制都没有——已修复。
+**What copy mode includes**: the code, wordlists, config templates, and every binary of the **current platform's** `bin/<platform>/` (self-contained, copyable to another machine); it excludes `.env`, `bin/config.yaml` (secrets never travel), `rust/target` (build artifacts), the **other platform's** bin directories, and `data/cache/runs` runtime state. The old version excluded all platform directories, producing a copy without a single binary — fixed.
 
-对 Codex 做三件事：建链接、往 `config.toml` 插入注册块（幂等）、改前备份 `config.toml.findinfo.bak`。
-反注册会逐字节还原原文件（保留 CRLF/LF）。
+For Codex it does three things: creates the link, inserts the registration block into `config.toml` (idempotent), and backs up `config.toml.findinfo.bak` before touching it.
+De-registration restores the original file byte for byte (CRLF/LF preserved).
 
-## 3. 各客户端注意事项
+## 3. Per-client notes
 
-### DSH / agents（`~/.agents/skills`）
-- 本仓库的 canonical 位置，其他客户端都可以指向它。
-- 技能列表由宿主注入，改 `SKILL.md` 后重开会话生效。
+### DSH / agents (`~/.agents/skills`)
+- The canonical location of this repo; other clients may point at it.
+- The skill list is injected by the host; editing `SKILL.md` takes effect after reopening the session.
 
-### Claude Code（`~/.claude/skills`）
-- 只认 frontmatter 的 `name` / `description`；`name` 与目录名不一致会加载失败。
-- Windows 上 Bash 工具走 Git Bash，命令必须 POSIX 兼容（本项目命令都是）。
-- 首次跑主动阶段会触发审批；批量放行前先确认目标范围。
+### Claude Code (`~/.claude/skills`)
+- Only the frontmatter `name` / `description` matter; a `name` that disagrees with the directory name fails to load.
+- On Windows the Bash tool goes through Git Bash, so commands must be POSIX-compatible (all commands here are).
+- The first active stage triggers an approval prompt; confirm the target scope before bulk-allowing.
 
-### Codex（`~/.codex/config.toml`）
-- 注册块：
+### Codex (`~/.codex/config.toml`)
+- The registration block:
 
 ```toml
 [[skills.config]]
@@ -51,36 +51,36 @@ path = 'E:\AI\skills\findinfo\SKILL.md'
 enabled = true
 ```
 
-- `[skills] include_instructions` 是**全局**开关，**必须为 true**：为 `false` 时 Codex 虽然注册了
-  skill，但不会把说明注入上下文——实测 agent 会回答"看不到这个 skill"。开启：
+- `[skills] include_instructions` is a **global** switch and **must be true**: when false, Codex has the skill
+  registered but never injects the instructions into context — observed behaviour: the agent answers "I cannot see this skill". To enable:
   ```bash
-python scripts/install.py --enable-instructions   # 全局，影响所有 skill
+python scripts/install.py --enable-instructions   # global, affects all skills
 ```
-  `--status` 在该值为 false 时输出 `warning`。
-- 改完跑 `codex doctor`，`0 fail` 才算配置有效。
+  `--status` prints a `warning` when the value is false.
+- After editing, run `codex doctor`; only `0 fail` means the config is valid.
 
-### 其它客户端与本地运行的前提
+### Other clients and prerequisites for local runs
 
-- 本 skill 的命令行调用、内置二进制、资产库都在本机，**只在本地客户端 Agent 会话里用**。
-- 不针对「会话在远端沙箱里执行」的模式做支持：那时 `bin/` 里的二进制与目标系统不是一套。
-- 想换系统就换对应平台的包（Windows 包 / Linux 包见 [docs/LINUX.md](LINUX.md)），而不是让包跨系统跑。
+- The command-line calls, bundled binaries and the asset store of this skill all live on the local machine — **use it only inside local client agent sessions**.
+- The "session executes in a remote sandbox" mode is not supported: the `bin/` binaries would not match the target system.
+- To move to another OS, take that platform's package (Windows package / Linux package, see [docs/LINUX.md](LINUX.md)) instead of making one package run cross-system.
 
-## 4. 状态共享
+## 4. Shared state
 
 ```text
-~/.findinfo/            ← 所有 Windows 客户端共享同一份资产库
+~/.findinfo/            <- all Windows clients share one asset store
 ├── findinfo.db
 ├── runs/
 └── cache/
 ```
 
-- 这些本地客户端共用 `~/.findinfo`，资产图是同一份（幂等合并）。
-- WSL 是另一个 HOME（`/root/.findinfo`），与 Windows 不共享；跨系统用 `assets --export` 再导入。
+- These local clients share `~/.findinfo`, so the asset graph is one and the same (idempotent merge).
+- WSL has a different HOME (`/root/.findinfo`) and does not share with Windows; to cross systems use `assets --export` and import.
 
-## 5. 快速自检
+## 5. Quick self-check
 
 ```bash
-python scripts/install.py --status   # 目录/链接/Codex 注册/include_instructions
-python scripts/install.py --verify   # 每个客户端路径实跑 doctor（含工具数）
-codex doctor | grep skills           # Codex 侧确认注册被解析
+python scripts/install.py --status   # directories/links/Codex registration/include_instructions
+python scripts/install.py --verify   # run doctor on each client path (incl. tool count)
+codex doctor | grep skills           # confirm Codex parsed the registration
 ```
