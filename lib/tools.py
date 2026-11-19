@@ -659,7 +659,12 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     tried = [p for p in per_source if p["outcome"] != core.OUTCOME_UNAVAILABLE]
     if tried and all(p["outcome"] in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT)
                      for p in tried):
-        outcome = core.OUTCOME_FAILED
+        # A stage where every source hit its deadline is a timeout, not a
+        # failure: the caller has to raise the timeout, not debug the tools.
+        if all(p["outcome"] == core.OUTCOME_TIMEOUT for p in tried):
+            outcome = core.OUTCOME_TIMEOUT
+        else:
+            outcome = core.OUTCOME_FAILED
     else:
         outcome = core.combine_outcome(*(outcomes or [core.OUTCOME_OK]))
         if outcome == core.OUTCOME_OK and not rows:
@@ -1622,10 +1627,7 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
     }
 
 
-# ---------------------------------------------------------------- doctor
-VERSION_ARGS = ["-version", "--version", "-V", "-h"]
-
-# ---------------------------------------------------------------- versions
+# ---------------------------------------------------------------- doctor / versions
 # Per-tool version recipe, derived from sampling each binary instead of
 # guessing. The old code ran every tool with every flag and took the first
 # x.y.z-looking token in the whole blob, so a usage banner echoing its own
@@ -1635,7 +1637,7 @@ VERSION_ARGS = ["-version", "--version", "-V", "-h"]
 # Each entry: (args to try, regex whose group 1 is the version).
 # Every regex is anchored on a version keyword or the tool's own name, so an
 # unrelated number in the output cannot win.
-_VERSION_ARGS = ["-version", "--version", "-V", "-h"]
+VERSION_ARGS = ["-version", "--version", "-V", "-h"]
 
 # ProjectDiscovery family prints "Current Version: v1.2.3" (capital V in older
 # builds, lowercase in newer).
@@ -1722,7 +1724,7 @@ def _tool_version(name: str, exe: str) -> tuple[str, str, str]:
     human can see what the tool actually said when parsing fails.
     """
     spec = _VERSION_SPECS.get(name)
-    args_list = spec[0] if spec else _VERSION_ARGS
+    args_list = spec[0] if spec else VERSION_ARGS
     last_raw = ""
     for arg in args_list:
         rc, out, err = core.run([exe, arg], timeout=20)

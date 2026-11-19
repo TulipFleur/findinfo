@@ -13,7 +13,7 @@ findinfo/
 ├── prompts/AGENT.txt    ← ★ 复制即用的提示词模板（人工复制，不参与自动加载）
 ├── bin/                ← 按平台分目录：bin/windows/、bin/linux/（不支持 macOS）
 │   ├── windows/        ← 12 个 .exe（Windows 预置；doctor 追踪 12 个）
-│   ├── linux/          ← ELF（scripts/setup-linux.sh 安装）
+│   ├── linux/          ← ELF（scripts/setup-linux.sh 安装；该脚本只在 Linux 包）
 │   └── config.example.yaml  ← ENScan Cookie 模板 → 复制成 bin/config.yaml
 ├── rust/onepass/       ← onepass 源码（15 源被动聚合，cargo build --release）
 ├── deploy/             ← systemd 模板（findinfo@.service / .timer）
@@ -37,7 +37,8 @@ findinfo/
 └── scripts/
     ├── findinfo.sh     ← ★ 固定入口（-t/-n/-a/--vhost/-b/--status）
     ├── install.py      ← ★ 跨客户端安装/状态/校验
-    ├── setup-linux.sh  ← ★ Linux 装原生二进制 + setcap + 体检
+    ├── build-release.py ← ★ 生成干净发布包 + SHA256SUMS（见第 3 节）
+    ├── setup-linux.sh  ← ★ Linux 装原生二进制 + setcap + 体检（只在 Linux 包）
     ├── build-onepass.sh← 重编 onepass（需 Rust 工具链）
     └── build-enscan.sh ← 重编 ENScan_GO（需 Go 1.23+）
 
@@ -56,7 +57,58 @@ findinfo/
 
 ---
 
-## 2. 回归验证（全部为模拟采集器，不碰真实目标、不耗配额）
+## 2. 发布流程（生成可复现的发布包）
+
+发布包由脚本生成，不再手工拷目录。**打 tag、建 Release、上传资产由人来做**，
+脚本只负责"目录里该有什么"。
+
+```bash
+python scripts/build-release.py                       # 两个平台，输出到 _rel/
+python scripts/build-release.py --platform windows     # 只打一个平台
+python scripts/build-release.py --dry-run              # 只看清单，不写文件
+python scripts/build-release.py --out _rel/next        # 先放旁边，人工对比后再替换
+python scripts/build-release.py --version 0.7.3        # 默认读 VERSION
+```
+
+产物：`_rel/findinfo-<版本>-<平台>.zip` + `_rel/SHA256SUMS`（每个 zip 一行），
+并对每个平台打印一行 JSON（`version` / `platform` / `files` / `bytes_raw` /
+`bytes_zip` / `sha256` / `audit_ok` / `audit_problems`），可直接贴进 Release 说明。
+
+**包里有什么，是规则不是记忆**（`scripts/build-release.py` 的 `shipped_files()`）：
+
+| 规则 | 结果 |
+|---|---|
+| 只打包 `git ls-files` 的已跟踪文件 | 天然排除 `__pycache__`/`.pyc`、`.env`、`data/`、`runs/`、`cache/` |
+| 加上**当前平台**的 `bin/<platform>/*` | Windows 包只有 `.exe`，Linux 包只有 ELF；另一平台的二进制永不混入 |
+| 排除开发物料 `tests/`、`agent-records/`、`rust/`、`scripts/agent-record.py`、`.gitignore` | 消费者不需要 pytest、源码与协作日志 |
+| 按平台排除 | Windows 包不含 `scripts/setup-linux.sh`（POSIX 安装器）和 `deploy/*.service|*.timer`（systemd） |
+| 永不打包密钥 | `bin/config.yaml`（ENScan Cookie）、`config/.env`；只带 `.example` 模板 |
+
+> `deploy/` 是整个目录排除的：它只有 systemd 单元，Windows 用不到；Linux 需要时从仓库取。
+
+**构建后自检**（脚本自动做，任一不过则 exit 1）：解压到临时目录，确认没有
+`.pyc`/`__pycache__`/`.env`/`bin/config.yaml`、`VERSION` 与 `--version` 一致、
+并在解压目录里跑一次 `python findinfo.py doctor`。**网络探测失败不算构建失败**
+（无出口时 doctor 的 `net_egress` 必然失败）；但如果 doctor 连 `tools_summary` 都产不出来，
+说明包里的 CLI 起不来，构建失败。
+
+**核对 SHA256SUMS**（下载后先验证，再解压）：
+
+```bash
+# Linux / macOS
+sha256sum -c SHA256SUMS
+
+# Windows PowerShell
+Get-FileHash .indinfo-0.7.2-windows.zip -Algorithm SHA256
+```
+
+**人工收尾（脚本不做）**：确认 `_rel/next` 的 file 清单与体积 → 替换 `_rel/` 里的旧包 →
+`git tag v<版本>` 并推送 → 建 GitHub Release、上传 zip 与 SHA256SUMS（上传资产用文件 payload，
+内联 JSON 会被 shell 转义破坏）。
+
+---
+
+## 3. 回归验证（全部为模拟采集器，不碰真实目标、不耗配额）
 
 ```bash
 pip install pytest       # 一次性：部分用例用 pytest 的 raises/monkeypatch/tmp_path
