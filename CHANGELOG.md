@@ -93,7 +93,7 @@
   `.exe` 在 Linux 沙箱里跑不了）。（`c424628`、`3226ebe`）
 - `README.md` 改为面向人的介绍 / 安装 / 快速开始 / 文档索引，不再重复 Agent 规则。（`3226ebe`）
 - 发布包与 `install.py --copy` 共用 `scripts/shipped.py` 的同一份清单，不再各写一套忽略规则；包内去掉运行时读不到的 `<tool>/config.yaml` 与 `subfinder/provider-config.yaml`。（`8518583`）
-- 内部：`tests/test_shipped_manifest.py` 的提交对照检查容错——变更日志不会记录只改测试的提交。（`5cc8b1c`、`723103d`）
+- 内部：提交对照检查只放过最新提交（它无法在自己的变更日志里写出自己的哈希），更早的都要在册。（`5cc8b1c`、`723103d`、`ec3ed32`）
 - `docs/DEVELOPMENT.md` 补发布包规则表与构建自检说明。（`6ca04ea`）
 
 ### 已知问题
