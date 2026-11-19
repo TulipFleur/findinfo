@@ -1,16 +1,17 @@
 # 跨客户端安装与差异
 
-> 同一份 skill 目录，四种客户端三种加载机制。装错了会「目录里有、agent 看不见」。
+> 同一份 skill 目录，三个本地客户端两种加载机制。装错了会「目录里有、agent 看不见」。
 
 ## 1. 机制矩阵
+
+本 skill 只在**本地客户端 Agent** 里用：Agent 进程与 `bin/<platform>/` 的二进制跑在同一台机器上。
+会话若落到远端沙箱（云端 Linux、远程容器），`bin/` 里的二进制就不是那个系统的，不在支持范围内。
 
 | 客户端 | 加载机制 | 安装位置 | 真正生效的开关 |
 |---|---|---|---|
 | **DSH / agents** | 扫描 skills 目录 | `~/.agents/skills/findinfo` | 目录存在 + `SKILL.md` 有 frontmatter |
 | **Claude Code** | 扫描 skills 目录 | `~/.claude/skills/findinfo` | 同上（frontmatter 的 `name` 必须等于目录名） |
 | **Codex CLI** | **读 config.toml 注册表** | 任意（建议 `~/.codex/skills/findinfo`） | `~/.codex/config.toml` 的 `[[skills.config]]` + `enabled = true` |
-| **Claude Desktop · Code 标签** | 就是 Claude Code，扫描 skills 目录 | `~/.claude/skills/findinfo` | 同 Claude Code |
-| **Claude Desktop · 聊天 / Cowork** | 待确认：桌面端有本地 agent 模式（`local-agent-mode-sessions/skills-plugin`，但只装了 Anthropic 自家 skill），会话也可能在云端执行；官方文档当前不可达 | — | 第三方 skill 能否加载、会话在本地还是云端：**待确认**。即使能加载，Windows 包里的 `.exe` 在 Linux 沙箱里也跑不了 |
 
 **关键坑（已踩过）**：只往 `~/.codex/skills/` 建链接，Codex 完全看不见；
 而且 `[[skills.config]]` 必须同时有 `path` 和 `enabled`——只写 `path` 会让整份 config 失效（`codex doctor` 报 `invalid data`）。
@@ -58,19 +59,11 @@ python scripts/install.py --enable-instructions   # 全局，影响所有 skill
   `--status` 在该值为 false 时输出 `warning`。
 - 改完跑 `codex doctor`，`0 fail` 才算配置有效。
 
-### Claude Desktop
+### 其它客户端与本地运行的前提
 
-桌面端存在两套运行方式，本次**未能核实官方文档**（`docs.claude.com` / `docs.anthropic.com` 在本地被地域墙拦截，只能拿到 "App unavailable in region"），以下据本机文件证据与 Anthropic 自家 skill 内的措辞给出，标 **待确认** 的部分不要当成结论：
-
-- **Code 标签 = Claude Code 本体**，读 `~/.claude/skills/`，与终端用法一致。这条可用。
-- **聊天 / Cowork 会话**：本机 `%APPDATA%\Claude\local-agent-mode-sessions\` 与
-  `%LOCALAPPDATA%\Claude-Data\<id>\local-agent-mode-sessions\` 下确有 `skills-plugin`（`plugin.json` 名为 `anthropic-skills`），
-  里面只放 Anthropic 自家的 17 个 skill（`source: anthropic-example`）——说明桌面端有**本地 agent 模式**的 skills 装入点，
-  但这是否对第三方 skill 开放、以及会话究竟跑在本机还是云端，**待确认**（Anthropic 的 `computer-use` skill 里同时区分了
-  "session runs in the desktop app" 与 "cloud session"，可见两种都存在）。
-- 即便第三方 skill 能被加载，**用 Windows 包也跑不起来**：包里是 `.exe`，云端沙箱是 Linux；
-  要云端用就得在 Linux 上装 Linux 包（[docs/LINUX.md](LINUX.md)）。
-- **实操建议**：要在桌面上跑本项目，走 Code 标签。
+- 本 skill 的命令行调用、内置二进制、资产库都在本机，**只在本地客户端 Agent 会话里用**。
+- 不针对「会话在远端沙箱里执行」的模式做支持：那时 `bin/` 里的二进制与目标系统不是一套。
+- 想换系统就换对应平台的包（Windows 包 / Linux 包见 [docs/LINUX.md](LINUX.md)），而不是让包跨系统跑。
 
 ## 4. 状态共享
 
@@ -81,7 +74,7 @@ python scripts/install.py --enable-instructions   # 全局，影响所有 skill
 └── cache/
 ```
 
-- 三个客户端共用 `~/.findinfo`，资产图是同一份（幂等合并）。
+- 这些本地客户端共用 `~/.findinfo`，资产图是同一份（幂等合并）。
 - WSL 是另一个 HOME（`/root/.findinfo`），与 Windows 不共享；跨系统用 `assets --export` 再导入。
 
 ## 5. 快速自检

@@ -154,7 +154,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # �
 ## 7. 跨客户端安装
 
 同一目录可被多个客户端共用：`python scripts/install.py`（建立 Windows junction / Linux symlink）、`--status`（装到哪、是否可用）、`--verify`（在每个客户端路径实跑 doctor）。
-各客户端机制差异、Codex 的 `config.toml` 注册、Claude Desktop 各模式能否加载本机 skills → [docs/CLIENTS.md](docs/CLIENTS.md)。
+各客户端机制差异、Codex 的 `config.toml` 注册 → [docs/CLIENTS.md](docs/CLIENTS.md)。
 
 ## 8. 与其他 skill 的衔接
 

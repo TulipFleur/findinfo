@@ -187,7 +187,7 @@ python scripts/install.py --status   # 查每个客户端是否已装
 python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 ```
 
-不同客户端的加载机制不一样（Codex 走 `config.toml` 注册表；Claude Desktop 的聊天/Cowork 是否能加载第三方 skill **待确认**，Code 标签可用），
+不同客户端的加载机制不一样（Codex 走 `config.toml` 注册表，其余扫 skills 目录）；
 细节和常见坑见 [docs/CLIENTS.md](docs/CLIENTS.md)。
 
 ### 使用边界
@@ -218,7 +218,7 @@ run 照常完成并交付，**不要**再对它反复 `--resume`（补上 key �
 | docs/TOOLS.md | 每个命令的参数、输出 JSON、示例、内置工具能力矩阵 |
 | docs/API-KEYS.md | **哪些需要 key**、申请地址、免费额度、不配的后果 |
 | docs/LINUX.md | Linux 部署：装二进制、CAP_NET_RAW、systemd、故障排查 |
-| docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex / Claude Desktop）加载机制与坑 |
+| docs/CLIENTS.md | 跨客户端（DSH / Claude Code / Codex）加载机制与坑 |
 | docs/DATA-MODEL.md | **数据模型**：资产字段、置信度规则、报告字段口径、旧数据迁移 |
 | docs/TROUBLESHOOTING.md | **故障与结果推进**：常见故障、wait 判读、来源级分支、红线 |
 | docs/DEVELOPMENT.md | **开发文档**：目录结构、回归测试怎么跑（日常使用不需要看） |
