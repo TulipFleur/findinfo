@@ -81,6 +81,7 @@ python scripts/build-release.py --version 0.7.3        # 默认读 VERSION
 | 只打包 `git ls-files` 的已跟踪文件 | 天然排除 `__pycache__`/`.pyc`、`.env`、`data/`、`runs/`、`cache/` |
 | 加上**当前平台**的 `bin/<platform>/*` | Windows 包只有 `.exe`，Linux 包只有 ELF；另一平台的二进制永不混入 |
 | 排除开发物料 `tests/`、`agent-records/`、`rust/`、`scripts/agent-record.py`、`.gitignore` | 消费者不需要 pytest、源码与协作日志 |
+| 排除工具目录下的 `config.yaml` 与 `subfinder/provider-config.yaml` | 它们是工具在 cwd 生成的默认模板；运行时只从 `cwd=bin/` 或 `$HOME/.config/<tool>/` 读取，仓库根的副本从不起作用 |
 | 按平台排除 | Windows 包不含 `scripts/setup-linux.sh`（POSIX 安装器）和 `deploy/*.service|*.timer`（systemd） |
 | 永不打包密钥 | `bin/config.yaml`（ENScan Cookie）、`config/.env`；只带 `.example` 模板 |
 
@@ -99,7 +100,7 @@ python scripts/build-release.py --version 0.7.3        # 默认读 VERSION
 sha256sum -c SHA256SUMS
 
 # Windows PowerShell
-Get-FileHash .indinfo-0.7.2-windows.zip -Algorithm SHA256
+Get-FileHash .indinfo-<版本>-windows.zip -Algorithm SHA256
 ```
 
 **人工收尾（脚本不做）**：确认 `_rel/next` 的 file 清单与体积 → 替换 `_rel/` 里的旧包 →

@@ -1631,7 +1631,7 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
 # Per-tool version recipe, derived from sampling each binary instead of
 # guessing. The old code ran every tool with every flag and took the first
 # x.y.z-looking token in the whole blob, so a usage banner echoing its own
-# path ("Usage of E:\...\findinfo-0.7.2-windows\bin\...") was reported as
+# path ("Usage of E:\...\findinfo-0.7.3-windows\bin\...") was reported as
 # that tool's version.
 #
 # Each entry: (args to try, regex whose group 1 is the version).
@@ -1685,9 +1685,9 @@ _PATH_NOISE = re.compile(
 def _strip_paths(text: str) -> str:
     """Remove filesystem paths so a directory name cannot pose as a version.
 
-    The install directory is literally named ``findinfo-0.7.2-windows``, so a
+    A release unpacks into a directory literally named after the version, so a
     usage banner echoing its own location caused the bogus
-    ``enscan -> 0.7.2-windows`` report.
+    ``enscan -> <version>-windows`` report.
     """
     out = text or ""
     for literal in (str(core.BIN_PLATFORM), str(core.ROOT), str(core.BIN)):

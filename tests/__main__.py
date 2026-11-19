@@ -52,6 +52,7 @@ MODULES = [
     "tests.test_brief_command",
     "tests.test_coverage_semantics",
     "tests.test_release_bundle",
+    "tests.test_shipped_manifest",
 ]
 
 

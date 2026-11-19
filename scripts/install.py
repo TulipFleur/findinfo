@@ -30,6 +30,17 @@ MARKER = ".findinfo-skill.json"
 # directory that holds the real skill (the parent of scripts/)
 SOURCE = Path(__file__).resolve().parent.parent
 
+# scripts/shipped.py owns what a consumer install contains; the release zip
+# reads the same manifest, so --copy and the archive cannot disagree again.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import shipped as _shipped                                    # noqa: E402
+
+
+def shipped_files(path: Path | None = None) -> list:
+    # Manifest for this host platform, relative to path (the skill root).
+    root = SOURCE if path is None else path
+    return _shipped.shipped_files(_shipped.host_platform(), root)
+
 
 # ---------------------------------------------------------------- fs helpers
 def _is_reparse_point(p: Path) -> bool:
@@ -347,19 +358,17 @@ def _install_one(kind: str, dst: Path, mode: str, force: bool, dry: bool) -> dic
         return result
 
     # copy mode: a self-contained skill directory.
-    # - secrets (.env, bin/config.yaml) are never copied to a shared location
-    # - rust build artifacts (target/) can be gigabytes and are rebuildable
-    # - OTHER platforms' bin dirs are excluded, but THIS platform's binaries
-    #   are included -- the old pattern list named all three, so a copy on
-    #   Linux shipped zero binaries and nothing ran
-    cur_platform = "windows" if os.name == "nt" else "linux"
-    other_platforms = {"windows", "linux"} - {cur_platform}
-    # tests/ is a developer self-check harness: neither findinfo.py nor lib/
-    # imports it, so a consumer install does not need the test files or their
-    # pytest dependency.
-    ignore = ["data", "cache", "runs", "_tmp", "__pycache__", "*.pyc", ".git",
-              ".env", "config.yaml", "target", "tests", *sorted(other_platforms)]
-    shutil.copytree(SOURCE, dst, ignore=shutil.ignore_patterns(*ignore))
+    # The membership rule is scripts/shipped.py, the same one the release zip
+    # uses -- src/shipped_files(). A private ignore list here is how a copy
+    # install came to miss eight config.yaml files the bundle shipped: the
+    # glob "config.yaml" matched every tool directory, not just bin/.
+    cur_platform = _shipped.host_platform()
+    files = shipped_files()
+    for rel in files:
+        src = SOURCE / rel
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
     (dst / MARKER).write_text(json.dumps(
         {"skill": SKILL_NAME, "source": str(SOURCE), "mode": "copy",
          "bin_platform_included": cur_platform},

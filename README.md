@@ -195,6 +195,21 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 `--active`、`--vhost`、`--crawl`、`--brute`、`--ports` 这些**主动阶段会真实向目标发包**。
 只对自己有授权的目标启用；纯被动阶段（`onepass`/`certs`/`subs`/`icp`/`dns`）零接触目标。
 
+## 从 0.7.x 升级
+
+0.8.0 有两处对外行为变了，升级时注意：
+
+1. **`report` 默认只写 `report.md` 和 `report.html`**。要 `report.json` 得加 `--with-json`，
+   要 `report.brief.json` 得加 `--with-brief`；stdout 的 `paths` 里不再有 `json` 键。
+   脚本里原来读 `report.json` 的地方，要么改成 `report ... --with-json`，要么直接换成
+   `python findinfo.py brief --run <run_id>`（stdout 一行 JSON，不落文件，给 Agent 用）。
+2. **`icp --from-store` 要带范围**：`python findinfo.py icp --from-store --scope example.com`。
+   ICP 表是跨项目共享的，不带 `--scope` 会把整张表都发给测绘平台。
+
+另外 0.8.0 起 `doctor` 会说清"缺 key"，不再把它当失败——缺 key 的阶段记成覆盖缺口，
+run 照常完成并交付，**不要**再对它反复 `--resume`（补上 key 重跑才会好转）。
+完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 文档
 
 | 文件 | 内容 |
@@ -208,6 +223,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 | docs/TROUBLESHOOTING.md | **故障与结果推进**：常见故障、wait 判读、来源级分支、红线 |
 | docs/DEVELOPMENT.md | **开发文档**：目录结构、回归测试怎么跑（日常使用不需要看） |
 | prompts/AGENT.txt | **复制给 agent 的完整工作流提示词模板**（人工复制粘贴，不参与自动加载） |
+| CHANGELOG.md | 版本变更记录（含 0.7.x 升级注意） |
 
 最终交付长这样（`findinfo.py report` 产出的 html 看板，可打印成 PDF）：
 

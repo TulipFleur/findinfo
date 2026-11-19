@@ -9,7 +9,7 @@ nobody reads. This script makes the contents a rule instead of a memory:
     python scripts/build-release.py --platform windows
     python scripts/build-release.py --out _rel/next --version 0.7.3
 
-What goes in (one rule, shared with install.py --copy via shipped_files()):
+What goes in (one rule, in scripts/shipped.py, shared with install.py --copy):
 
   * tracked files only (git ls-files)  -> no __pycache__, no .env, no state
   * plus this platform's bin/<platform>/* (the binaries are not in git);
@@ -18,6 +18,9 @@ What goes in (one rule, shared with install.py --copy via shipped_files()):
     the agent-record tool)
   * minus files that only apply to the other platform / are only useful when
     working on the source tree, as listed in PLATFORM_ONLY
+
+shipped.py owns PLATFORM_ONLY / DEV_DIRS / DEV_FILES / SECRETS and the
+manifest itself; this script only packs, audits and sums.
 
 Secrets are never shipped: excluded_paths() drops bin/config.yaml and
 config/.env regardless of platform.
@@ -41,75 +44,35 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PLATFORMS = ("windows", "linux")
 
-# ------------------------------------------------------------ file selection
+# scripts/shipped.py holds the manifest rule shared with install.py --copy.
+# The file name has a dash, so the plain import does not work.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import shipped as _shipped                                    # noqa: E402
 
-# Files that only make sense on one platform. Never "just this one has docs":
-# every removal below has to be justified by what the file does.
-PLATFORM_ONLY = {
-    # shell installers are POSIX-only (bash); deploy/ units are systemd units
-    "linux": (),
-    "windows": (
-        "scripts/setup-linux.sh",     # installs ELF binaries via curl + tar
-        "deploy/findinfo@.service",   # systemd unit
-        "deploy/findinfo@.timer",     # systemd timer
-    ),
-}
-
-# Directories that hold developer material, not shippable skill content.
-DEV_DIRS = (
-    "tests/",          # self-check harness; pytest is not a consumer need
-    "agent-records/",  # per-session agent collaboration log
-    "rust/",           # onepass sources; rebuild from the repo, not the bundle
-    "deploy/",         # systemd units are per-platform (see PLATFORM_ONLY)
-)
-
-# Single developer files.
-DEV_FILES = (
-    "scripts/agent-record.py",   # dev record tool, unrelated to using the skill
-    "scripts/build-onepass.sh",  # build script, superseded by DEV_DIRS for both
-    "scripts/build-enscan.sh",
-)
-
-# Files that must never leave the author's machine, in any platform.
-SECRETS = (
-    "bin/config.yaml",       # ENScan cookie
-    "config/.env",           # API keys
-    "config/config.json",
-    "config/scope.json",
-)
+# Re-exported so callers and tests can keep naming one module. The manifest
+# rule itself lives in shipped.py and nowhere else; the identity checks in
+# tests/test_shipped_manifest.py depend on these being the same objects.
+PLATFORMS = _shipped.PLATFORMS
+PLATFORM_ONLY = _shipped.PLATFORM_ONLY
+DEV_DIRS = _shipped.DEV_DIRS
+DEV_FILES = _shipped.DEV_FILES
+SECRETS = _shipped.SECRETS
+TOOL_DEFAULT_CONFIGS = _shipped.TOOL_DEFAULT_CONFIGS
+host_platform = _shipped.host_platform
+tracked_files = _shipped.tracked_files
+platform_binaries = _shipped.platform_binaries
+excluded_paths = _shipped.excluded_paths
+shipped_files = _shipped.shipped_files
 
 # Runtime/packaging leftovers that should not exist in a bundle. A tracked
 # file that matches one of these is a bug, so the audit fails on them.
 FORBIDDEN_SUFFIXES = (".pyc", ".pyo")
 FORBIDDEN_PARTS = ("__pycache__", ".git")
 # Bare names that must never appear anywhere in a bundle. config.yaml is
-# deliberately NOT here: the PD tools own <tool>/config.yaml files are
-# auto-generated defaults, while our ENScan cookie lives at the different
-# path bin/config.yaml (SECRETS is path based).
+# deliberately NOT here: the file that must not ship is bin/config.yaml, our
+# ENScan cookie, and SECRETS already excludes that one by path.
 FORBIDDEN_NAMES = (".env", ".gitignore")
-# .gitignore is repo bookkeeping, not skill content.
-DEV_FILES = (*DEV_FILES, ".gitignore")
-
-
-def _norm(rel: str) -> str:
-    return rel.replace(os.sep, "/").lstrip("./") if rel.startswith("./") else rel.replace(os.sep, "/")
-
-
-def _under(rel: str, prefixes) -> bool:
-    return any(rel == p.rstrip("/") or rel.startswith(p) for p in prefixes)
-
-
-def tracked_files(root: Path = ROOT) -> list:
-    """Every file git knows about, relative and slash-separated."""
-    proc = subprocess.run(["git", "ls-files", "-z"], cwd=str(root),
-                          capture_output=True)
-    if proc.returncode != 0:
-        raise SystemExit("git ls-files failed in " + str(root) + ": "
-                         + proc.stderr.decode("utf-8", "replace"))
-    out = proc.stdout.decode("utf-8", "replace").split("\0")
-    return [_norm(p) for p in out if p]
 
 
 def platform_tool_names(platform: str, root: Path = ROOT) -> list:
@@ -123,68 +86,6 @@ def platform_tool_names(platform: str, root: Path = ROOT) -> list:
             continue
         names.append(name.replace(".exe", "") if platform == "windows" else name)
     return sorted(names)
-
-
-def platform_binaries(platform: str, root: Path = ROOT) -> list:
-    """This platform's binaries: bin/<platform>/* (not tracked in git).
-
-    Hidden support files (e.g. bin/linux/.installed-versions, the manifest
-    setup-linux.sh keeps for --check) are part of a working install, so they
-    travel too; only secrets and bytecode are filtered by excluded_paths().
-    """
-    d = root / "bin" / platform
-    if not d.is_dir():
-        return []
-    out = []
-    for p in sorted(d.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = _norm(str(p.relative_to(root)))
-        # bin/<platform>/config.yaml is the ENScan cookie the author filled
-        # in locally; the .example next to it is what ships
-        if rel in SECRETS or p.name in ("config.yaml", ".env"):
-            continue
-        out.append(rel)
-    return out
-
-
-def excluded_paths(platform: str) -> list:
-    """Absolute-in-bundle paths that must never be packed, for this platform."""
-    bad = list(SECRETS)
-    wrong = "linux" if platform == "windows" else "windows"
-    bad += platform_binaries(wrong)          # other platform's binaries
-    bad += list(PLATFORM_ONLY[platform])
-    bad += [p for p in DEV_FILES]
-    return bad
-
-
-def shipped_files(platform: str, root: Path = ROOT) -> list:
-    """The bundle manifest: sorted, slash-separated, relative paths.
-
-    This is the single rule shared with install.py --copy. If a file is not
-    here, it is not in the bundle, and nothing else decides membership.
-    """
-    if platform not in PLATFORMS:
-        raise SystemExit("unknown platform " + platform
-                         + " (choose from " + ", ".join(PLATFORMS) + ")")
-    keep = set(tracked_files(root)) | set(platform_binaries(platform, root))
-    excluded = set(excluded_paths(platform))
-
-    result = []
-    for rel in sorted(keep):
-        if rel in excluded:
-            continue
-        if _under(rel, DEV_DIRS):
-            continue
-        # never ship the other platform's binaries even if they were tracked
-        if rel.startswith("bin/") and rel.count("/") >= 1:
-            parts = rel.split("/")
-            if len(parts) > 1 and parts[1] in PLATFORMS and parts[1] != platform:
-                continue
-        if _under(rel, ("docs/",)) and rel.endswith(".pyc"):
-            continue
-        result.append(rel)
-    return result
 
 
 def is_forbidden(rel: str) -> bool:
@@ -431,11 +332,6 @@ def _version(root: Path, want: str) -> str:
     if not f.is_file():
         raise SystemExit("no VERSION file and no --version given")
     return f.read_text(encoding="utf-8").strip()
-
-
-def host_platform() -> str:
-    """The platform whose binaries this interpreter can actually run."""
-    return "windows" if os.name == "nt" else "linux"
 
 
 def _runnable_here(path: Path) -> bool:
