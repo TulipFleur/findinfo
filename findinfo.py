@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _SUBCOMMANDS = frozenset((
     "doctor", "entity", "certs", "passive", "brute", "icp", "subs", "dns",
     "probe", "ipagg", "ports", "vhost", "crawl", "extract", "report", "clean",
-    "assets", "status", "wait", "cancel", "runs", "run", "__worker",
+    "assets", "status", "wait", "cancel", "runs", "run", "brief", "__worker",
 ))
 
 
@@ -119,7 +119,8 @@ def cmd_entity(args) -> None:
     store = core.Store()
     try:
         res = tools.t_enscan(store, args.name, invest=args.invest, deep=args.deep,
-                            outdir=Path(args.out) if args.out else None)
+                             outdir=Path(args.out) if args.out else None,
+                             timeout=args.tool_timeout)
         out(res)
     finally:
         store.close()
@@ -128,7 +129,7 @@ def cmd_entity(args) -> None:
 def cmd_certs(args) -> None:
     store = core.Store()
     try:
-        out(tools.t_certs(store, args.domain))
+        out(tools.t_certs(store, args.domain, timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -143,7 +144,8 @@ def cmd_passive(args) -> None:
         merged = []
         for d in domains:
             merged.append(tools.t_onepass(store, d, sources=srcs,
-                                          min_confidence=args.min_conf))
+                                          min_confidence=args.min_conf,
+                                          timeout=args.tool_timeout))
         out({"domains": merged, "total": sum(m.get("count", 0) for m in merged)})
     finally:
         store.close()
@@ -153,7 +155,8 @@ def cmd_brute(args) -> None:
     store = core.Store()
     try:
         out(tools.t_brute(store, args.domain, wordlist=args.wordlist,
-                          bandwidth=args.bandwidth, wildcard=args.wildcard))
+                          bandwidth=args.bandwidth, wildcard=args.wildcard,
+                          timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -163,8 +166,15 @@ def cmd_icp(args) -> None:
     try:
         codes = args.code or []
         if args.from_store:
-            codes = [a["canonical"] for a in store.get_assets(kind="icp")]
-        out(tools.t_icp(store, codes, engines=args.engines))
+            # The ICP table is shared across engagements, so an unscoped
+            # --from-store reverse-lookups another project's filings. Scope it
+            # exactly like every other --from-store command does.
+            scope = [core.canon_domain(d) for d in (args.scope or [])]
+            scope = [d for d in scope if d]
+            codes = [a["canonical"] for a in
+                     store.get_assets(kind="icp", match=scope or None)]
+        out(tools.t_icp(store, codes, engines=args.engines,
+                        timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -177,7 +187,8 @@ def cmd_subs(args) -> None:
             domains = _domains_from_store(store, 0.7, args.scope)
         merged = []
         for d in domains:
-            r = tools.t_subs(store, d, engines=args.engines)
+            r = tools.t_subs(store, d, engines=args.engines,
+                             timeout=args.tool_timeout)
             merged.append(r)
         out({"domains": merged, "total": sum(m.get("count", 0) for m in merged)})
     finally:
@@ -225,7 +236,7 @@ def cmd_dns(args) -> None:
         domains = args.domain or []
         if args.from_store or not domains:
             domains = _domains_from_store(store, args.min_conf, args.scope)
-        out(tools.t_dns(store, domains))
+        out(tools.t_dns(store, domains, timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -236,7 +247,7 @@ def cmd_probe(args) -> None:
         hosts = args.host or []
         if args.from_store or not hosts:
             hosts = _domains_from_store(store, args.min_conf, args.scope)
-        out(tools.t_httpx(store, hosts))
+        out(tools.t_httpx(store, hosts, timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -244,7 +255,7 @@ def cmd_probe(args) -> None:
 def cmd_ipagg(args) -> None:
     store = core.Store()
     try:
-        out(tools.t_ipagg(store, args.ip))
+        out(tools.t_ipagg(store, args.ip, timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -253,7 +264,8 @@ def cmd_ports(args) -> None:
     store = core.Store()
     try:
         ips = args.ip or [a["canonical"] for a in store.get_assets(kind="ip")]
-        out(tools.t_ports(store, ips, top_ports=args.top_ports))
+        out(tools.t_ports(store, ips, top_ports=args.top_ports,
+                          timeout=args.tool_timeout))
     finally:
         store.close()
 
@@ -277,6 +289,7 @@ def cmd_vhost(args) -> None:
             hosts = hosts + extra
         ports = [int(p) for p in (args.ports or "80,443").split(",") if p.strip()]
         out(tools.t_vhost(store, args.ip, hosts, ports=ports, threads=args.threads,
+                          timeout=args.tool_timeout,
                           skip_live=not args.no_skip_live))
     finally:
         store.close()
@@ -301,7 +314,8 @@ def cmd_crawl(args) -> None:
             scope = [core.registrable_domain(core.split_url(u)[0] or "") or ""
                      for u in urls]
             scope = [s for s in scope if s]
-        out(tools.t_crawl(store, urls, depth=args.depth, scope_domains=scope)
+        out(tools.t_crawl(store, urls, depth=args.depth, timeout=args.tool_timeout,
+                          scope_domains=scope)
             | {"scope": scope, "scope_warning": scope_warning})
     finally:
         store.close()
@@ -337,29 +351,59 @@ def cmd_extract(args) -> None:
                     if not core.in_scope(h, only):
                         continue
                 urls.append(u)
-        out(tools.t_extract(store, rows, urls=urls))
+        out(tools.t_extract(store, rows, urls=urls, timeout=args.tool_timeout))
     finally:
         store.close()
 
 
-def cmd_report(args) -> None:
-    """Render final deliverables: JSON digest for agents, HTML dashboard for humans.
+# Above this size a --print-json payload swamps an agent context;
+# the caller still gets its data, but is told where the brief is.
+PRINT_JSON_WARN_BYTES = 64 * 1024
 
-    Scope is a suffix filter (--match) because the asset store is shared across
-    engagements. Without it the report silently includes every other project's
-    rows; the collector falls back to the latest run's target and says so.
-    An explicit --match that canon_domain() rejects entirely is an ERROR, not a
-    silent fallback to the whole library.
+
+def _report_coverage(run_id: str) -> dict:
+    """Read the coverage block of a finished run, for the agent brief.
+
+    report.collect() reads the asset graph and knows nothing about which
+    stages ran; the gaps live in the run state. The brief must carry them or
+    an agent reads "nothing found" as "nothing there".
     """
+    if not run_id:
+        return {}
+    try:
+        st = jobs.derive(jobs.read_state(run_id))
+    except Exception:
+        return {}
+    cov = st.get("coverage") or (st.get("result") or {}).get("coverage") or {}
+    return dict(cov) if isinstance(cov, dict) else {}
+
+
+def _resolve_report_scope(args) -> list:
+    """Shared scope resolution for report and brief: validate --match, then
+    fall back to the run's own scope. Both commands answer the same question
+    ("what does the library hold for this target") so they must reject and
+    resolve scopes identically -- an agent switching between them should
+    never see one command accept what the other refuses."""
     if args.match and not core.canon_scope(args.match):
         raise core.FindInfoError(
             "no valid domain in --match: " + ",".join(args.match) +
             " (a garbage scope must fail loudly, not degrade to a full-library report)")
-    # A report must read the SAME library the run wrote to. core.Store() has
-    # already resolved HOME/TASK from the environment at import time, so if the
-    # caller quoted --run from another task, this process would open the wrong
-    # database and cheerfully produce an empty report (rc=0). Refuse loudly and
-    # say what to pass instead.
+    match = list(args.match or [])
+    if not match and args.run:
+        # Fall back to the run's own scope: a run started with two seeds
+        # (example.com + example.org) must not have half its assets reported as
+        # out-of-scope noise just because the caller quoted one seed.
+        spec = jobs.read_spec(args.run)
+        scope = core.canon_scope(spec.get("scope") or [])
+        if scope:
+            match = scope
+            core.log("scope from run " + str(args.run) + " -> " + ",".join(scope))
+    return match
+
+
+def _require_run_task(args) -> None:
+    """A library read must hit the SAME library the run wrote to (see the
+    long comment in cmd_report). Extracted so brief gets the same guard."""
     if args.run and not os.environ.get("FINDINFO_TASK", ""):
         try:
             _spec = jobs.read_spec(args.run)
@@ -370,19 +414,24 @@ def cmd_report(args) -> None:
             raise core.FindInfoError(
                 "run " + str(args.run) + " belongs to task '" + _want +
                 "'; re-run with: python findinfo.py --task " + _want +
-                " report --run " + str(args.run) +
+                " " + str(getattr(args, "_sub", "report")) +
+                " --run " + str(args.run) +
                 " (without it this process reads the shared library and "
                 "would report an empty scope)")
-    match = list(args.match or [])
-    if not match and args.run:
-        # Fall back to the run's own scope: a run started with two seeds
-        # (example.com + example.org) must not have half its assets reported as
-        # out-of-scope noise just because the caller quoted one seed.
-        spec = jobs.read_spec(args.run)
-        scope = core.canon_scope(spec.get("scope") or [])
-        if scope:
-            match = scope
-            core.log("report: scope from run " + str(args.run) + " -> " + ",".join(scope))
+
+
+def cmd_brief(args) -> None:
+    """Agent read API: query the library, print ONE brief JSON to stdout.
+
+    This is the unified entry an agent uses instead of opening report files:
+    same facts as report.brief.json (counts, coverage gaps, top hosts,
+    internal services, leaks, next steps) with the same hard byte ceiling,
+    but it never writes a file -- stdout is the deliverable. `report` is the
+    human-facing command (md/html); scripts wanting the full digest use
+    `assets --export` or `report --with-json`.
+    """
+    _require_run_task(args)
+    match = _resolve_report_scope(args)
     store = core.Store()
     try:
         data = report.collect(store, match=match or None, min_conf=args.min_conf,
@@ -390,15 +439,68 @@ def cmd_report(args) -> None:
                               engagement=args.engagement)
     finally:
         store.close()
+    coverage = _report_coverage(args.engagement)
+    brief = report.build_brief(data, top=args.top,
+                               max_bytes=args.max_bytes,
+                               coverage=coverage)
+    brief["note"] = ("Agent 统一入口：直接查库不落文件。report 只产出人看的 md/html；"
+                     "全量数据用 assets --export 或 report --with-json。")
+    out(brief)
+
+
+def cmd_report(args) -> None:
+    """Render the human deliverables: md + html for people.
+
+    Agent reads happen through `brief` (query the library, stdout only) or
+    `assets --export` (full rows for scripts). The machine files
+    (report.json / report.brief.json) are opt-in via --with-json so a human
+    delivery does not write files nobody opens.
+
+    Scope is a suffix filter (--match) because the asset store is shared across
+    engagements. Without it the report silently includes every other project's
+    rows; the collector falls back to the latest run's target and says so.
+    An explicit --match that canon_domain() rejects entirely is an ERROR, not a
+    silent fallback to the whole library.
+    """
+    args._sub = "report"
+    _require_run_task(args)
+    match = _resolve_report_scope(args)
+    store = core.Store()
+    try:
+        data = report.collect(store, match=match or None, min_conf=args.min_conf,
+                              limit=args.limit, ep_limit=args.ep_limit,
+                              engagement=args.engagement)
+    finally:
+        store.close()
+    # The brief has to state what the collection could NOT do, so pull the
+    # run's coverage snapshot; --engagement is the run id it reads from.
+    coverage = _report_coverage(args.engagement)
     paths = report.write_bundle(data, out_dir=args.out, slug=args.slug,
-                                json_limit=args.json_limit)
+                                json_limit=args.json_limit,
+                                with_json=args.with_json,
+                                with_brief=args.with_brief,
+                                # getattr: a hand-built Namespace (tests, callers)
+                                # should not have to know every new knob
+                                brief_top=getattr(args, "brief_top", None),
+                                brief_max_bytes=getattr(args, "brief_max_bytes", None),
+                                coverage=coverage)
     res = {"counts": data["counts"], "scope": data["scope"],
            "paths": paths, "warnings": data["environment"]["warnings"],
-           "next_steps": data["next_steps"][:3]}
+           "next_steps": data["next_steps"][:3],
+           "note": "agent 数据请用 brief 命令（stdout 一行 JSON）；机器文件仅在 --with-json/--with-brief 时生成"}
     if args.print_md:
         res["md"] = report.build_md(data)
     if args.print_json:
         res["json"] = data
+        # --print-json keeps its old behaviour, but a caller has to be told
+        # when the payload is big enough to swamp an agent context.
+        size = len(json.dumps(data, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8"))
+        if size > PRINT_JSON_WARN_BYTES:
+            sys.stderr.write(
+                "warning: --print-json returned " + str(size // 1024) + " KB of JSON; "
+                "an agent context should use the brief command instead "
+                "(stdout, <= " + str(report.BRIEF_MAX_BYTES // 1024) + " KB)\n")
     out(res)
 
 
@@ -808,14 +910,12 @@ def _plan_stages(args, active) -> list:
 
 
 def _engine_key(engine: str) -> bool:
-    name = (engine or "").strip().lower()
-    if not name:
-        return False
-    if name == "fofa":
-        return bool(core.api_key("fofa") or core.api_base("fofa"))
-    if name == "censys":
-        return bool(core.api_key("censys") or core.api_key("censys_id"))
-    return bool(core.api_key(name))
+    """Whether the mapping engine has a usable credential.
+
+    Delegates to core.engine_has_key so the coverage report and the uncover
+    gating in lib/tools.py can never disagree about which engines are usable.
+    """
+    return core.engine_has_key(engine)
 
 
 def _coverage_unavailable(args, active) -> dict:
@@ -1494,7 +1594,13 @@ def _run_pipeline(args) -> int:
                                                              core.OUTCOME_TIMEOUT)})) + ")",
                     result=res)
             return res
-        _stage(store, run_dir, summary, "subs", {"seeds": seeds, "engines": args.engines},
+        # The usable-engine set is part of the input hash on purpose: adding a
+        # mapping key must re-run this stage instead of hitting a checkpoint
+        # written when the engine had no key (which recorded "unavailable").
+        _usable_engines, _ = core.split_engines(args.engines)
+        _stage(store, run_dir, summary, "subs",
+               {"seeds": seeds, "engines": args.engines,
+                "usable_engines": _usable_engines},
                args, _subs,
                lambda r: ({"found": r["found"]} |
                           ({"quota_exhausted": True} if r.get("quota_exhausted") else {})))
@@ -1875,6 +1981,19 @@ def cmd_run(args) -> int:
 
 
 # ---------------------------------------------------------------- parser
+def _add_tool_timeout(parser) -> None:
+    """Give a single-stage subcommand the same --tool-timeout contract as run.
+
+    Each stage shells out to an external binary; without this flag an agent has
+    no way to bound a slow tool except by killing the whole session, which is
+    exactly what the docs used to claim it could do. Default 0 means "use the
+    tool's own default", matching run's semantics.
+    """
+    parser.add_argument(
+        "--tool-timeout", type=int, default=0,
+        help="per-tool timeout in seconds (0 = the tool's own default)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="findinfo",
                                 description="asset reconnaissance skill for AI agents")
@@ -1896,16 +2015,21 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--invest", type=int, default=51)
     e.add_argument("--deep", type=int, default=2)
     e.add_argument("--out", default="")
+    _add_tool_timeout(e)
     e.set_defaults(func=cmd_entity)
 
     c = sub.add_parser("certs", help="certificate transparency expansion")
     c.add_argument("--domain", required=True)
+    _add_tool_timeout(c)
     c.set_defaults(func=cmd_certs)
 
     i = sub.add_parser("icp", help="ICP record -> domains (fofa/quake/hunter)")
     i.add_argument("--code", action="append", help="repeatable")
     i.add_argument("--from-store", action="store_true")
     i.add_argument("--engines", default="fofa,quake,hunter")
+    i.add_argument("--scope", action="append",
+                    help="limit --from-store to these domain suffixes (repeatable); the ICP table is shared, so without it every project's filings match")
+    _add_tool_timeout(i)
     i.set_defaults(func=cmd_icp)
 
     pa = sub.add_parser("passive", help="15-source passive collection via bundled Rust onepass")
@@ -1914,6 +2038,7 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--sources", default="", help="comma separated source ids (see: onepass sources)")
     pa.add_argument("--min-conf", type=float, default=0.0)
     pa.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    _add_tool_timeout(pa)
     pa.set_defaults(func=cmd_passive)
 
     br = sub.add_parser("brute", help="DNS brute force via ksubdomain (ACTIVE, needs Npcap)")
@@ -1921,6 +2046,7 @@ def build_parser() -> argparse.ArgumentParser:
     br.add_argument("--wordlist", default="wordlists/sub.txt")
     br.add_argument("--bandwidth", default="3m", help="3m/5m/10m, lower = politer")
     br.add_argument("--wildcard", default="basic", choices=["basic", "advanced", "none"])
+    _add_tool_timeout(br)
     br.set_defaults(func=cmd_brute)
 
     sb = sub.add_parser("subs", help="passive subdomain enumeration")
@@ -1928,6 +2054,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--from-store", action="store_true")
     sb.add_argument("--engines", default="fofa,quake,hunter,shodan,censys")
     sb.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    _add_tool_timeout(sb)
     sb.set_defaults(func=cmd_subs)
 
     dn = sub.add_parser("dns", help="resolve + wildcard filtering")
@@ -1935,6 +2062,7 @@ def build_parser() -> argparse.ArgumentParser:
     dn.add_argument("--from-store", action="store_true")
     dn.add_argument("--min-conf", type=float, default=0.4)
     dn.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    _add_tool_timeout(dn)
     dn.set_defaults(func=cmd_dns)
 
     pr = sub.add_parser("probe", help="httpx liveness / tech / ip mapping (ACTIVE)")
@@ -1942,15 +2070,18 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--from-store", action="store_true")
     pr.add_argument("--min-conf", type=float, default=0.7)
     pr.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    _add_tool_timeout(pr)
     pr.set_defaults(func=cmd_probe)
 
     ia = sub.add_parser("ipagg", help="group domains by ip, drop CDN")
     ia.add_argument("--ip", action="append")
+    _add_tool_timeout(ia)
     ia.set_defaults(func=cmd_ipagg)
 
     po = sub.add_parser("ports", help="naabu port scan (ACTIVE)")
     po.add_argument("--ip", action="append")
     po.add_argument("--top-ports", type=int, default=1000)
+    _add_tool_timeout(po)
     po.set_defaults(func=cmd_ports)
 
     vh = sub.add_parser("vhost", help="Host header collision -> internal services (ACTIVE)")
@@ -1966,6 +2097,7 @@ def build_parser() -> argparse.ArgumentParser:
     vh.add_argument("--threads", type=int, default=20)
     vh.add_argument("--no-skip-live", action="store_true",
                     help="collide even hosts already confirmed live (default: skip them)")
+    _add_tool_timeout(vh)
     vh.set_defaults(func=cmd_vhost)
 
     cr = sub.add_parser("crawl", help="katana crawl (ACTIVE)")
@@ -1977,6 +2109,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "--from-store it also limits which URLs are picked up. "
                          "Without it the scope is derived from the seed URLs' "
                          "registrable domains.")
+    _add_tool_timeout(cr)
     cr.set_defaults(func=cmd_crawl)
 
     ex = sub.add_parser("extract", help="leaked domains/IPs from crawl output")
@@ -1987,6 +2120,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="restrict --from-store URLs to these domains (repeatable); "
                          "avoids re-fetching another engagement's historical assets")
     ex.add_argument("--url", action="append")
+    _add_tool_timeout(ex)
     ex.set_defaults(func=cmd_extract)
 
     as_ = sub.add_parser("assets", help="list / export asset graph")
@@ -1997,7 +2131,7 @@ def build_parser() -> argparse.ArgumentParser:
     as_.add_argument("--export", default="")
     as_.set_defaults(func=cmd_assets)
 
-    rp = sub.add_parser("report", help="final deliverables: report.json (agent) + report.html (human)")
+    rp = sub.add_parser("report", help="human deliverables: report.md + report.html (agent reads use `brief`)")
     rp.add_argument("--match", action="append",
                     help="scope to these domain suffixes (repeatable); with --run and "
                          "no --match the run's own scope is used")
@@ -2012,8 +2146,42 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--slug", default="", help="label for the default output dir")
     rp.add_argument("--engagement", default="default", help="read stage checkpoints for this run id")
     rp.add_argument("--print-md", action="store_true", help="also return the markdown text")
-    rp.add_argument("--print-json", action="store_true", help="also return the full digest")
+    rp.add_argument("--brief-top", type=int, default=20,
+                    help="kept in report.brief.json when --with-brief is given "
+                         "(default 20; the brief command has its own --top)")
+    rp.add_argument("--brief-max-bytes", type=int, default=32768,
+                    help="byte ceiling for report.brief.json; arrays shrink to fit "
+                         "and every cut is recorded in its truncated field")
+    rp.add_argument("--with-brief", action="store_true",
+                    help="also write report.brief.json (off by default: agents use "
+                         "the brief command, which prints to stdout)")
+    rp.add_argument("--with-json", action="store_true",
+                    help="also write report.json, the full machine digest "
+                         "(off by default: scripts use assets --export)")
+    rp.add_argument("--print-json", action="store_true",
+                    help="also return the FULL digest on stdout -- several hundred "
+                         "KB on a large target, which will flood an agent "
+                         "context; use the brief command instead")
     rp.set_defaults(func=cmd_report)
+
+    bf = sub.add_parser("brief",
+                        help="agent read API: query the library, print ONE "
+                             "brief JSON to stdout (no files written)")
+    bf.add_argument("--match", action="append",
+                    help="scope to these domain suffixes (repeatable); with --run "
+                         "and no --match the run's own scope is used")
+    bf.add_argument("--run", default="",
+                    help="take the scope from this run id when --match is omitted")
+    bf.add_argument("--min-conf", type=float, default=0.3)
+    bf.add_argument("--limit", type=int, default=300, help="hosts kept in the digest")
+    bf.add_argument("--ep-limit", type=int, default=400, help="endpoints kept in the digest")
+    bf.add_argument("--engagement", default="default", help="read stage checkpoints for this run id")
+    bf.add_argument("--top", type=int, default=20,
+                    help="high-priority hosts kept in the brief (default 20)")
+    bf.add_argument("--max-bytes", type=int, default=32768,
+                    help="byte ceiling for the brief payload; arrays shrink to fit "
+                         "and every cut is recorded in its truncated field")
+    bf.set_defaults(func=cmd_brief)
 
     cl = sub.add_parser("clean", help="trim the shared asset graph (keep/match/all)")
     cl.add_argument("--keep", action="append",

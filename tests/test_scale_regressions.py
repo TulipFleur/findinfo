@@ -69,6 +69,8 @@ def test_report_scope_comes_from_run_when_match_omitted():
     args = argparse.Namespace(match=None, min_conf=0.0, limit=50, ep_limit=50,
                               json_limit=0, out=str(Path(core.HOME) / "rep"),
                               slug="scope", engagement="default", run=rd.name,
+                              brief_top=20, brief_max_bytes=32768,
+                              with_json=False, with_brief=False,
                               print_md=False, print_json=False)
     buf = io.StringIO()
     with redirect_stdout(buf):

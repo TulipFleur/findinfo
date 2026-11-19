@@ -1307,11 +1307,15 @@ def build_html(data) -> str:
 
 
 # ---------------------------------------------------------------- write
-def write_bundle(data, out_dir=None, slug=None, json_limit=None) -> dict:
-    """Write report.json + report.md + report.html; returns the paths.
+def write_bundle(data, out_dir=None, slug=None, json_limit=None,
+                 with_json=False, with_brief=False, brief_top=None,
+                 brief_max_bytes=None, coverage=None) -> dict:
+    """Write the human deliverables (md + html); machine files are opt-in.
 
-    json_limit caps the machine digest (hosts/endpoints arrays) so an agent can
-    always read it whole; the html/md keep the fuller human view.
+    Default output is what people open: report.md and report.html. The agent
+    read path is the `brief` command (library query -> stdout, no file), so
+    report.brief.json and report.json are only written when a script asks
+    for them (--with-brief / --with-json). json_limit caps digest arrays.
     """
     c = data["counts"]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1332,12 +1336,18 @@ def write_bundle(data, out_dir=None, slug=None, json_limit=None) -> dict:
         digest["truncated"]["by_json_limit"] = json_limit
 
     paths = {}
-    p = base / "report.json"
-    # Compact, not indented: this file is read by an agent (or jq), and the
-    # pretty form roughly doubles the bytes for no readability gain at 100 KB.
-    p.write_text(json.dumps(digest, ensure_ascii=False, separators=(",", ":")),
-                 encoding="utf-8")
-    paths["json"] = str(p)
+    if with_brief:
+        paths["brief"] = write_brief(data, base, top=brief_top,
+                                     max_bytes=brief_max_bytes,
+                                     coverage=coverage)["path"]
+    if with_json:
+        p = base / "report.json"
+        # Compact, not indented: this file is read by a script, and the
+        # pretty form roughly doubles the bytes for no readability gain
+        # at 100 KB.
+        p.write_text(json.dumps(digest, ensure_ascii=False, separators=(",", ":")),
+                     encoding="utf-8")
+        paths["json"] = str(p)
     p = base / "report.md"
     p.write_text(build_md(data), encoding="utf-8")
     paths["md"] = str(p)
@@ -1366,3 +1376,250 @@ def write_bundle(data, out_dir=None, slug=None, json_limit=None) -> dict:
         except OSError:
             pass
     return paths
+
+
+# ------------------------------------------------------------ agent brief
+# An agent should never open report.json: the digest is sized for scripts and
+# downstream tools, and at 1000+ domains it runs to several hundred KB. The
+# brief is the file an agent reads: same facts, hard byte ceiling, and every
+# cut is stated in "truncated" so a short brief can never be mistaken for a
+# complete one.
+BRIEF_SCHEMA = "findinfo.brief/1"
+BRIEF_TOP = 20              # default number of high-priority hosts
+BRIEF_LEAKS = 20            # default number of leak examples
+BRIEF_MAX_BYTES = 32 * 1024
+BRIEF_MAX_COVERAGE = 40
+
+_BRIEF_HOST_FIELDS = ("host", "score", "priority", "reasons", "provenance")
+
+
+def _brief_host(h):
+    """Only the fields an agent branches on; cosmetic detail stays in report.json."""
+    out = {}
+    for k in _BRIEF_HOST_FIELDS:
+        out[k] = h.get(k)
+    # without these three a finding cannot be acted on without a second lookup
+    for k in ("status", "ip", "internal"):
+        if h.get(k) not in (None, "", False):
+            out[k] = h[k]
+    return out
+
+
+def _brief_coverage(data=None, coverage=None):
+    """Failed / not-run / unavailable stages, each with a human-readable why.
+
+    This is the part agents get wrong most often: a run with three unavailable
+    sources is not the same as a run with nothing found, and a brief that only
+    lists findings cannot tell the two apart.
+    """
+    # Callers pass either a whole digest (data) or a ready coverage block; both
+    # have to end up in the same shape, or a caller-supplied block silently
+    # keeps its raw dict-of-lists form and the agent gets inconsistent output.
+    if coverage is None:
+        coverage = (data or {}).get("coverage")
+    cov = coverage or {}
+    unavail = cov.get("unavailable") or {}
+    unavailable = []
+    for key, entries in unavail.items():
+        if isinstance(entries, dict):
+            entries = list(entries.items())
+        if not isinstance(entries, (list, tuple)):
+            unavailable.append({"kind": key, "reason": str(entries)})
+            continue
+        for item in entries:
+            if isinstance(item, dict):
+                row = dict(item)
+                row.setdefault("kind", key)
+                unavailable.append(row)
+            else:
+                unavailable.append({"kind": key, "reason": str(item)})
+    return {
+        "failed_stages": [dict(x) for x in (cov.get("failed_stages") or [])
+                          if isinstance(x, dict)],
+        "not_run_stages": list(cov.get("not_run_stages") or []),
+        "skipped_stages": list(cov.get("skipped_stages") or []),
+        "unavailable": unavailable[:BRIEF_MAX_COVERAGE],
+        "unavailable_total": len(unavailable),
+    }
+
+
+def build_brief(data, top=None, leak_limit=None, max_bytes=None, coverage=None) -> dict:
+    """Shape one collection pass into a brief small enough to read whole.
+
+    Only what an agent needs to decide the next action: how much was found,
+    what the collection could not do, the highest-priority hosts, every
+    internal service, leak counts, and the suggested next steps. The big
+    arrays (all hosts, endpoints, signals, charts) stay in report.json.
+    """
+    top = BRIEF_TOP if top is None else max(int(top), 0)
+    leak_limit = BRIEF_LEAKS if leak_limit is None else max(int(leak_limit), 0)
+    max_bytes = BRIEF_MAX_BYTES if max_bytes is None else int(max_bytes)
+
+    counts = dict(data.get("counts") or {})
+    hosts_all = data.get("hosts_all") or data.get("hosts") or []
+    ranked = [h for h in hosts_all if h.get("priority") in ("high", "medium")]
+    if not ranked:
+        ranked = hosts_all
+    leaks = data.get("leaks") or {}
+    internal = data.get("internal_services") or []
+
+    brief = {
+        "schema": BRIEF_SCHEMA,
+        "generated_at": data.get("generated_at") or core.now(),
+        "note": ("Agent 读这个文件。report.json 是给脚本和下游工具的全量数据，"
+                 "体积大，不要整份读进上下文。"),
+        "scope": dict(data.get("scope") or {}),
+        "counts": counts,
+        "environment": {
+            "warnings": list((data.get("environment") or {}).get("warnings") or [])},
+        "coverage": _brief_coverage(data, coverage),
+        "top_hosts": [_brief_host(h) for h in ranked[:top]],
+        "top_hosts_total": len(ranked),
+        "internal_services": [_brief_host(h) for h in internal],
+        "internal_services_total": len(internal),
+        "leaks": {
+            "domains_total": counts.get("leak_domains", len(leaks.get("domains") or [])),
+            "ips_total": counts.get("leak_ips", len(leaks.get("ips") or [])),
+            "domains": list(leaks.get("domains") or [])[:leak_limit],
+            "ips": list(leaks.get("ips") or [])[:leak_limit],
+            "private_ips": list(leaks.get("private_ips") or [])[:leak_limit],
+        },
+        "next_steps": list(data.get("next_steps") or []),
+        "truncated": {},
+    }
+
+    # -- first the explicit caps the caller asked for -----------------------
+    if len(ranked) > len(brief["top_hosts"]):
+        brief["truncated"]["top_hosts"] = {
+            "kept": len(brief["top_hosts"]), "total": len(ranked),
+            "hint": "--brief-top 调整；完整列表在 report.json 的 hosts"}
+    if len(internal) > len(brief["internal_services"]):
+        brief["truncated"]["internal_services"] = {
+            "kept": len(brief["internal_services"]), "total": len(internal),
+            "hint": "完整列表在 report.json 的 internal_services"}
+    for key in ("domains", "ips"):
+        total = brief["leaks"][key + "_total"]
+        kept = len(brief["leaks"][key])
+        if total > kept:
+            brief["truncated"]["leaks." + key] = {"kept": kept, "total": total}
+
+    # -- then the hard byte ceiling ----------------------------------------
+    # brief_bytes/brief_max_bytes are part of the file, so the ceiling has to
+    # be measured under a payload that already carries them; otherwise the
+    # final write is a few bytes larger than what was measured and the
+    # promise "never exceeds max_bytes" is off by a rounding error.
+    brief["brief_bytes"] = 0
+    brief["brief_max_bytes"] = max_bytes
+    brief["truncated"].update(_shrink_brief(brief, max_bytes))
+    brief["brief_bytes"] = _brief_size(brief)
+    # one final pass in case the number itself pushed it over
+    if brief["brief_bytes"] > max_bytes:
+        extra = _shrink_brief(brief, max_bytes)
+        if extra:
+            brief["truncated"].update(extra)
+        brief["brief_bytes"] = _brief_size(brief)
+    return brief
+
+
+def _brief_size(brief) -> int:
+    return len(json.dumps(brief, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8"))
+
+
+def _shrink_brief(brief, max_bytes) -> dict:
+    """Cut the cheapest things first until the brief fits, recording each cut.
+
+    Order matters: prose goes before findings, findings go before counts, and
+    the coverage gaps shrink last because a brief without them reads as a
+    complete result.
+    """
+    cuts = {}
+
+    def fits():
+        return _brief_size(brief) <= max_bytes
+
+    if fits():
+        return cuts
+
+    # 1. prose first
+    brief.pop("note", None)
+    if fits():
+        cuts["note"] = "已省略说明文字以压缩体积"
+        return cuts
+
+    # 2. leak examples -- cut by count first, the counts are never lost
+    for key, total_key in (("domains", "domains_total"), ("ips", "ips_total"),
+                           ("private_ips", None)):
+        arr = list(brief["leaks"].get(key) or [])
+        while arr and not fits():
+            arr.pop()
+        brief["leaks"][key] = arr
+        if total_key:
+            # only a real drop counts: a total shared with another array
+            # would otherwise mark an array that lost nothing
+            kept = len(arr)
+            if kept < brief["leaks"].get(total_key, 0):
+                cuts["leaks." + key] = {"kept": kept,
+                                        "total": brief["leaks"][total_key]}
+    if fits():
+        return cuts
+
+    # 3. per-host detail before per-host count: a rank with one host and
+    # every reason is more useful than twenty hosts with none. The field
+    # is where the bytes actually are (a reason is a full sentence).
+    for h in brief["top_hosts"]:
+        h["reasons"] = (h.get("reasons") or [])[:2]
+        h["provenance"] = (h.get("provenance") or [])[:3]
+    cuts["detail"] = "reasons 截到 2 条，provenance 截到 3 条"
+    if fits():
+        return cuts
+
+    # 4. internal services: they are findings, so only trim the tail
+    while len(brief["internal_services"]) > 1 and not fits():
+        brief["internal_services"].pop()
+    if len(brief["internal_services"]) < brief["internal_services_total"]:
+        cuts["internal_services"] = {
+            "kept": len(brief["internal_services"]),
+            "total": brief["internal_services_total"]}
+    if fits():
+        return cuts
+
+    # 5. only now start dropping high-priority hosts, worst rank first
+    while len(brief["top_hosts"]) > 1 and not fits():
+        brief["top_hosts"].pop()
+    cuts["top_hosts"] = {"kept": len(brief["top_hosts"]),
+                         "total": brief["top_hosts_total"]}
+    if fits():
+        return cuts
+
+    # 6. last resort: shrink the gaps and next steps, and SAY so loudly
+    while brief["coverage"]["unavailable"] and not fits():
+        brief["coverage"]["unavailable"].pop()
+    while len(brief["next_steps"]) > 2 and not fits():
+        brief["next_steps"].pop()
+    cuts["coverage"] = {
+        "kept": len(brief["coverage"]["unavailable"]),
+        "total": brief["coverage"].get("unavailable_total", 0)}
+    return cuts
+
+
+def write_brief(data, base, top=None, leak_limit=None, max_bytes=None,
+                coverage=None) -> dict:
+    """Write report.brief.json next to report.json; returns path + stats."""
+    brief = build_brief(data, top=top, leak_limit=leak_limit,
+                        max_bytes=max_bytes, coverage=coverage)
+    p = Path(base) / "report.brief.json"
+    blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+    p.write_text(blob, encoding="utf-8")
+    # brief_bytes is written INTO the file, so its own digit count can shift
+    # the total. Re-state the real size and rewrite once if it moved.
+    actual = len(blob.encode("utf-8"))
+    if brief.get("brief_bytes") != actual:
+        brief["brief_bytes"] = actual
+        blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+        if len(blob.encode("utf-8")) != actual:
+            brief["brief_bytes"] = len(blob.encode("utf-8"))
+            blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+        p.write_text(blob, encoding="utf-8")
+    return {"path": str(p), "bytes": len(blob.encode("utf-8")),
+            "truncated": brief["truncated"]}

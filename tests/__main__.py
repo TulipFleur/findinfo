@@ -46,6 +46,11 @@ MODULES = [
     "tests.test_tool_inventory",
     "tests.test_host_reap",
     "tests.test_env_selfcheck",
+    "tests.test_zero_key_run",
+    "tests.test_version_parsing",
+    "tests.test_report_brief",
+    "tests.test_brief_command",
+    "tests.test_release_bundle",
 ]
 
 

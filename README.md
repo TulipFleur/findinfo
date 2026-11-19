@@ -93,7 +93,8 @@ skill 假定宿主满足三件事：**本地 Python ≥3.10**、**能执行仓�
 
     cd <本目录>
 
-    # Linux：先装原生二进制（Windows 用内置 bin/*.exe，跳过这步）
+    # Linux 发布包：先装原生二进制（Windows 包内置 bin/windows/*.exe，跳过这步）
+    # Windows 发布包里没有 setup-linux.sh，脚本只随 Linux 包分发
     bash scripts/setup-linux.sh --dry-run   # 看计划
     bash scripts/setup-linux.sh --cap       # 安装 + 授权 CAP_NET_RAW
 
@@ -120,7 +121,8 @@ skill 假定宿主满足三件事：**本地 Python ≥3.10**、**能执行仓�
     python findinfo.py wait  --run <run_id> --timeout 30
     python findinfo.py status --run <run_id>
 
-    # 6) 交付：一套给人看（html/md），一套给 AI 读（json）
+    # 6) 交付：agent 用 brief 查库读数（stdout 一行 JSON），report 出人看的 html/md
+    python findinfo.py brief --match example.com
     python findinfo.py report --match example.com
 
     # 7) 导出全量（喂下游扫描器）
@@ -150,7 +152,8 @@ findinfo 是给 AI agent 调用的：装好之后，用一段提示词让 agent 
    继续等同一个 run_id；不要重启、不要提前宣布完成
 4) 结果：state=completed → python findinfo.py status --run <run_id> 读 result/coverage；
    失败/中断 → run --resume <run_id> 断点续跑；预算用尽 → 如实说明覆盖不完整
-5) 交付：python findinfo.py report --match {{TARGET}}，
+5) 交付：python findinfo.py brief --match {{TARGET}}（你读的，stdout 一行 JSON）+
+   python findinfo.py report --match {{TARGET}}（人看的 md/html），
    最终说明必须写清 结束原因（complete/partial/failed/cancelled）、已执行/失败/未执行阶段、覆盖缺口与产物路径
 ```
 
@@ -167,6 +170,10 @@ findinfo 是给 AI agent 调用的：装好之后，用一段提示词让 agent 
 
 纯被动阶段（`onepass` / `certs` / `subs`）里的 onepass 有 8 个免 key 数据源，不配任何 key 也能出结果；
 下面这些是**扩展覆盖**用的，按需申请。填进 `config/.env`（`cp config/.env.example config/.env`）。
+
+**缺 key 不是失败：** 没配 key 的测绘引擎会被记为 `unavailable`（覆盖缺口），
+`uncover` 根本不会带着空 key 去跑。阶段照常完成、`run` 以 `complete`/`partial` 结束，
+退出码不是 5。补上 key 后重跑同一目标，`subs` 会因输入哈希变化而真正重跑，不会被旧断点跳过。
 
 | 用途 | 字段 | 申请地址 | 免费额度 |
 |---|---|---|---|
@@ -234,7 +241,7 @@ python scripts/install.py --verify   # 在每个客户端路径上实跑 doctor
 
 ## 内置工具
 
-二进制随仓库分发、开箱即用（Linux 端用 `scripts/setup-linux.sh` 安装），能力矩阵与每个命令的详细参数见 [docs/TOOLS.md](docs/TOOLS.md)；在场/可执行/版本自检用 `python findinfo.py doctor`。
+二进制随发布包分发、开箱即用（Linux 包里用 `scripts/setup-linux.sh` 现场安装，该脚本只在 Linux 包中提供），能力矩阵与每个命令的详细参数见 [docs/TOOLS.md](docs/TOOLS.md)；在场/可执行/版本自检用 `python findinfo.py doctor`。
 
 
 ## 核心设计

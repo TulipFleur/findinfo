@@ -46,9 +46,9 @@ python findinfo.py doctor
 }
 ```
 
-**`source` / `tools_summary`**：`bundle` = 解析到 `<skill>/bin`（自包含，推荐）；`path` = 从 `PATH` 借的，
-可能根本不是同一个工具（Kali 的 `python3-httpx` 就占着 `/usr/bin/httpx`，此时会给 `suspect` + `hint`）。
-`all_in_bin: true` 是“13 个工具全在 skill 目录且都能执行”的机器可读结论。
+**`source` / `tools_summary`**：`source` 固定为 `bundle`——`core.tool()` 只查 `bin/<platform>/`，
+**不回退 `PATH`、也不回退扁平 `bin/`**（`outside_bin` 因此恒为空，保留字段仅为兼容旧调用方）。
+`all_in_bin: true` 是“全部内置工具都在 skill 目录且都能执行”的机器可读结论（数量见 ）。
 
 **`environment`（宿主前提）**：`python_ok` = 解释器 ≥3.10（代码用 PEP 604 语法，低版本阶段必 SyntaxError）；
 `not_executable` = 在场但本机**执行不了**的二进制（沙箱剥执行位/拦截未知二进制 → 条目给 `executable:false` + 原因 hint）；
@@ -669,9 +669,10 @@ python findinfo.py clean --all --vacuum                            # 全清
 **防止污染**：`passive/subs/dns/probe/vhost/extract --from-store` 都支持 `--scope X`
 （vhost 用 `--domain`），只读该域下的资产。**开新任务时务必带上**，否则会继承上一个目标的资产。
 
-## report — 最终交付（给 AI 的 json / 给人的 html）
+## report — 人的交付物（md / html）
 
-把资产图整理成两套最终产物。**不改库、不发包**，纯读 SQLite。
+把资产图整理成给人看的最终产物。**不改库、不发包**，纯读 SQLite。
+Agent 读数用 `brief` 命令（stdout 一行 JSON，不落文件）；脚本要全量数据用 `assets --export`。
 
 **范围判定按资产类型**：域名按后缀；URL 先解析出主机名再判；IP 按其归属域名（assets.parent）判——共享 IP 只表示"该范围内有域名解析到它"，不是独占归属。**显式传入非法 `--match`（没有一个是合法域名）会直接报错退出**，不会静默退化成整库报告。未传 `--match` 时回落到最近一次 run 的目标并给出告警。
 
@@ -679,7 +680,7 @@ python findinfo.py clean --all --vacuum                            # 全清
 python findinfo.py report                                  # 范围 = 最近一次 run 的目标域
 python findinfo.py report --match example.com --match example.org --slug example
 python findinfo.py report --print-md                       # 额外回显 markdown 正文
-python findinfo.py report --json-limit 40                  # 截断 json 里的大数组（省 token）
+python findinfo.py report --with-json --json-limit 40      # 顺便写 report.json（脚本用）
 python findinfo.py report --out ./out --limit 80 --ep-limit 200
 ```
 
@@ -688,9 +689,10 @@ Windows 无软链权限时退化为 `reports/latest.txt`）
 
 | 文件 | 读者 | 说明 |
 |---|---|---|
-| `report.json` | agent / 脚本 | 完整结论 + 来源标注 + `charts`；单行紧凑 JSON |
-| `report.md` | 人 / 对话 | 分级清单（高价值主机、内部服务、端点、泄露、下一步） |
-| `report.html` | 人 | 自包含深色看板，无外部 JS/CSS/字体，带打印样式 |
+| `report.md` | 人 / 对话 | 分级清单（高价值主机、内部服务、端点、泄露、下一步）——**默认必写** |
+| `report.html` | 人 | 自包含深色看板，无外部 JS/CSS/字体，带打印样式——**默认必写** |
+| `report.json` | 脚本 | 完整 digest + 来源标注 + `charts`；**仅 `--with-json` 时写** |
+| `report.brief.json` | 脚本 | 32 KB 摘要；**仅 `--with-brief` 时写**（agent 常规读取走 `brief` 命令） |
 
 | 参数 | 说明 |
 |---|---|
@@ -700,6 +702,7 @@ Windows 无软链权限时退化为 `reports/latest.txt`）
 | `--json-limit` | cap `report.json` 里的数组（0 = 不额外截断） |
 | `--out` / `--slug` | 输出目录 / 目录名标签 |
 | `--engagement` | 读哪个 run 的阶段检查点（`stages` 字段） |
+| `--with-json` / `--with-brief` | 补写机器文件 report.json / report.brief.json（默认不写） |
 | `--print-md` / `--print-json` | 顺便把 md 正文 / 完整 digest 回显到 stdout |
 
 **输出（stdout 一行 JSON）**
@@ -709,7 +712,7 @@ Windows 无软链权限时退化为 `reports/latest.txt`）
   "counts": {"domains_in_scope": 48, "live": 27, "interesting": 12, "internal_services": 4,
              "endpoints_in_scope": 6379, "endpoints_interesting": 153, "leak_domains": 8},
   "scope": {"match": ["example.com"], "auto": false},
-  "paths": {"json": ".../report.json", "md": ".../report.md", "html": ".../report.html"},
+  "paths": {"md": ".../report.md", "html": ".../report.html"},
   "warnings": ["检测到 4 个域名解析到 198.18.0.0/15（Clash/TUN fake-IP）…"],
   "next_steps": ["关闭 TUN 后重跑 dns/probe…"]
 }
@@ -718,6 +721,36 @@ Windows 无软链权限时退化为 `reports/latest.txt`）
 **report.json 结构**：`schema` / `scope` / `counts` / `hosts[]`（`host`,`ip`,`status`,`title`,`tech`,
 `priority`,`score`,`reasons[]`,`provenance[]`,`discovered_by`,`sensitive[]`,`params[]`）/ `endpoints[]` /
 `signals`（泄露密钥等）/ `ip_groups` / `provenance`（工具→资产数）/ `stages` / `next_steps` / `charts` / `truncated`。
+
+---
+
+## brief — Agent 统一读取入口（查库 → stdout 一行 JSON）
+
+Agent 想看"这次收成了什么"就用它：直接查资产库，把与 `report.brief.json` 相同的摘要
+（counts / coverage 缺口 / top_hosts / internal_services / leaks / next_steps）以**一行 JSON 打到 stdout**，
+**不写任何文件**。范围语义与 `report` 完全一致（`--match` 校验、`--run` 回退 scope、跨 task 拒绝）。
+
+```bash
+python findinfo.py --task <名> brief --match 主域      # 常规用法
+python findinfo.py brief --run <run_id>                # 不带 --match，沿用 run 的 scope
+python findinfo.py brief --match 主域 --top 10         # top_hosts 上限（默认 20）
+python findinfo.py brief --match 主域 --max-bytes 8192 # 字节上限（默认 32 KB）
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--match X` | 目标域后缀，可重复；语义与 report 的 `--match` 一致 |
+| `--run <run_id>` | 不给 `--match` 时沿用该 run 的 scope |
+| `--top` / `--max-bytes` | top_hosts 条数（默认 20）/ payload 字节上限（默认 32768） |
+| `--min-conf` / `--limit` / `--ep-limit` | 同 report |
+| `--engagement` | 读哪个 run 的阶段检查点（coverage 字段） |
+
+**输出（stdout 一行 JSON，即整个命令的产物）**：`schema: findinfo.brief/1`、`counts`、`scope`、
+`environment.warnings`、`coverage`（failed/not_run/unavailable）、`top_hosts`（每条含
+`host`/`score`/`priority`/`reasons`/`provenance`）、`internal_services`、`leaks`、`next_steps`、
+`truncated`（被截断数组的 kept/total）。
+
+---
 
 **来源标注**：同一资产的 `discovered_by` 保留原始 sources 串（如 `onepass:rapiddns,subfinder`），
 `provenance` 归一化成工具列表并配中文标签；onepass 的多个上游源只算一个工具。
@@ -750,6 +783,7 @@ python findinfo.py vhost --ip <候选IP> --from-store
 python findinfo.py crawl --from-store
 python findinfo.py extract --url <js>
 
-# 6. 交付（json 给 agent 读，html 给人看）
+# 6. 交付（brief 给 agent 读，report 出 md/html 给人看）
+python findinfo.py brief --match 主域
 python findinfo.py report --match 主域
 ```
