@@ -153,23 +153,43 @@ OUTCOME_TIMEOUT = "timeout"
 OUTCOME_UNAVAILABLE = "unavailable"
 OUTCOME_BUDGET = "budget"
 
+# Severity used when merging per-source outcomes. "unavailable" is
+# deliberately BELOW partial: a source we never had a key for is a coverage gap
+# (it goes to coverage.unavailable), not evidence that the stage broke. Ranking
+# it above partial made "subfinder worked, no mapping key configured" report as
+# worse than "subfinder worked, a keyed source crashed", and pushed an agent
+# into --resume loops over a problem retrying can never fix.
 _OUTCOME_RANK = {
-    OUTCOME_OK: 0, OUTCOME_EMPTY: 1, OUTCOME_BUDGET: 2,
-    OUTCOME_PARTIAL: 3, OUTCOME_TIMEOUT: 4,
-    OUTCOME_UNAVAILABLE: 5, OUTCOME_FAILED: 6,
+    OUTCOME_OK: 0, OUTCOME_EMPTY: 1, OUTCOME_UNAVAILABLE: 2,
+    OUTCOME_BUDGET: 3, OUTCOME_PARTIAL: 4, OUTCOME_TIMEOUT: 5,
+    OUTCOME_FAILED: 6,
 }
 
 
 def combine_outcome(*outcomes: str) -> str:
-    """Worst outcome wins, so one dead source cannot hide behind a live one.
+    """Merge per-source outcomes, never letting a gap masquerade as success.
 
-    ok+empty -> empty (a real "nothing found"), partial+ok -> partial, any
-    failed with no success -> failed. Unknown values are ignored.
+    Rules (see tests/test_source_outcomes.py for the contract):
+      - no source at all usable -> unavailable (a coverage gap, not a failure)
+      - every usable source failed -> failed
+      - some usable succeeded, some failed -> partial
+      - otherwise the worst remaining outcome wins (timeout > partial > budget)
+    Unknown values are ignored so a new adapter cannot poison the merge.
     """
     seen = [o for o in outcomes if o in _OUTCOME_RANK]
     if not seen:
         return OUTCOME_OK
-    return max(seen, key=lambda o: _OUTCOME_RANK[o])
+    usable = [o for o in seen if o != OUTCOME_UNAVAILABLE]
+    if not usable:
+        return OUTCOME_UNAVAILABLE
+    if all(o in (OUTCOME_FAILED, OUTCOME_TIMEOUT) for o in usable):
+        return OUTCOME_FAILED
+    succeeded = [o for o in usable
+                 if o in (OUTCOME_OK, OUTCOME_EMPTY, OUTCOME_PARTIAL, OUTCOME_BUDGET)]
+    broken = [o for o in usable if o in (OUTCOME_FAILED, OUTCOME_TIMEOUT)]
+    if succeeded and broken:
+        return OUTCOME_TIMEOUT if OUTCOME_TIMEOUT in broken else OUTCOME_PARTIAL
+    return max(usable, key=lambda o: _OUTCOME_RANK[o])
 
 
 def outcome_from_rc(rc: int, count: int, *, ok: bool | None = None) -> str:
@@ -364,9 +384,53 @@ def api_key(name: str) -> str:
     return ""
 
 
+    v = CFG.get("apis", {}).get(name, {})
+# Which config key each uncover engine needs. An engine with no key can only
+# fail, so it must never be handed to uncover: one dead engine out of five
+# turns a successful stage into "every source failed".
+UNCOVER_ENGINE_KEYS = {
+    "fofa": "fofa",
+    "quake": "quake",
+    "hunter": "hunter",
+    "shodan": "shodan",
+    "censys": "censys",
+    "zoomeye": "zoomeye",
+    "securitytrails": "securitytrails",
+    "virustotal": "virustotal",
+    "chaos": "chaos",
+}
+
+
+def engine_has_key(engine: str) -> bool:
+    """True when the mapping engine has a usable credential configured."""
+    name = UNCOVER_ENGINE_KEYS.get((engine or "").strip().lower())
+    if not name:
+        return False
+    if name == "fofa":
+        # FOFA needs the email too, and a relay gateway can stand in for the
+        # official API entirely (see api_base).
+        return bool(api_key("fofa") or api_base("fofa"))
+    if name == "censys":
+        return bool(api_key("censys") or api_key("censys_id"))
+    return bool(api_key(name))
+
+
+def split_engines(engines: str) -> tuple[list[str], list[str]]:
+    """Split a requested engine list into (usable, missing-key)."""
+    usable, missing = [], []
+    for raw in (engines or "").split(","):
+        e = raw.strip().lower()
+        if not e:
+            continue
+        (usable if engine_has_key(e) else missing).append(e)
+    return usable, missing
+
+
 def api_email(name: str) -> str:
     v = CFG.get("apis", {}).get(name, {})
     return v.get("email", "") if isinstance(v, dict) else ""
+
+
 
 
 def api_base(name: str) -> str:

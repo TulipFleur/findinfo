@@ -17,8 +17,14 @@ def test_outcome_vocabulary_is_ordered_by_severity():
     core = fresh_core()
     assert core.combine_outcome(core.OUTCOME_OK, core.OUTCOME_EMPTY) == core.OUTCOME_EMPTY
     assert core.combine_outcome(core.OUTCOME_OK, core.OUTCOME_PARTIAL) == core.OUTCOME_PARTIAL
-    assert core.combine_outcome(core.OUTCOME_PARTIAL, core.OUTCOME_FAILED) == core.OUTCOME_FAILED
+    # partial already contains a success, so a sibling failure keeps it partial
+    assert core.combine_outcome(core.OUTCOME_PARTIAL, core.OUTCOME_FAILED) == core.OUTCOME_PARTIAL
     assert core.combine_outcome() == core.OUTCOME_OK
+    # a source we never configured is a coverage gap, not a failure
+    assert core.combine_outcome(core.OUTCOME_OK, core.OUTCOME_UNAVAILABLE) == core.OUTCOME_OK
+    assert core.combine_outcome(core.OUTCOME_UNAVAILABLE) == core.OUTCOME_UNAVAILABLE
+    assert core.combine_outcome(core.OUTCOME_FAILED,
+                                core.OUTCOME_UNAVAILABLE) == core.OUTCOME_FAILED
 
 
 def test_rc_classification_distinguishes_empty_from_failed():
@@ -40,19 +46,28 @@ def test_subs_all_sources_failing_is_not_a_clean_empty():
 
     import lib.core as C
     orig_run, orig_has, orig_key = C.run, C.has_tool, C.api_key
+    orig_base = C.api_base
     C.has_tool = lambda n: n in ("subfinder", "uncover")
     C.api_key = lambda n: ""
+    # a configured FOFA gateway counts as a usable engine, so it has to be
+    # cleared too or uncover really runs and this stops testing "no key"
+    C.api_base = lambda n: ""
     C.run = lambda *a, **k: (1, "", "injected failure")
     try:
         out = tools.t_subs(core.Store(), "example.com")
     finally:
         C.run, C.has_tool, C.api_key = orig_run, orig_has, orig_key
+        C.api_base = orig_base
     assert out["outcome"] == core.OUTCOME_FAILED, out
     assert out["ok"] is False, out
     assert out["count"] == 0
-    # the per-source detail must name who died
-    failed = [p["id"] for p in out["per_source"] if p["outcome"] == core.OUTCOME_FAILED]
-    assert set(failed) >= {"subfinder", "uncover"}, out["per_source"]
+    # the per-source detail must name who died, and distinguish the two cases:
+    # subfinder really ran and failed; uncover was never run because no mapping
+    # key is configured (a coverage gap, reported as unavailable).
+    by_id = {p["id"]: p for p in out["per_source"]}
+    assert by_id["subfinder"]["outcome"] == core.OUTCOME_FAILED, out["per_source"]
+    assert by_id["uncover"]["outcome"] == core.OUTCOME_UNAVAILABLE, out["per_source"]
+    assert "no api key" in by_id["uncover"]["error"], out["per_source"]
 
 
 def test_subs_healthy_empty_is_empty_not_failed():

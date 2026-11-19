@@ -508,11 +508,21 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
             core.log("icp " + code + ": no uncover binary and gateway returned no rows")
             errors.append({"code": code, "rc": -1, "stderr": "no uncover, gateway empty"})
             continue
+        usable, missing = core.split_engines(engines)
+        if not usable:
+            # No engine has a key: running uncover would only produce rc!=0 and
+            # turn a coverage gap into a stage failure. Record it as unavailable.
+            core.log("icp " + code + ": no api key for engines: " +
+                     ",".join(missing))
+            errors.append({"code": code, "rc": None, "unavailable": True,
+                           "stderr": "no api key for engines: " +
+                                     ",".join(missing)})
+            continue
         q = 'icp="' + code + '"'
         core.throttle("fofa")
         core.mapping_wait()
-        rc, out, err = core.run([exe, "-q", q, "-e", engines, "-json", "-silent"],
-                                timeout=timeout)
+        rc, out, err = core.run([exe, "-q", q, "-e", ",".join(usable), "-json",
+                                 "-silent"], timeout=timeout)
         if rc != 0 or not (out or "").strip():
             # uncover swallows upstream API errors (bad key -> empty stdout with
             # rc=0), so a silent zero is indistinguishable from "no results".
@@ -614,15 +624,26 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
                    [core.tool("chaos"), "-d", domain, "-silent", "-json",
                     "-key", core.api_key("chaos")], key="domain", tool="chaos")
 
-    if core.has_tool("uncover"):
+    # Only hand uncover the engines we actually have credentials for: an engine
+    # with no key can only fail, and one dead engine out of five used to turn a
+    # successful stage into "every source failed" -> partial run -> an agent
+    # that resumes forever against a problem retrying can never fix.
+    usable_engines, missing_engines = core.split_engines(engines)
+    if core.has_tool("uncover") and usable_engines:
         core.throttle("fofa")
         core.mapping_wait()
         run_source("uncover",
                    [core.tool("uncover"), "-q", 'domain:"' + domain + '"',
-                    "-e", engines, "-json", "-silent"], key="host", tool="uncover")
-    else:
+                    "-e", ",".join(usable_engines), "-json", "-silent"],
+                   key="host", tool="uncover")
+    elif not core.has_tool("uncover"):
         per_source.append({"id": "uncover", "outcome": core.OUTCOME_UNAVAILABLE,
                            "found": 0, "rc": None, "error": "binary not found"})
+    else:
+        per_source.append({"id": "uncover", "outcome": core.OUTCOME_UNAVAILABLE,
+                           "found": 0, "rc": None,
+                           "error": "no api key for engines: " +
+                                    ",".join(missing_engines)})
 
     rows = []
     for d, srcs in found.items():
@@ -1604,6 +1625,120 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
 # ---------------------------------------------------------------- doctor
 VERSION_ARGS = ["-version", "--version", "-V", "-h"]
 
+# ---------------------------------------------------------------- versions
+# Per-tool version recipe, derived from sampling each binary instead of
+# guessing. The old code ran every tool with every flag and took the first
+# x.y.z-looking token in the whole blob, so a usage banner echoing its own
+# path ("Usage of E:\...\findinfo-0.7.2-windows\bin\...") was reported as
+# that tool's version.
+#
+# Each entry: (args to try, regex whose group 1 is the version).
+# Every regex is anchored on a version keyword or the tool's own name, so an
+# unrelated number in the output cannot win.
+_VERSION_ARGS = ["-version", "--version", "-V", "-h"]
+
+# ProjectDiscovery family prints "Current Version: v1.2.3" (capital V in older
+# builds, lowercase in newer).
+_PD_VERSION = re.compile(r"Current [Vv]ersion:\s*(v?\d+\.\d+[\w.\-]*)", re.I)
+
+_VERSION_SPECS = {
+    "subfinder": (["-version", "--version"], _PD_VERSION),
+    "httpx":     (["-version", "--version"], _PD_VERSION),
+    "dnsx":      (["-version", "--version"], _PD_VERSION),
+    "naabu":     (["-version", "--version"], _PD_VERSION),
+    "cdncheck":  (["-version", "--version"], _PD_VERSION),
+    "uncover":   (["-version", "--version"], _PD_VERSION),
+    "katana":    (["-version", "--version"], _PD_VERSION),
+    "chaos":     (["-version", "--version"], _PD_VERSION),
+    # "KSubdomain version 2.4" -- only two components, hence \d+\.\d+
+    "ksubdomain": (["-version", "--version", "-h"],
+                   re.compile(r"KSubdomain\s+version\s+(v?\d+(?:\.\d+)*)", re.I)),
+    # onepass answers --version with JSON: {"ok":true,"version":"0.1.0"}
+    "onepass":   (["--version"],
+                  re.compile(r'"version"\s*:\s*"([^"]+)"')),
+    # ENScan_GO prints a "Version:" field, but this build leaves it empty. The
+    # regex only accepts a real dotted value, so an empty field yields "", not
+    # the install path that follows it.
+    "enscan":    (["-version", "--version", "-h"],
+                  re.compile(r"^Version:\s*(v?\d+(?:\.\d+)+[\w.\-]*)\s*$",
+                             re.M)),
+    # hostCollision has no version flag: -h prints a Go flag usage banner
+    # headed by the binary's absolute path. Nothing to parse.
+    "hostCollision": (["-h"],
+                      re.compile(r"^hostCollision\s+(v?\d+\.\d+[\w.\-]*)$",
+                                 re.M | re.I)),
+}
+
+# Anything that looks like a filesystem location must never be mistaken for a
+# version. Stripped before matching so a path cannot even reach a regex.
+_PATH_NOISE = re.compile(
+    r"""(?:[A-Za-z]:\\[^\s"']*          # C:\... (Windows absolute)
+        |\\\\[^\s"']*                   # \\server\share
+        |[\w.\-]*[\\/][\w.\-\\/]*      # any a\b or a/b fragment
+    )""",
+    re.I | re.X)
+
+
+
+def _strip_paths(text: str) -> str:
+    """Remove filesystem paths so a directory name cannot pose as a version.
+
+    The install directory is literally named ``findinfo-0.7.2-windows``, so a
+    usage banner echoing its own location caused the bogus
+    ``enscan -> 0.7.2-windows`` report.
+    """
+    out = text or ""
+    for literal in (str(core.BIN_PLATFORM), str(core.ROOT), str(core.BIN)):
+        if literal:
+            out = out.replace(literal, " ")
+            out = out.replace(literal.replace(chr(92), "/"), " ")
+    return _PATH_NOISE.sub(" ", out)
+
+
+def parse_version(tool: str, text: str) -> tuple[str, bool]:
+    """Return (version, found) for one tool's raw output.
+
+    found is False when the output carries no recognisable version, which is
+    the honest answer for a tool with no version flag (hostCollision) or a
+    build that leaves the field blank (this enscan binary).
+    """
+    spec = _VERSION_SPECS.get(tool)
+    if not spec:
+        return "", False
+    _args, rx = spec
+    m = rx.search(_strip_paths(text))
+    if not m:
+        return "", False
+    val = (m.group(1) if m.groups() else m.group(0)).strip()
+    if not val or "/" in val or chr(92) in val:
+        return "", False
+    return val, True
+
+
+def _tool_version(name: str, exe: str) -> tuple[str, str, str]:
+    """Run the tool's own version recipe; return (version, raw, exec_error).
+
+    `raw` is the first 120 characters of the first non-empty invocation, so a
+    human can see what the tool actually said when parsing fails.
+    """
+    spec = _VERSION_SPECS.get(name)
+    args_list = spec[0] if spec else _VERSION_ARGS
+    last_raw = ""
+    for arg in args_list:
+        rc, out, err = core.run([exe, arg], timeout=20)
+        if rc == 126:
+            # binary exists but the OS refuses to run it: report that instead
+            # of pretending the version is unknown
+            return "", "", (err or "")[:200]
+        blob = (out or "") + (err or "")
+        if blob and not last_raw:
+            last_raw = blob[:120]
+        ver, found = parse_version(name, blob)
+        if found:
+            return ver, blob[:120], ""
+    return "", last_raw, ""
+
+
 
 # The only bundled binary that is built from in-repo source: if the binary is
 # older than the source tree, a rebuild was forgotten and fixes silently
@@ -1697,25 +1832,22 @@ def doctor() -> dict:
         except core.ToolMissing:
             report[n] = {"present": False}
             continue
-        ver = ""
-        exec_error = ""
-        for arg in VERSION_ARGS:
-            rc, out, err = core.run([exe, arg], timeout=20)
-            if rc == 126:
-                # binary exists but the OS refuses to run it (no exec bit /
-                # wrong arch / sandbox policy). core.run already converted the
-                # OSError into rc=126; surface it instead of "no version".
-                exec_error = (err or "")[:200]
-                break
-            blob = (out or "") + (err or "")
-            m = re.search(r"(v?\d+\.\d+\.\d+[\w.\-]*)", blob)
-            if m:
-                ver = m.group(1)
-                break
+        # Per-tool recipe (see _VERSION_SPECS): the old "first x.y.z in the
+        # blob" approach reported the install directory name as a version
+        # whenever a usage banner echoed its own path.
+        ver, ver_raw, exec_error = _tool_version(n, exe)
         # core.tool() only resolves inside bin/<platform>/, so anything that
         # turns up here is a bundled binary by construction.
-        report[n] = {"present": True, "path": exe, "version": ver,
-                     "source": "bundle"}
+        entry = {"present": True, "path": exe, "version": ver,
+                 "source": "bundle"}
+        if ver_raw:
+            # 120 chars of what the tool actually printed, so a human can see
+            # why a version was not recognised instead of guessing
+            entry["version_raw"] = ver_raw
+        if not ver:
+            # honest "we could not tell" -- never a path fragment posing as one
+            entry["version_unknown"] = True
+        report[n] = entry
         if exec_error:
             report[n].update({"executable": False, "hint": exec_error})
             continue
