@@ -138,21 +138,60 @@ def read_state(ref) -> dict:
     return data
 
 
-def update_state(ref, **kw) -> dict:
-    rd = resolve(ref)
-    p = rd / "status.json"
+# Fields whose change is a REAL fact an agent acts on. Anything else
+# (updated/updated_ts/seq/beat) is a heartbeat: it must not move the progress
+# cursor, or `wait --since` would report progress every 30 seconds.
+_SUBSTANTIVE_FIELDS = ("state", "stage", "stage_state", "stage_index",
+                       "stage_total", "counts", "endpoints", "result",
+                       "coverage", "last_error", "attempt", "pid",
+                       "planned_stages", "round", "rounds")
+
+
+def _substantive_fingerprint(state: dict) -> str:
+    """Stable hash of the substantive projection of a state document."""
+    import hashlib
+    blob = json.dumps([state.get(k) for k in _SUBSTANTIVE_FIELDS],
+                      sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _write_locked(rd: Path, p: Path, mutate) -> dict:
+    """Read-modify-write status.json with the whole cycle under the state lock.
+
+    `mutate(data)` returns the fields to merge, or None to abort (a fenced
+    write that lost its token). Reading the token OUTSIDE the lock and writing
+    inside it is the exact race F05 describes: a fresh attempt can install its
+    token between the check and the write, and the stale writer then clobbers
+    it. Here the check sees the same bytes it merges into.
+    """
     with _Lock(rd / "state.lock"):
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             data = {}
-        data.update(kw)
+        fields = mutate(data)
+        if fields is None:
+            return data
+        data.update(fields)
         data["run_id"] = rd.name
         data["seq"] = int(data.get("seq") or 0) + 1
         data["updated"] = core.now()
         data["updated_ts"] = now_ts()
+        # Persist the progress cursor: the seq of the last SUBSTANTIVE change.
+        # A heartbeat-only write leaves it where it was.
+        fp = _substantive_fingerprint(data)
+        if data.get("progress_fingerprint") != fp:
+            data["progress_fingerprint"] = fp
+            data["progress_seq"] = data["seq"]
         _atomic_write(p, data)
     return data
+
+
+def update_state(ref, **kw) -> dict:
+    """Unfenced state write (CLI / host-side control entries only)."""
+    rd = resolve(ref)
+    p = rd / "status.json"
+    return _write_locked(rd, p, lambda data: dict(kw))
 
 
 def pid_alive(pid) -> bool:
@@ -547,17 +586,30 @@ def claim_launch(rd, spec: dict) -> str | None:
 
 
 def fenced_write(rd, token, **fields) -> bool:
-    """update_state that first revalidates the launch token.
+    """update_state that validates the launch token INSIDE the state lock.
 
-    Every state mutation the worker performs goes through here once a token
-    exists; a superseded attempt's write is dropped instead of overwriting the
-    newer attempt's progress (T18).
+    The token comparison and the merge happen in the same critical section:
+    a resume that installs a new token between a stale reader's check and its
+    write can no longer be clobbered (F05). A write without a token is allowed
+    only while the state carries no token at all (legacy job): an empty token
+    is not a universal bypass once a token exists.
     """
-    st = read_state(rd)
-    if token and (st.get("launch_token") or "") != token:
-        return False
-    update_state(rd, **fields)
-    return True
+    rd = resolve(rd)
+    accepted = {"ok": False}
+
+    def mutate(data):
+        current = data.get("launch_token") or ""
+        if token:
+            if current != token:
+                return None
+        elif current:
+            # legacy/empty writer against a fenced job: refuse
+            return None
+        accepted["ok"] = True
+        return dict(fields)
+
+    _write_locked(rd, rd / "status.json", mutate)
+    return accepted["ok"]
 
 
 def worker_main(ref) -> int:
@@ -580,6 +632,13 @@ def worker_main(ref) -> int:
     # provenance of THIS execution (the pipeline cannot read job.json itself
     # without re-resolving the run dir).
     os.environ["FINDINFO_ATTEMPT"] = str(int(spec.get("attempt") or 1))
+    # The pipeline's status writes are fenced by the SAME token this worker
+    # claimed. Publishing it here (not re-reading job.json later) keeps the
+    # identity immutable for the life of the process: a late resume that
+    # rewrites job.json cannot hand this worker a different identity.
+    _spec_token = spec.get("launch_token") or ""
+    if _spec_token:
+        os.environ["FINDINFO_LAUNCH_TOKEN"] = str(_spec_token)
     token = claim_launch(rd, spec)
     if token is None:
         core.log("[job] superseded attempt (launch token mismatch); exiting "
@@ -789,18 +848,35 @@ def wait_status(ref, states, timeout: float = 30.0, poll: float = 0.05) -> dict:
         time.sleep(min(poll, max(0.0, deadline - time.time())))
 
 
-# Heartbeat-only writes bump seq without changing any fact an agent acts on.
-# wait() used to report changed:true for those every ~30s, so a caller following
-# the docs ("report changed to the user") narrated progress that did not exist.
-# These are the fields update_state() touches on a real transition; anything
-# else (updated/updated_ts/seq alone) is a heartbeat.
-_SUBSTANTIVE_FIELDS = ("state", "stage", "stage_state", "stage_index", "stage_total",
-                       "counts", "endpoints", "result", "coverage", "last_error",
-                       "attempt", "pid", "planned_stages")
+def _wait_payload(st, changed, timed_out, waited, start) -> dict:
+    """One decision payload for BOTH wait modes.
 
-
-def _substantive(state: dict) -> tuple:
-    return tuple(state.get(k) for k in _SUBSTANTIVE_FIELDS)
+    compact and full differ only by the bulky echoes (coverage/run_dir); every
+    field an agent needs to choose the next action is produced here, at the
+    bottom, so a compact projection can never drop attempt, terminal,
+    reaped_by_host or the coverage gaps (F13).
+    """
+    cov = st.get("coverage") if isinstance(st.get("coverage"), dict) else {}
+    gap = cov.get("not_run_stages") or []
+    return {
+        "run_id": st.get("run_id"), "state": st.get("state") or "unknown",
+        "attempt": st.get("attempt"), "pid": st.get("pid"),
+        "terminal": bool(st.get("terminal")),
+        "changed": bool(changed), "timed_out": bool(timed_out),
+        "waited_sec": waited, "seq": st.get("seq"),
+        "progress_seq": st.get("progress_seq"),
+        "alive": st.get("alive"), "interrupted": st.get("interrupted"),
+        "stalled": st.get("stalled"),
+        "reaped_by_host": st.get("reaped_by_host"),
+        "retryable": st.get("retryable"),
+        "next_action": st.get("next_action"),
+        "gap_count": len(gap),
+        "gaps": gap,
+        "result": st.get("result"),
+        "coverage": st.get("coverage"),
+        "progress": progress(st),
+        "run_dir": st.get("run_dir"),
+    }
 
 
 def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict:
@@ -809,49 +885,62 @@ def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict
     A timed-out wait means "nothing changed within this window"; it is NOT a
     failure signal, and the caller must keep waiting on the same run id.
 
-    Without an explicit --since cursor the baseline is the state read *now*, so
-    the call blocks until something actually changes (or the timeout fires)
-    instead of returning immediately on whatever the worker just wrote.
+    The cursor is the PERSISTED progress marker (`progress_seq`: the seq of the
+    last substantive change), not a snapshot taken when this call started:
 
-    `changed` means a SUBSTANTIVE field moved (stage, counts, state...), not a
-    heartbeat: the worker's liveness thread bumps seq every ~30s without any
-    fact changing, and that must not read as progress.
+    * `--since N` compares N with the persisted marker, so a change that
+      happened BETWEEN two waits is reported on the next call (F13: the old
+      code compared N with the CURRENT snapshot's seq, so a caller that passed
+      the previous call's cursor never saw the change);
+    * without `--since`, the call blocks until a substantive change happens
+      after it started.
+
+    A heartbeat bumps seq but neither the marker nor `changed`.
     """
     rd = resolve(ref)
     timeout = max(0.0, float(timeout if timeout is not None else 30.0))
     start = time.time()
     baseline = read_state(rd)
+    base_marker = baseline.get("progress_seq")
+    if base_marker is None:
+        # legacy state without the persisted marker: fall back to the seq seen
+        # now, and say so (never silently drop a change)
+        base_marker = baseline.get("seq")
+        legacy_marker = True
+    else:
+        legacy_marker = False
     if since_seq is None:
-        since_seq = baseline.get("seq")
-    baseline_sub = _substantive(baseline)
+        cursor = base_marker
+    else:
+        cursor = since_seq
     while True:
         st = derive(read_state(rd))
-        seq_moved = (since_seq is not None and st.get("seq") != since_seq)
-        changed = seq_moved and _substantive(st) != baseline_sub
-        if st.get("terminal") or changed:
-            out = {"run_id": st.get("run_id"), "state": st.get("state"),
-                   "changed": bool(changed), "timed_out": False,
-                   "waited_sec": round(time.time() - start, 1),
-                   "progress": progress(st), "alive": st.get("alive"),
-                   "interrupted": st.get("interrupted"), "stalled": st.get("stalled"),
-                   "reaped_by_host": st.get("reaped_by_host"),
-                   "result": st.get("result"), "coverage": st.get("coverage"),
-                   "run_dir": st.get("run_dir"), "seq": st.get("seq")}
-            if st.get("terminal"):
-                out["terminal"] = True
+        marker = st.get("progress_seq")
+        if marker is None:
+            marker = st.get("seq")
+        changed = (marker is not None and cursor is not None
+                   and marker != cursor)
+        if st.get("terminal"):
+            out = _wait_payload(st, changed, False,
+                                round(time.time() - start, 1), start)
+            if legacy_marker:
+                out["note"] = ("this job predates the persisted progress cursor; "
+                               "the comparison used seq as a one-time fallback")
+            out["cursor"] = cursor
+            out["resync_recommended"] = bool(legacy_marker)
+            return out
+        if changed:
+            out = _wait_payload(st, True, False,
+                                round(time.time() - start, 1), start)
+            out["cursor"] = cursor
             return out
         if time.time() - start >= timeout:
-            out = {"run_id": st.get("run_id"), "state": st.get("state") or "unknown",
-                   "changed": False, "timed_out": True,
-                   "waited_sec": round(time.time() - start, 1),
-                   "progress": progress(st), "alive": st.get("alive"),
-                   "interrupted": st.get("interrupted"), "stalled": st.get("stalled"),
-                   "reaped_by_host": st.get("reaped_by_host"),
-                   "run_dir": st.get("run_dir"), "seq": st.get("seq"),
-                   "note": "wait timeout means this wait window ended, not that the "
-                           "job failed; keep waiting on the same run_id"}
+            out = _wait_payload(st, False, True,
+                                round(time.time() - start, 1), start)
+            out["cursor"] = cursor
+            out["note"] = ("wait timeout means this wait window ended, not that "
+                           "the job failed; keep waiting on the same run_id")
             return out
-        # short poll: return as soon as seq moves instead of sleeping a fixed slice
         time.sleep(min(poll, max(0.0, timeout - (time.time() - start))))
 
 
