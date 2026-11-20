@@ -68,6 +68,7 @@ MODULES = [
     "tests.test_dns_wildcard_probe",
     "tests.test_asset_timestamps",
     "tests.test_w1_pipeline_work",
+    "tests.test_w2_spec_wiring",
 ]
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import dataclasses
 import hashlib
 import json
 import os
@@ -105,6 +106,7 @@ if _HOME:
 
 from lib import core, jobs, report, tools, work
 from lib import metered as metered_mod
+from lib import spec as spec_mod
 
 
 def out(obj) -> None:
@@ -1148,50 +1150,6 @@ def _fold_runtime_unavailable(unavailable: dict, stages: list) -> dict:
     return out
 
 
-def _foreground_argv(args) -> list:
-    """Rebuild the CLI argv a worker should replay (drop --background/--resume)."""
-    argv = ["run"]
-    if args.name:
-        argv += ["--name", args.name]
-    for d in (args.domain or []):
-        argv += ["--domain", d]
-    if _active_enabled(args):
-        argv.append("--active")
-    if args.ports:
-        argv.append("--ports")
-    if args.vhost:
-        argv.append("--vhost")
-    if args.crawl:
-        argv.append("--crawl")
-    if args.brute:
-        argv += ["--brute", "--brute-wordlist", args.brute_wordlist,
-                 "--brute-bandwidth", args.brute_bandwidth]
-    argv += ["--depth", str(args.depth), "--invest", str(args.invest),
-             "--deep", str(args.deep), "--entity-timeout", str(getattr(args, "entity_timeout", 1200)),
-             "--engines", args.engines,
-             "--top-ports", str(args.top_ports), "--max-seed", str(args.max_seed),
-             "--max-vhost-ips", str(args.max_vhost_ips)]
-    if args.no_icp:
-        argv.append("--no-icp")
-    if args.no_onepass:
-        argv.append("--no-onepass")
-    if getattr(args, "force_stage", False):
-        argv.append("--force-stage")
-    rounds = int(getattr(args, "rounds", 1) or 1)
-    if rounds != 1:
-        argv += ["--rounds", str(rounds)]
-    budget = float(getattr(args, "time_budget", 0) or 0)
-    if budget:
-        argv += ["--time-budget", str(budget)]
-    tool_timeout = int(getattr(args, "tool_timeout", 0) or 0)
-    if tool_timeout:
-        argv += ["--tool-timeout", str(tool_timeout)]
-    task_timeout = float(getattr(args, "task_timeout", 0) or 0)
-    if task_timeout:
-        argv += ["--task-timeout", str(task_timeout)]
-    return argv
-
-
 def _dedupe_payload(args) -> dict:
     """Everything that changes what a run would collect.
 
@@ -1217,47 +1175,22 @@ def _dedupe_payload(args) -> dict:
 
 
 
-# ---------------------------------------------------------------- resume merge
-# Budget switches a resume is allowed to override. Everything else (target,
-# scope, stage selection) stays exactly as the job was started: a resume must
-# never silently point the same run id at a different company.
-_RESUME_OVERRIDABLE = ("--rounds", "--time-budget", "--tool-timeout",
-                       "--task-timeout", "--force-stage")
-
-
-def _argv_value(argv: list[str], flag: str):
-    """Value of `flag` in an argv list, or None when absent."""
-    for i, a in enumerate(argv):
-        if a == flag and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith(flag + "="):
-            return a.split("=", 1)[1]
-    return None
-
-
-def _set_argv_value(argv: list[str], flag: str, value: str) -> list[str]:
-    """Replace (or append) a flag's value in argv, leaving order intact."""
-    out = list(argv)
-    for i, a in enumerate(out):
-        if a == flag:
-            if i + 1 < len(out):
-                out[i + 1] = value
-                return out
-            out.append(value)
-            return out
-    out += [flag, value]
-    return out
-
-
-
 # Flags whose presence on the command line must be distinguishable from
-# "argparse filled in the default". Resume merging depends on this: replaying a
-# job must not overwrite the stored budget with defaults the caller never typed.
+# "argparse filled in the default". Resume patching depends on this: replaying
+# a job must not overwrite the stored budget with defaults the caller never
+# typed (only explicitly-typed limits reach RunSpec.resume_patch).
 _TRACKED_FLAGS = {
     "--rounds": "rounds", "--time-budget": "time_budget",
     "--tool-timeout": "tool_timeout", "--task-timeout": "task_timeout",
     "--force-stage": "force_stage",
 }
+
+# Identity/scope flags: explicitly typed on a --resume they are a REFUSAL
+# candidate (RunSpec.resume_patch raises), never a silent repoint of the same
+# run id at a different target.
+_IDENTITY_FLAGS = ("--name", "--domain", "--engines", "--no-icp",
+                   "--no-onepass", "--active", "--ports", "--vhost",
+                   "--crawl", "--brute")
 
 
 def _mark_explicit(args, argv: list[str]) -> None:
@@ -1268,56 +1201,36 @@ def _mark_explicit(args, argv: list[str]) -> None:
             if a == flag or a.startswith(flag + "="):
                 seen.add(attr)
     setattr(args, "_explicit", seen)
-
-def _remove_argv_flag(argv: list[str], flag: str) -> list[str]:
-    """Remove a flag and the value that belongs to it, positionally."""
-    out: list[str] = []
-    skip = 0
-    for i, a in enumerate(argv):
-        if skip:
-            skip -= 1
-            continue
-        if a == flag:
-            if i + 1 < len(argv):
-                skip = 1
-            continue
-        if a.startswith(flag + "="):
-            continue
-        out.append(a)
-    return out
+    ident = set()
+    for a in argv:
+        for flag in _IDENTITY_FLAGS:
+            if a == flag or a.startswith(flag + "="):
+                ident.add(flag)
+    setattr(args, "_explicit_identity", ident)
 
 
-def _merge_resume_argv(argv: list[str], args) -> list[str]:
-    """Apply the budget flags the caller explicitly typed; keep the rest.
+def _spec_from_stored(spec: dict) -> "spec_mod.RunSpec":
+    """The RunSpec a stored job carries (docs par.4 legacy import).
 
-    Without this, `run --resume <id> --rounds 5` was accepted (rc=0) and then
-    ignored: the worker replayed the original argv, so the budget never changed
-    and the agent believed it had widened the run. Only flags listed in
-    args._explicit are applied -- a value that merely equals the default is not
-    an instruction.
+    Preference order: the run_spec block written by RunSpec-aware launches,
+    then a parse of the stored argv through the real parser (one conversion,
+    never a second handwritten importer). Legacy jobs whose argv predates a
+    flag keep that flag's parser default -- the same semantics the worker
+    replay itself would give it.
     """
-    explicit = set(getattr(args, "_explicit", ()) or ())
-    out = list(argv)
-    mapping = (("rounds", "--rounds", str), ("time_budget", "--time-budget", str),
-               ("tool_timeout", "--tool-timeout", str),
-               ("task_timeout", "--task-timeout", str))
-    for attr, flag, cast in mapping:
-        if attr not in explicit:
-            continue
-        val = getattr(args, attr, None)
-        if val in (None, "", 0, 0.0):
-            # An explicit 0 means "remove this ceiling". Remove ONLY this flag
-            # and its value, by position. The previous filter compared VALUES
-            # against the flag's first value, so `--time-budget 0` deleted every
-            # element equal to "60" -- including the unrelated
-            # `--tool-timeout 60` sitting later in the same argv.
-            out = _remove_argv_flag(out, flag)
-            continue
-        out = _set_argv_value(out, flag, cast(val))
-    if "force_stage" in explicit and getattr(args, "force_stage", False):
-        if "--force-stage" not in out:
-            out.append("--force-stage")
-    return out
+    rs = None
+    if spec.get("run_spec"):
+        try:
+            rs = spec_mod.RunSpec.from_json(json.dumps(spec["run_spec"]))
+        except (ValueError, TypeError):
+            rs = None
+    if rs is None and spec.get("argv"):
+        parsed = build_parser().parse_args(list(spec["argv"]))
+        rs = spec_mod.from_cli(parsed)
+    if rs is None:
+        raise core.FindInfoError("stored job spec has no runnable identity")
+    return rs
+
 
 def _run_paths(rd: Path) -> dict:
     return {"run_dir": str(rd),
@@ -1376,9 +1289,21 @@ def _start_background_locked(args, payload, key) -> int:
     inflight = jobs.find_inflight(key)
     if inflight is not None:
         st = jobs.derive(jobs.read_state(inflight))
-        out(dict({"run_id": inflight.name, "state": st.get("state"),
-                  "reused": True, "started": False, "dedupe_key": key},
-                 **_run_paths(inflight),
+        reuse = {"run_id": inflight.name, "state": st.get("state"),
+                 "reused": True, "started": False, "dedupe_key": key}
+        # Same collection identity, different limits: the in-flight job keeps
+        # ITS limits (docs par.4) -- report the difference instead of silently
+        # applying the new ones to a running job.
+        try:
+            stored = _spec_from_stored(jobs.read_spec(inflight))
+            diff = spec_mod.from_cli(args).diff(stored)
+            if diff:
+                reuse["request_differences"] = diff
+                reuse["note"] = ("in-flight job reused; requested limits were "
+                                 "NOT applied to the running job")
+        except Exception:
+            pass
+        out(dict(reuse, **_run_paths(inflight),
                  next=_followup("wait", inflight, "--timeout", "30")))
         return 0
 
@@ -1387,8 +1312,12 @@ def _start_background_locked(args, payload, key) -> int:
     rd = core.new_run_dir(target_label)
     planned = _plan_stages(args, active)
     task = os.environ.get("FINDINFO_TASK", "")
+    # One RunSpec owns the worker argv (the CLI, the worker replay and the
+    # spec.json entry below all come from the same conversion -- a second
+    # handwritten argv list is exactly the drift the plan forbids).
+    rs = spec_mod.from_cli(args)
     jobs.write_spec(
-        rd, entry="findinfo:main", argv=_foreground_argv(args),
+        rd, entry="findinfo:main", argv=rs.to_worker_argv(),
         target=args.name or target_label, scope=core.canon_scope(args.domain or []),
         engagement=ENGAGEMENT, task=task, home=str(core.HOME), root=str(core.ROOT),
         python=sys.executable, dedupe_key=key, attempt=1, params=payload,
@@ -1400,6 +1329,7 @@ def _start_background_locked(args, payload, key) -> int:
         budget={"rounds": int(getattr(args, "rounds", 1) or 1),
                 "time_budget_sec": float(getattr(args, "time_budget", 0) or 0),
                 "task_timeout_sec": float(getattr(args, "task_timeout", 0) or 0)},
+        run_spec=json.loads(rs.to_json()),
         env={"FINDINFO_HOME": str(core.HOME), "FINDINFO_TASK": task},
     )
     jobs.update_state(rd, state="queued", stage="queued", stage_state="queued",
@@ -1451,32 +1381,59 @@ def _resume_run_locked(args, rd) -> int:
     if not spec.get("argv"):
         raise core.FindInfoError("not a background run (no job spec): " + rd.name)
 
-    # -- explicit budget overrides on resume -------------------------------
-    # The old behaviour replayed spec["argv"] verbatim, so `--resume <id>
-    # --rounds 5` re-ran with the ORIGINAL rounds and the caller had no way to
-    # widen the budget (the flag was silently ignored, rc=0). Merge only what
-    # was actually typed: argparse cannot tell "not given" from "given the
-    # default", so the parser records each override in args._explicit (see
-    # build_parser) and everything else keeps the spec value.
-    argv = _merge_resume_argv(list(spec["argv"]), args)
-    spec["argv"] = argv
-    # Keep the budget block consistent with the argv a worker will replay.
-    budget = dict(spec.get("budget") or {})
-    for flag, key, cast in (("--rounds", "rounds", int),
-                            ("--time-budget", "time_budget_sec", float),
-                            ("--tool-timeout", "tool_timeout_sec", int),
-                            ("--task-timeout", "task_timeout_sec", float)):
-        val = _argv_value(argv, flag)
-        if val is not None:
-            budget[key] = cast(float(val)) if key != "rounds" else cast(val)
-    spec["budget"] = budget
-    # task_timeout lives at the top level (that is what worker_main reads), so
-    # it must be updated -- and CLEARED when the caller passed --task-timeout 0.
-    # Leaving the old value behind meant "remove the ceiling" silently kept it.
+    # -- resume patching through ONE conversion (docs par.4) ----------------
+    # The stored argv is parsed back into a RunSpec; only the documented
+    # limit fields may move. Identity/scope/source flags changed on the
+    # command line are an ERROR, not a silent repoint of the same run id at a
+    # different company (RunSpec.resume_patch raises). With no explicit flags
+    # typed (args._explicit empty) the stored spec replays unchanged.
+    #
+    # The requested spec is rebuilt from the STORED identity plus ONLY the
+    # explicitly typed limits: argparse cannot tell "not given" from "given
+    # the default", so a bare `--resume <id>` must not compare its parser
+    # defaults against the job's real flags and cry identity change.
     explicit = set(getattr(args, "_explicit", ()) or ())
-    if "task_timeout" in explicit:
-        _tt = _argv_value(argv, "--task-timeout")
-        spec["task_timeout"] = float(_tt) if _tt is not None else 0.0
+    ident_typed = set(getattr(args, "_explicit_identity", ()) or ())
+    if explicit or ident_typed:
+        stored_spec = _spec_from_stored(spec)
+        if ident_typed:
+            # An explicitly-typed identity flag must match the stored one; a
+            # DIFFERENT one repoints the run and is refused (docs par.4).
+            from_cli_spec = spec_mod.from_cli(args)
+            changed = {f: (getattr(from_cli_spec, f, None),
+                           getattr(stored_spec, f, None))
+                       for f in spec_mod.RunSpec.IDENTITY_FIELDS
+                       if getattr(from_cli_spec, f, None) !=
+                       getattr(stored_spec, f, None)}
+            # only flags the caller actually typed count; untyped ones
+            # differ because argparse filled defaults, not because the
+            # caller asked for a change
+            if changed and any(f in ("name", "domain") or
+                               getattr(args, f, None) not in (None, False, "", (), [])
+                               for f in changed):
+                raise core.FindInfoError(
+                    "resume rejected: identity/scope flags changed for an "
+                    "existing job (start a new run instead): " +
+                    json.dumps({k: v for k, v in changed.items()}, default=str))
+        if explicit:
+            requested = dataclasses.replace(
+                stored_spec,
+                **{f: getattr(args, f, None) for f in explicit
+                   if getattr(args, f, None) is not None})
+            try:
+                effective = stored_spec.resume_patch(requested)
+            except ValueError as exc:
+                raise core.FindInfoError("resume rejected: " + str(exc)) from None
+            # An explicit 0 means "remove this ceiling"; resume_patch copied the
+            # REQUESTED value, so an explicitly-typed 0 is already applied here.
+            spec["argv"] = effective.to_worker_argv()
+            spec["budget"] = {"rounds": effective.rounds,
+                             "time_budget_sec": effective.time_budget,
+                             "task_timeout_sec": effective.task_timeout,
+                             "tool_timeout_sec": effective.tool_timeout}
+            spec["task_timeout"] = effective.task_timeout
+            if spec.get("run_spec") is not None:
+                spec["run_spec"] = json.loads(effective.to_json())
     spec["attempt"] = int(spec.get("attempt") or 1) + 1
     # Launch token: fencing for THIS attempt. The worker must present it to
     # publish state; a stale attempt (this resume raced with another) can
