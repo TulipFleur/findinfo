@@ -1237,7 +1237,8 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
     # coverage and next_steps can be derived instead of re-interpreted.
     entry.setdefault("outcome", core.OUTCOME_OK)
     _oc = entry.get("outcome")
-    entry["status"] = ("succeeded" if _oc in (core.OUTCOME_OK, core.OUTCOME_EMPTY)
+    entry["status"] = ("succeeded" if _oc in (core.OUTCOME_OK, core.OUTCOME_EMPTY,
+                                             core.OUTCOME_UNAVAILABLE)
                        else ("budget" if _oc == core.OUTCOME_BUDGET else "partial"))
     # The checkpoint decides whether a re-run may SKIP this stage. Writing
     # "done" for a partial stage meant a later run skipped it forever, so the
@@ -2180,6 +2181,33 @@ def _run_pipeline(args) -> int:
                 # checkpoint hit: reuse the anchors this run published earlier
                 approved_names = list((jobs.read_state(run_dir) or {}).get(
                     "approved_company_names") or [])
+            if not approved_refs and not approved_names and args.name:
+                # LEGACY COMPATIBILITY. An existing task's entity checkpoint
+                # predates subject references, so neither the run state nor the
+                # stage result names an approved subject -- yet the store's
+                # company rows (and their domain parents) are the anchor the
+                # earlier run approved with this exact name. Recover ONLY the
+                # companies the anchor gate itself would keep for this name; a
+                # company that does not match is not silently adopted.
+                try:
+                    _stored = [a["canonical"] for a in
+                               store.get_assets(kind="company")]
+                except Exception:
+                    _stored = []
+                # Prefer an EXACT normalised match (the real anchor); only if
+                # there is none fall back to the tolerant name matcher, and
+                # only when it yields exactly one candidate.
+                _norm = {tools.norm_entity_name(args.name)}
+                _exact = [c for c in _stored
+                          if tools.norm_entity_name(c) in _norm]
+                _pick = _exact
+                if not _pick:
+                    _pick, _ = tools.filter_entities(_stored, args.name)
+                if len(_pick) == 1:
+                    approved_names = [str(x) for x in _pick[:1]]
+                    core.log("entity checkpoint predates subject refs; "
+                             "recovered the approved company anchor: " +
+                             approved_names[0])
             summary["_approved_company_names"] = approved_names
             if approved_refs or approved_names:
                 _write_status(run_dir, approved_subject_refs=approved_refs,
@@ -2479,11 +2507,25 @@ def _run_pipeline(args) -> int:
             def _icp():
                 r = tools.t_icp(store, icp_codes, engines=args.engines,
                                 timeout=tool_timeout, ledger=summary.get("_ledger"))
+                errs = r.get("errors") or []
                 res = {"domains": len(r.get("domains", [])),
-                       "errors": len(r.get("errors", []))}
-                ok = bool(r.get("domains")) or not r.get("errors")
-                if not ok:
-                    raise core.StageError("icp lookup failed for all codes", result=res)
+                       "errors": len(errs)}
+                # An engine without a key (or a relay that is down) is a
+                # CAPABILITY GAP, not a stage failure: the documented keyless
+                # contract says a missing OPTIONAL credential must not become
+                # exit code 5. Only a real tool/transport failure with no
+                # capability excuse fails the stage.
+                _unavailable = [e for e in errs if e.get("unavailable")]
+                _real = [e for e in errs if not e.get("unavailable")]
+                if _unavailable and not _real:
+                    res["unavailable_sources"] = sorted({
+                        str(e.get("stderr") or "unavailable")[:80]
+                        for e in _unavailable})[:5]
+                    res["outcome"] = core.OUTCOME_UNAVAILABLE
+                    return res
+                if not r.get("domains") and _real:
+                    raise core.StageError("icp lookup failed for all codes",
+                                          result=res)
                 return res
             _stage(store, run_dir, summary, "icp", {"codes": icp_codes}, args, _icp,
                    lambda r: {"domains": r["domains"], "errors": r.get("errors", 0)})
@@ -2756,14 +2798,27 @@ def _run_pipeline(args) -> int:
         # Legacy JS rows with PROVABLE ownership (this run's membership or the
         # run's own scope) migrate idempotently into the durable queue; a
         # done row stays done, unknown ownership is reported and left in place.
+        #
+        # Only migrate WORK this run can actually drain: without the crawl/
+        # extract stages nothing would ever claim an extract item, and a
+        # migrated pending row would keep the run permanently partial with a
+        # gap no retry can close. Completed legacy rows still migrate (they
+        # carry history/statistics and are never re-opened).
         try:
-            _mig = work.import_js_queue(store, summary["_run_public_id"], scope)
+            _can_drain_js = "extract" in planned
+            _mig = work.import_js_queue(store, summary["_run_public_id"], scope,
+                                        include_open=_can_drain_js)
             summary["js_migration"] = {"attached": _mig.get("attached", 0),
                                        "skipped_done": _mig.get("skipped_done", 0),
+                                       "deferred_open": _mig.get("deferred_open", 0),
                                        "unknown": len(_mig.get("unknown") or [])}
             if _mig.get("unknown"):
                 core.log("legacy js_queue: " + str(len(_mig["unknown"])) +
                          " row(s) have no provable owner; left untouched")
+            if _mig.get("deferred_open"):
+                core.log("legacy js_queue: " + str(_mig["deferred_open"]) +
+                         " open row(s) belong to this run but it plans no "
+                         "crawl/extract stage; left in the legacy queue")
         except Exception as exc:
             core.log("legacy js_queue migration failed: " + repr(exc)[:160])
         for round_no in range(1, rounds + 1):
@@ -2876,7 +2931,8 @@ def _run_pipeline(args) -> int:
                 s_["stage"]: (
                     "succeeded" if ("elapsed" in s_ and not s_.get("failed")
                                     and s_.get("outcome") in (None, core.OUTCOME_OK,
-                                                              core.OUTCOME_EMPTY))
+                                                              core.OUTCOME_EMPTY,
+                                                              core.OUTCOME_UNAVAILABLE))
                     else "partial" if ("elapsed" in s_ and not s_.get("failed")
                                        and s_.get("outcome") in (core.OUTCOME_PARTIAL,
                                                                  core.OUTCOME_BUDGET))
@@ -3001,11 +3057,16 @@ def _run_pipeline(args) -> int:
             summary.pop(_private, None)
         core.write_jsonl(run_dir / "summary.jsonl", [summary])
         store.finish_run(run_id, summary)
+        # stage_total must never be smaller than what actually ran: a resumed
+        # run replays stages and can legitimately report more entries than the
+        # original plan, and percent > 100 reads as corruption.
+        _done_count = len(done_stages) + len(skipped_stages)
+        _stage_total = max(int(summary.get("_stage_total") or 0), _done_count)
         _write_status(run_dir, stage="done", state="completed", stage_state="done",
                       counts=counts, endpoints=endpoints,
                       result=summary["result"], coverage=coverage,
-                      stage_index=len(done_stages) + len(skipped_stages),
-                      stage_total=summary["_stage_total"])
+                      stage_index=_done_count,
+                      stage_total=_stage_total)
         out(summary)
         return rc
     except Exception as exc:

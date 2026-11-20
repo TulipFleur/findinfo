@@ -485,7 +485,8 @@ JS_LEGACY_STATE_MAP = {"done": "done", "skipped": "done",
                        "failed": "failed", "pending": "pending"}
 
 
-def import_js_queue(store, run_id: str, scope: list | None = None) -> dict:
+def import_js_queue(store, run_id: str, scope: list | None = None,
+                    include_open: bool = True) -> dict:
     """Idempotently migrate provably-owned legacy JS rows into one run.
 
     Proof of ownership, in order:
@@ -497,19 +498,25 @@ def import_js_queue(store, run_id: str, scope: list | None = None) -> dict:
 
     Migration is idempotent: an existing work item for the same
     (run, extract, url) is not duplicated, and a legacy `done` row becomes a
-    done work item -- never re-opened as pending. Unknown ownership is
-    reported (not claimed, not deleted).
+    done work item -- never re-opened as pending.
 
-    Returns {"attached": n, "unknown": [...], "skipped_done": n}.
+    `include_open=False` migrates only COMPLETED rows. A run that plans no
+    crawl/extract stage cannot drain an open item, so importing one would
+    leave a migrated obligation nobody claims -- the run would stay partial
+    forever with a gap no retry can close. Open rows stay in the legacy queue
+    and are reported (`deferred_open`).
+
+    Unknown ownership is reported (not claimed, not deleted).
     """
     attached = 0
     skipped_done = 0
+    deferred_open = 0
     unknown: list = []
     try:
-        rows = store.conn.execute(
-            "SELECT url, state FROM js_queue").fetchall()
+        rows = store.conn.execute("SELECT url, state FROM js_queue").fetchall()
     except Exception:
-        return {"attached": 0, "unknown": [], "skipped_done": 0}
+        return {"attached": 0, "unknown": [], "skipped_done": 0,
+                "deferred_open": 0}
     want_scope = core.canon_scope(scope or [])
     for r in rows:
         url = r["url"]
@@ -525,10 +532,12 @@ def import_js_queue(store, run_id: str, scope: list | None = None) -> dict:
             unknown.append(url)
             continue
         if legacy_state == "done":
-            # a completed legacy row must not turn into new pending work
             skipped_done += 1
             target_state = "done"
         elif legacy_state in ("failed", "pending"):
+            if not include_open:
+                deferred_open += 1
+                continue
             target_state = legacy_state
         else:
             unknown.append(url)
@@ -544,7 +553,7 @@ def import_js_queue(store, run_id: str, scope: list | None = None) -> dict:
             if cur.rowcount:
                 attached += 1
     return {"attached": attached, "unknown": unknown,
-            "skipped_done": skipped_done}
+            "skipped_done": skipped_done, "deferred_open": deferred_open}
 
 
 def effective_invocations(store, run_id: str, attempt: int) -> dict:

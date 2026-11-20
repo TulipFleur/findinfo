@@ -317,7 +317,10 @@ def progress(state: dict) -> dict:
     total = st.get("stage_total")
     pct = None
     if isinstance(idx, int) and isinstance(total, int) and total > 0:
-        pct = round(idx * 100.0 / total, 1)
+        # A resumed run can have executed more stage entries than the original
+        # plan; the index is then larger than the total. Report the real
+        # progress of the PLAN (never > 100), and keep the raw index visible.
+        pct = round(min(idx, total) * 100.0 / total, 1)
     return {
         "stage": st.get("stage"),
         "stage_state": st.get("stage_state"),

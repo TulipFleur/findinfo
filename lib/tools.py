@@ -1076,7 +1076,17 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
             # Surface it instead of returning a clean-looking empty list.
             core.log("icp " + code + ": uncover rc=" + str(rc) + " empty "
                      + ("; " + err.strip()[:200] if err.strip() else ""))
-            errors.append({"code": code, "rc": rc, "stderr": err.strip()[:300]})
+            _low = (err or "").lower()
+            # "requires keys but no keys were found" / "no api key" is a
+            # CAPABILITY gap (docs: a missing optional credential is not a
+            # stage failure), not a tool fault.
+            _missing_key = any(k in _low for k in
+                               ("requires keys", "no keys", "no api key",
+                                "unauthorized", "401", "403"))
+            _entry = {"code": code, "rc": rc, "stderr": err.strip()[:300]}
+            if _missing_key:
+                _entry["unavailable"] = True
+            errors.append(_entry)
         for r in core.parse_jsonl(out):
             rows += 1
             host = r.get("host") or ""

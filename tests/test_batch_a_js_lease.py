@@ -327,3 +327,33 @@ def test_standalone_backend_still_uses_the_legacy_queue():
             pass   # no work schema at all in a pure standalone store
     finally:
         store.close()
+
+
+def test_open_legacy_rows_are_not_migrated_without_a_drain_path():
+    """A run that cannot drain extract work must not adopt open legacy rows.
+
+    Real CLI uncovered this: a passive run (no crawl/extract) migrated 108
+    pending JS rows and could never claim them, so it stayed partial with a
+    gap no retry could close.
+    """
+    s = _store()
+    ts = core.now()
+    with s._write():
+        for url, state in (("https://mt-a.example.com/open.js", "pending"),
+                           ("https://mt-a.example.com/done.js", "done")):
+            s.conn.execute(
+                "INSERT OR IGNORE INTO js_queue(url, state, attempts,"
+                " last_error, discovered_at, updated_at)"
+                " VALUES(?,?,0,'',?,?)", (url, state, ts, ts))
+    res = work.import_js_queue(s, RUN, ["mt-a.example.com"], include_open=False)
+    assert res["attached"] == 1, ("only the completed row migrates", res)
+    assert res["deferred_open"] == 1, res
+    states = {r["canonical"]: r["status"] for r in s.conn.execute(
+        "SELECT canonical, status FROM work_items WHERE run_id=?", (RUN,))}
+    assert states == {"https://mt-a.example.com/done.js": "done"}, states
+    # the open row is still pending in the legacy table, unclaimed
+    legacy = s.conn.execute(
+        "SELECT state FROM js_queue WHERE url=?",
+        ("https://mt-a.example.com/open.js",)).fetchone()
+    assert legacy["state"] == "pending"
+    s.close()

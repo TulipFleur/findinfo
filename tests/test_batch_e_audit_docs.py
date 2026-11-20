@@ -174,3 +174,68 @@ def test_docs_state_the_current_contracts():
     assert "unsupported_target_kind" in tools_doc
     dm = (ROOT / "docs" / "DATA-MODEL.md").read_text(encoding="utf-8")
     assert "dispatch_seq" in dm and "native_dispatch" in dm
+
+
+# ---------------------------------------------------------------- real-run fixes
+def test_icp_missing_key_is_a_capability_gap_not_a_stage_failure():
+    """Real CLI uncovered this: uncover 'requires keys' must not fail the stage.
+
+    The keyless contract says an absent OPTIONAL credential is a coverage gap;
+    the run must not end exit 5 because quake/hunter keys are missing.
+    """
+    import argparse
+    import unittest.mock as mock
+    import findinfo
+    from contextlib import redirect_stdout
+    import io
+    core_now = fresh_core()
+    from tests.util import fresh_tools
+    tools = fresh_tools(core_now)
+    fi = findinfo
+
+    def fake_icp(store, codes, engines="", timeout=0, ledger=None, **kw):
+        return {"codes": list(codes), "rows": 0, "domains": [], "ips": [],
+                "errors": [{"code": codes[0], "rc": 1,
+                            "unavailable": True,
+                            "stderr": "uncover: agents [fofa] requires keys but "
+                                      "no keys were found"}]}
+
+    args = argparse.Namespace(
+        task="", name="", domain=["hniu.cn"], active=False, ports=False,
+        vhost=False, crawl=False, brute=False, brute_wordlist="",
+        brute_bandwidth="3m", depth=3, invest=51, deep=1, engines="fofa",
+        no_icp=False, no_onepass=True, top_ports=1000, max_seed=5,
+        max_vhost_ips=10, force_stage=False, background=False, resume="",
+        rounds=1, time_budget=0.0, task_timeout=0.0, tool_timeout=0,
+        entity_timeout=1200)
+    fakes = {
+        "t_certs": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True},
+        "t_subs": lambda s, d, engines="", timeout=0, **kw: {"count": 0, "ok": True},
+        "t_dns": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True, "rc": 0,
+                                                "domains": [], "wildcard": []},
+    }
+    patches = [mock.patch.object(tools, n, side_effect=f) for n, f in fakes.items()]
+    patches.append(mock.patch.object(fi.tools, "t_icp", side_effect=fake_icp))
+    for p in patches:
+        p.start()
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = fi.cmd_run(args)
+        payload = json.loads([l for l in buf.getvalue().splitlines()
+                              if l.startswith("{")][-1])
+    finally:
+        for p in reversed(patches):
+            p.stop()
+    failed = {f["stage"] for f in payload["coverage"]["failed_stages"]}
+    assert "icp" not in failed, ("a missing key must not fail icp", failed)
+    assert rc == 0, ("a keyless run must not exit 5", rc, payload["result"])
+
+
+def test_progress_percent_never_exceeds_one_hundred():
+    """A resumed run can execute more entries than planned: cap the percent."""
+    from lib import jobs
+    st = {"stage_index": 7, "stage_total": 6, "stage": "done"}
+    p = jobs.progress(st)
+    assert p["percent"] == 100.0, p
+    assert p["stage_index"] == 7 and p["stage_total"] == 6

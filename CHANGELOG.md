@@ -7,6 +7,33 @@
 
 ## [Unreleased]
 
+### 非 DNS 自动化修复（docs/NON-DNS-REPAIR.md）
+
+- **JS 与租约**（`b542692`）。run 模式只以 work_items 调度/统计 JS，standalone
+  沿用 Store.js_*；只把真实发现且允许的 JS 入队（HTML/JSON 不再是待办），成功项
+  不重开；旧队列按可证明归属幂等迁移，未知归属保留并报告；claim 修好 retry_at、
+  过期 running 回收、每次新 token，旧 token 不能写结果或确认；结果+membership+
+  ack 在同一有效租约下提交，网络在事务外。
+- **作业与等待**（`64439c0`）。首次启动也生成 attempt/token；状态读、token 校验、
+  seq 与写入在同一锁内；pipeline 进度/心跳/终态都走围栏；旧 worker 存活时报占用
+  而不另起；旧无 token 任务由控制入口迁移；wait 用持久化实质进展游标，compact/full
+  都保留 attempt/terminal/reaped_by_host/gap。
+- **资产归属**（`5b9196a`）。ENScan 按实体保留资产，只授予已批准主体；别名种子不再
+  依赖 parent==搜索词；短品牌保守策略不放宽；历史复用标记 reuse 并保留原
+  observed_at，不伪造当前观测，也不混入其他 run。
+- **输出与配置**（`0bab11a`）。brief 合并全部字段后用最终 encoder 裁剪计量，
+  brief_bytes 等于真实 stdout 字节（含换行，二进制写出避免 CRLF 差 1）；显式 0 保留；
+  resume 只比较明确输入；dry-run resume 与实际恢复共用有效 spec；离线入口在 runtime
+  导入前分流，不读配置、不建目录。
+- **记录与操作**（`d8951dd`）。invocation 每次派发独立 ID、重试追加不覆盖、按真实
+  dispatch_seq 排序；审计区分真实重复派发与日志重放、provider_http/native_dispatch
+  单位、未结算状态；IP:port 目标明确报 unsupported_target_kind；同步 SKILL/AGENT/
+  TOOLS/DATA-MODEL。
+- **真实测试修正**（`8ad6493` 后未提交改动，见下条提交）。对湖南信息职业技术学院
+  实测发现并修复：旧任务 checkpoint 命中时因缺少 subject ref 丢种子；缺可选密钥时
+  icp 被误判为阶段失败并导致 exit 5；resume 后 percent 超过 100；无 crawl/extract
+  阶段时迁移的 108 条 open JS 变成无人消费的永久缺口。
+
 ### 接线批次（docs/RELIABILITY-PLAN.md 落地收尾）
 
 - **W1：主流水线接入运行成员与持久工作队列**（`aa9a840`）。轮次输入改为读

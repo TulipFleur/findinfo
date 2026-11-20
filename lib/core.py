@@ -307,6 +307,12 @@ def emit(obj: Any) -> None:
     humans piping to a UTF-8-aware terminal); the JSON value content is the
     same either way. Both paths share encode_json_line(), so a caller that
     measured these bytes sees the same number on stdout.
+
+    The bytes are written through the BINARY buffer on purpose: a text-mode
+    write on Windows translates '\\n' to '\\r\\n', which would make stdout one
+    byte longer than the measured payload -- exactly the off-by-one that made a
+    declared brief_bytes disagree with the real stdout. A caller that measures
+    encode_json_line() now sees that exact byte count.
     """
     if (os.environ.get("FINDINFO_EMIT") or "").lower() == "minimal" and isinstance(obj, dict):
         if obj.get("schema") == "findinfo.brief/1":
@@ -315,8 +321,15 @@ def emit(obj: Any) -> None:
         else:
             drop = ("progress", "coverage", "summary", "params", "paths")
             obj = {k: v for k, v in obj.items() if k not in drop}
-    sys.stdout.write(encode_json_line(obj))
-    sys.stdout.flush()
+    data = encode_json_line(obj).encode("utf-8", "replace")
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        sys.stdout.flush()
+        buf.write(data)
+        buf.flush()
+    else:                                  # a replaced stdout (tests, embedding)
+        sys.stdout.write(data.decode("utf-8", "replace"))
+        sys.stdout.flush()
 
 
 class FindInfoError(Exception):
