@@ -72,6 +72,7 @@ MODULES = [
     "tests.test_w3_metered_wiring",
     "tests.test_w4_identity_gate",
     "tests.test_w5_wildcard_unified",
+    "tests.test_w6_worker_fencing",
 ]
 
 

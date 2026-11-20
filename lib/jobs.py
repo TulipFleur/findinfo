@@ -585,7 +585,10 @@ def worker_main(ref) -> int:
         core.log("[job] superseded attempt (launch token mismatch); exiting "
                  "without touching state")
         return 4                     # fenced out: a newer attempt owns the job
-    update_state(rd, state="running", pid=os.getpid(), started_ts=now_ts(),
+    # Every state mutation this worker performs goes through fenced_write
+    # (par.11): a superseded attempt can never publish progress, a timeout
+    # verdict or a terminal state over a newer attempt's.
+    fenced_write(rd, token, state="running", pid=os.getpid(), started_ts=now_ts(),
                  attempt=int(spec.get("attempt") or 1),
                  launch_token=token or None,
                  target=spec.get("target"), scope=spec.get("scope") or [],
@@ -627,7 +630,10 @@ def worker_main(ref) -> int:
                     upd["coverage"] = {"complete": False,
                                        "reason": "task_timeout",
                                        "attempt": int(spec.get("attempt") or 1)}
-                update_state(rd, **upd)
+                # The deadline fires from THIS worker's timer, so it must also
+                # respect the fence: a superseded attempt timing out must not
+                # overwrite the newer attempt's state.
+                fenced_write(rd, token, **upd)
                 try:
                     _kill_children()
                 except Exception:
@@ -710,7 +716,12 @@ def worker_main(ref) -> int:
     if err:
         upd["last_error"] = {"type": "unexpected", "message": err.splitlines()[-1][:300],
                              "traceback_tail": err}
-    update_state(rd, **upd)
+    # Terminal write is fenced too (par.11): if a newer attempt already
+    # claimed the launch, this one exits without publishing anything over it.
+    if not fenced_write(rd, token, **upd):
+        core.log("[job] terminal write fenced out (superseded attempt); "
+                 "state left to the newer attempt")
+        return exit_code
     core.log("[job] worker finished state=" + state + " rc=" + str(exit_code))
     return exit_code
 
