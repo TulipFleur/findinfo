@@ -53,6 +53,11 @@ MODULES = [
     "tests.test_coverage_semantics",
     "tests.test_release_bundle",
     "tests.test_shipped_manifest",
+    "tests.test_extract_scope_split",
+    "tests.test_fake_ip_guard",
+    "tests.test_js_property_chains",
+    "tests.test_dns_wildcard_probe",
+    "tests.test_asset_timestamps",
 ]
 
 

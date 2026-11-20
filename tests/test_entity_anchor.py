@@ -108,3 +108,99 @@ def test_named_domains_sort_ahead_of_anchored_ones():
     rd = sorted(core.RUNS_DIR.glob("*"), key=lambda p: p.stat().st_mtime)[-1]
     summary = json.loads((rd / "summary.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert summary["seed_domains"][0] == "named-target.cn", summary["seed_domains"]
+
+
+# ---------------------------------------------------------------- anchoring gate
+# A real run against a college name came back from aiqicha with 13 meituan-group
+# companies and 27 of their ICP domains. Nothing in the pipeline noticed: the
+# stranger's domains were stored under the requested name at confidence 0.9 and
+# the next stage dutifully started probing www.meituan.com. These tests pin the
+# gate that now refuses that answer.
+
+def test_name_matching_rejects_a_lookalike_entity():
+    """A shared word is not an identity; only real overlap anchors a name."""
+    tools = fresh_tools(fresh_core())
+    assert tools.name_matches("湖南信息职业技术学院", "湖南信息职业技术学院")
+    assert tools.name_matches("北京三快科技有限公司", "北京三快科技有限公司长沙分公司")
+    assert tools.name_matches("北京三快科技有限公司", "北京三快科技")
+    assert not tools.name_matches("湖南信息职业技术学院", "北京三快科技有限公司")
+    assert not tools.name_matches("湖南信息职业技术学院", "长沙民政职业技术学院")
+
+
+def test_norm_entity_name_strips_legal_form_and_spacing():
+    tools = fresh_tools(fresh_core())
+    assert tools.norm_entity_name(" 北京三快科技有限公司 ") == "北京三快科技"
+    assert tools.norm_entity_name("北京三快科技") == "北京三快科技"
+
+
+def test_harvested_strangers_are_rejected_and_never_stored():
+    """t_enscan must refuse to store an entity that is not the requested one."""
+    core = fresh_core()
+    tools = fresh_tools(core)
+    store = core.Store()
+    stranger = {
+        "enterprise_info": [{"name": "北京三快科技有限公司"}],
+        "icp": [{"domain": "meituan.com", "icp": "京ICP备10211739号-1"},
+                {"domain": "qiaoyuai.com", "icp": "京ICP备10211739号-64"}],
+    }
+    outdir = core.RUNS_DIR / "enscan"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def _write(*_a, **_kw):
+        # t_enscan snapshots the directory before running the binary, so the
+        # fixture JSON has to appear "when the tool ran", not before it.
+        (outdir / "someid.json").write_text(json.dumps(stranger), encoding="utf-8")
+        return (0, "", "")
+
+    with mock.patch.object(tools.core, "run", side_effect=_write):
+        r = tools.t_enscan(store, "湖南信息职业技术学院", outdir=outdir)
+    assert r.get("anchor_failed") is True, r
+    assert r["companies"] == [] and r["domains"] == [] and r["icp"] == []
+    assert core.Store().get_assets(kind="domain") == [], "stranger's domains were stored"
+    assert core.Store().get_assets(kind="company") == [], "stranger was stored as the target"
+
+
+def test_anchored_entity_still_stores_domains():
+    """The gate must not break the normal case: a matching entity is kept."""
+    core = fresh_core()
+    tools = fresh_tools(core)
+    store = core.Store()
+    good = {
+        "enterprise_info": [{"name": "湖南信息职业技术学院"}],
+        "icp": [{"domain": "hnxxzy.cn", "icp": "湘ICP备00000000号-1"}],
+    }
+    outdir = core.RUNS_DIR / "enscan2"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def _write(*_a, **_kw):
+        (outdir / "good.json").write_text(json.dumps(good), encoding="utf-8")
+        return (0, "", "")
+
+    with mock.patch.object(tools.core, "run", side_effect=_write):
+        r = tools.t_enscan(store, "湖南信息职业技术学院", outdir=outdir)
+    assert not r.get("anchor_failed"), r
+    assert r["companies"] == ["湖南信息职业技术学院"], r
+    assert "hnxxzy.cn" in r["domains"], r
+
+def test_icp_regex_matches_real_registration_numbers():
+    """Real filings read "<province>ICP备<n>号-<m>" with NO letter.
+
+    The pattern required one letter between the province and ICP, so every
+    real ICP number harvested from ENScan was discarded and the ICP stage
+    silently contributed nothing.
+    """
+    import tests.util  # noqa: F401
+    from lib import tools
+    assert tools.ICP_RE.findall("湘ICP备05009865号-1") == ["湘ICP备05009865号-1"]
+    assert tools.ICP_RE.findall("京ICP备10211739号-64") == ["京ICP备10211739号-64"]
+    # the lettered form still parses where a site uses it
+    assert tools.ICP_RE.findall("沪ICP证000001号")
+
+
+def test_harvest_entity_collects_icp_numbers():
+    import tests.util  # noqa: F401
+    from lib import tools
+    row = {"icp": [{"domain": "hniu.cn", "icp": "湘ICP备05009865号-1",
+                    "website": "www.hniu.cn"}]}
+    got = tools.harvest_entity(row)
+    assert "湘ICP备05009865号-1" in got["icp"], got

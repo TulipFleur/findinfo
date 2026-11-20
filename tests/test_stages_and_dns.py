@@ -23,7 +23,9 @@ class _FakeRun:
     def __call__(self, cmd, timeout=300, input_text=None, cwd=None, env=None):
         cmd = list(cmd)
         for needle, res in self.outputs:
-            if any(needle in str(c) for c in cmd):
+            # The wildcard probe carries its name on stdin, not in argv, so the
+            # scripted pattern has to be matched against both.
+            if any(needle in str(c) for c in cmd) or needle in (input_text or ""):
                 return res
         return 0, "", ""
 
@@ -252,7 +254,7 @@ def test_completed_run_then_crawl_executes():
         return {"count": len(urls), "rows": [], "truncated": False, "ok": True,
                 "rc": 0, "dropped_out_of_scope": 0, "scope": scope_domains or []}
 
-    def fake_extract(store_, rows, urls=None, timeout=0, fetch_limit=40):
+    def fake_extract(store_, rows, urls=None, timeout=0, fetch_limit=40, scope=None):
         return {"count_domains": 0, "count_ips": 0, "fetched": 0,
                 "js_discovered": 0, "api_paths": [], "api_hosts": 0,
                 "secrets": {}, "domains": [], "ips": []}

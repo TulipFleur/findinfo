@@ -449,6 +449,7 @@ def collect(store, match=None, min_conf=0.4, limit=300, ep_limit=400,
             "endpoints": len(eps), "params": params[:12], "sensitive": sensitive[:6],
             "score": score, "priority": priority, "reasons": _uniq(reasons)[:6],
             "first_seen": a.get("first_seen") or "",
+            "last_seen": a.get("last_seen") or "",
         })
 
     order = {"high": 0, "medium": 1, "low": 2, "info": 3}

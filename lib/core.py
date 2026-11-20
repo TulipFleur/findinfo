@@ -981,6 +981,62 @@ pdf doc docx xls xlsx ppt pptx csv zip rar 7z gz tgz bz2 tar iso dmg
 woff woff2 ttf eot otf
 css? _ inc bak old log tmp swp sql db
 """.split())
+# Interior labels that only ever appear inside a JS property chain, never in
+# a hostname a recon run legitimately sees: jQuery UI widgets, ECharts
+# internals, DOM geometry and event plumbing. Matched against lower-cased
+# labels of every position except the last.
+# TLDs that are ALSO everyday JS/DOM property names. jQuery/ECharts bundles
+# yield i.find.id, ge.td, xt.host, li.eq, thumbobj.click, ex.name, ce.fn: every
+# label is a property word and the last one happens to be a real suffix, so the
+# public-suffix check in canon_domain passes it. Enumerating every property
+# name cannot work (i.find.id uses "find"), so the test is inverted: for these
+# suffixes require POSITIVE evidence that the second-level label is a real
+# organisation name -- a hyphen, a digit, or a word that is not a known
+# property/object word. hniu.cn, mail.example.com and my-api.example.cn are
+# unaffected because .cn/.com are not in this set.
+_AMBIGUOUS_TLDS = frozenset("""
+id td th fn eq on is host name click top run build link live life world
+today space website fun press rocks social media news blog page network
+systems solutions services digital agency studio design software tools codes
+zone fit games wiki email art band cafe city company center
+""".split())
+
+# Words that appear as property/object names in minified JS and are never a
+# registrable organisation label on their own.
+_JS_WORDS = frozenset("""
+find filter name names eq lt gt fn td th tr host hosts id ids obj opt opts t e i
+o a b c el els ev e v k p s n m x y z key keys data item items val value index
+len length text html node nodes type target style class list map set get add
+remove push pop each this self window document prototype constructor
+""".split())
+
+
+def _looks_like_js_chain(labels: list) -> bool:
+    """True when a .tld-shaped label list reads as an object property chain."""
+    if len(labels) < 2:
+        return False
+    if labels[-1] not in _AMBIGUOUS_TLDS:
+        return False
+    second = labels[-2]
+    if "-" in second or any(ch.isdigit() for ch in second):
+        return False            # my-api.example / api2.example: a real label
+    if second not in _JS_WORDS and len(second) >= 5:
+        return False            # a plausible word: hniu, school, example
+    return True
+
+
+_JS_DOM_PROPERTY_LABELS = frozenset("""
+style options animation clienty clientx offset position overflowoffset
+browserinfo osinfo activegroup pagey pagex railpadding axispointer boundaries
+componentoptions selectiondrag pseudos rail value size
+""".split())
+
+# Names that look like the above but are also legitimate registrable domains.
+_JS_PROPERTY_DOMAINS = frozenset("""
+tr
+""".split())
+
+
 
 # JS expressions also look like hostnames: `window.top`, `popover.style.top`,
 # `t.top-i.top` are property accesses, not domains. `.top` is a real TLD, so a
@@ -1095,6 +1151,23 @@ def canon_domain(value: str) -> str | None:
     # second-level label never contains one of these operator-prone patterns.
     if re.search(r"\.(top|left|right|bottom)-", v):
         return None
+    # Property chains whose LAST label is a real TLD word. jQuery/ECharts
+    # bundles produce `e.animation.on`, `options.name`, `abel.tr`: every label
+    # is a DOM/JS property and the final one happens to be a real TLD
+    # (.top/.name/.on/.tr), so the suffix guard above lets it through. A real
+    # host never has an interior label that is a JS property word; when one
+    # does, and the name is not a known registrable domain, drop it.
+    # `e.clienty-n.top`: a JS subtraction inside a label. Split on the
+    # hyphen and test the pieces against the same property vocabulary.
+    if any(part in _JS_DOM_PROPERTY_LABELS
+           for lbl in labels[:-1] if "-" in lbl
+           for part in lbl.split("-") if part):
+        return None
+    if v not in _JS_PROPERTY_DOMAINS:
+        if any(lbl in _JS_DOM_PROPERTY_LABELS for lbl in labels[:-1]):
+            return None
+        if _looks_like_js_chain(labels):
+            return None
     return v
 
 
@@ -1453,6 +1526,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
   status INTEGER,
   title TEXT,
   first_seen TEXT NOT NULL,
+  last_seen TEXT,
   UNIQUE(asset, method, path, params)
 );
 CREATE TABLE IF NOT EXISTS steps (
@@ -1486,6 +1560,7 @@ CREATE TABLE IF NOT EXISTS asset_links (
   owner TEXT NOT NULL,          -- the domain/engagement it relates to
   source TEXT NOT NULL DEFAULT '',
   first_seen TEXT NOT NULL,
+  last_seen TEXT,
   UNIQUE(kind, canonical, relation, owner)
 );
 CREATE INDEX IF NOT EXISTS idx_assets_kind ON assets(kind);
@@ -1527,7 +1602,34 @@ class Store:
             pass
         self.conn.isolation_level = None      # explicit transactions only
         self.conn.executescript(SCHEMA)
+        self._migrate_seen_columns()
         self.conn.commit()
+
+    def _migrate_seen_columns(self) -> None:
+        """Add last_seen to older databases that predate it.
+
+        CREATE TABLE IF NOT EXISTS never touches an existing table, so a
+        store created before last_seen existed would keep the old shape and
+        every write would fail. The migration is idempotent: PRAGMA reports
+        the columns already present and nothing is altered twice.
+        """
+        for table in ("endpoints", "asset_links"):
+            try:
+                cols = [r[1] for r in self.conn.execute(
+                    "PRAGMA table_info(" + table + ")").fetchall()]
+            except sqlite3.Error:
+                continue
+            if not cols or "last_seen" in cols:
+                continue
+            try:
+                self.conn.execute(
+                    "ALTER TABLE " + table + " ADD COLUMN last_seen TEXT")
+                # Backfill: an asset discovered before this column existed
+                # was last observed at least at first_seen, never earlier.
+                self.conn.execute(
+                    "UPDATE " + table + " SET last_seen=first_seen WHERE last_seen IS NULL")
+            except sqlite3.Error:
+                pass
 
     @contextlib.contextmanager
     def _write(self):
@@ -1586,19 +1688,19 @@ class Store:
                    owner: str, source: str = "") -> bool:
         """Record that `canonical` relates to `owner` (idempotent).
 
-        INSERT OR IGNORE on (kind, canonical, relation, owner): re-observing the
-        same pairing is a no-op, so re-runs and migrations cannot fan the table
-        out. Old databases get the table via CREATE TABLE IF NOT EXISTS on open.
+        Keyed on (kind, canonical, relation, owner): re-observing the same
+        pairing does not fan the table out, but it DOES move last_seen forward
+        (see _link). Returns True when the edge is new.
         """
         if not canonical or not owner or not relation:
             return False
         with self._write():
-            cur = self.conn.execute(
-                "INSERT OR IGNORE INTO asset_links"
-                "(kind,canonical,relation,owner,source,first_seen)"
-                " VALUES(?,?,?,?,?,?)",
-                (kind, canonical, relation, owner, source or "", now()))
-            return bool(cur.rowcount)
+            before = self.conn.execute(
+                "SELECT id FROM asset_links"
+                " WHERE kind=? AND canonical=? AND relation=? AND owner=?",
+                (kind, canonical, relation, owner)).fetchone()
+            self._link(kind, canonical, relation, owner, source or "", now())
+            return before is None
 
     def linked_owners(self, kind: str, canonical: str,
                       relation: str | None = None) -> list[str]:
@@ -1625,6 +1727,37 @@ class Store:
             sql += " AND relation=?"
             args.append(relation)
         return [r["canonical"] for r in self.conn.execute(sql, args)]
+
+    def _link(self, kind: str, canonical: str, relation: str, owner: str,
+              source: str, ts: str) -> None:
+        """Record one (asset, relation, owner) edge, refreshing last_seen.
+
+        A re-observation is the whole point of last_seen: an edge that is
+        still being seen must move forward instead of staying pinned to the
+        first time it was discovered. The source token is merged rather than
+        overwritten, so the row keeps every upstream that ever reported it.
+        """
+        if not (canonical and owner):
+            return
+        try:
+            row = self.conn.execute(
+                "SELECT id, source FROM asset_links"
+                " WHERE kind=? AND canonical=? AND relation=? AND owner=?",
+                (kind, canonical, relation, owner)).fetchone()
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO asset_links"
+                    "(kind,canonical,relation,owner,source,first_seen,last_seen)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (kind, canonical, relation, owner, source or "", ts, ts))
+            else:
+                merged = self._merge_sources(row["source"] or "", source or "")
+                self.conn.execute(
+                    "UPDATE asset_links SET last_seen=?, source=? WHERE id=?",
+                    (ts, merged, row["id"]))
+        except sqlite3.Error:
+            pass
+
 
     def upsert_asset(self, kind: str, canonical: str, source: str,
                      confidence: float = 0.4, passivity: str = "passive",
@@ -1656,14 +1789,7 @@ class Store:
                     (kind, canonical, parent, merged, conf, passivity,
                      json.dumps(attrs or {}, ensure_ascii=False), ts, ts))
                 if parent:
-                    try:
-                        self.conn.execute(
-                            "INSERT OR IGNORE INTO asset_links"
-                            "(kind,canonical,relation,owner,source,first_seen)"
-                            " VALUES(?,?,?,?,?,?)",
-                            (kind, canonical, "resolved_from", parent, source or "", ts))
-                    except Exception:
-                        pass
+                    self._link(kind, canonical, "resolved_from", parent, source, ts)
                 return canonical, True
             merged = self._merge_sources(row["sources"], source)
             distinct = len(source_upstreams(merged))
@@ -1686,14 +1812,7 @@ class Store:
                 # Keep the many-to-many side in step with the single-valued
                 # parent column: parent tells you one owner, asset_links tells
                 # you every owner ever seen (see the SCHEMA note).
-                try:
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO asset_links"
-                        "(kind,canonical,relation,owner,source,first_seen)"
-                        " VALUES(?,?,?,?,?,?)",
-                        (kind, canonical, "resolved_from", parent, source or "", ts))
-                except Exception:
-                    pass
+                self._link(kind, canonical, "resolved_from", parent, source, ts)
         return canonical, False
 
     # -- JS work queue -----------------------------------------------------
@@ -1823,14 +1942,19 @@ class Store:
                 "SELECT id FROM endpoints WHERE asset=? AND method=? AND path=? AND params=?",
                 (asset, method, path, params)).fetchone()
             if row:
+                # Re-observing an endpoint moves last_seen forward; first_seen
+                # stays put so "when did we first see this path" survives a
+                # rerun that merely confirms it again.
                 self.conn.execute(
-                    "UPDATE endpoints SET status=COALESCE(?,status), title=COALESCE(?,title) WHERE id=?",
-                    (status, title, row["id"]))
+                    "UPDATE endpoints SET status=COALESCE(?,status),"
+                    " title=COALESCE(?,title), last_seen=? WHERE id=?",
+                    (status, title, ts, row["id"]))
                 return False
             self.conn.execute(
-                "INSERT INTO endpoints(asset,method,path,params,source,status,title,first_seen)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (asset, method, path, params, source, status, title, ts))
+                "INSERT INTO endpoints"
+                "(asset,method,path,params,source,status,title,first_seen,last_seen)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (asset, method, path, params, source, status, title, ts, ts))
         return True
 
     def get_endpoints(self, asset: str | None = None, limit: int = 100000) -> list[dict]:
@@ -1903,6 +2027,26 @@ class Store:
             n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(doomed)
         return {"assets": n, "endpoints": ep, "filter": w,
                 "endpoints_touched": ep_touched}
+
+    def clear_steps(self, canon: list[str] | None = None) -> int:
+        """Forget stage checkpoints whose inputs were just deleted.
+
+        Dropping assets while `steps` still says done is self-contradictory:
+        the next run skips the stage and every downstream stage starves for
+        input (seen with `clean --all` before an ENScan re-run). canon=None
+        clears every checkpoint, which is what an unfiltered wipe means.
+        """
+        with self._write():
+            if not canon:
+                cur = self.conn.execute("DELETE FROM steps")
+                return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            n = 0
+            for m in canon_scope(canon):
+                cur = self.conn.execute(
+                    "DELETE FROM steps WHERE input_hash LIKE ?",
+                    ("%" + m + "%",))
+                n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            return n
 
     def vacuum(self) -> None:
         """Reclaim disk after a big purge (WAL is checkpointed first)."""

@@ -108,7 +108,9 @@ def test_wildcard_answers_are_filtered_and_reported():
     import json
 
     def fake_run(cmd, timeout=300, input_text=None, cwd=None, env=None):
-        if any("wildcard-probe" in str(c) for c in cmd):
+        # the probe name travels on stdin, not in argv
+        if any("wildcard-probe" in str(c) for c in cmd) or \
+                "wildcard-probe" in (input_text or ""):
             return 0, json.dumps({"host": "findinfo-wildcard-probe-9f3a.w.example.com",
                                   "a": ["9.9.9.9"]}), ""
         return 0, "", ""

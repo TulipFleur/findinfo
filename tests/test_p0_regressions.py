@@ -222,3 +222,35 @@ def test_clean_match_dry_run_agrees_with_real_run():
     real = _clean(["--match", "example.com"])
     assert real["assets"] == preview["assets"], (
         "preview said %s, real run deleted %s" % (preview["assets"], real["assets"]))
+
+
+def test_clean_all_also_forgets_stage_checkpoints():
+    """Assets gone but `steps` still "done" makes the next run skip a stage.
+
+    Real failure: after `clean --all`, `run` logged "stage entity skipped
+    (done for these inputs)" against an empty store and died with "no seed
+    domain" -- the checkpoint survived the data it was derived from.
+    """
+    core = fresh_core()
+    _seed(core, "a.example.com", "b.example.com")
+    store = core.Store()
+    store.set_step("default", "entity", "hash1", "done")
+    assert store.step_done("default", "entity", "hash1") is True
+    payload = _clean(["--all", "--yes"])
+    assert payload.get("deleted") is True
+    assert payload.get("steps_cleared", 0) >= 1, payload
+    assert store.step_done("default", "entity", "hash1") is False, (
+        "a stage checkpoint outlived the assets it was computed from")
+
+
+def test_scoped_clean_forgets_only_matching_checkpoints():
+    core = fresh_core()
+    _seed(core, "a.example.com", "b.other.com")
+    store = core.Store()
+    store.set_step("default", "entity", "hash-example.com", "done")
+    store.set_step("default", "entity2", "hash-other.com", "done")
+    payload = _clean(["--match", "example.com"])
+    assert payload.get("steps_cleared") == 1, payload
+    assert store.step_done("default", "entity", "hash-example.com") is False
+    assert store.step_done("default", "entity2", "hash-other.com") is True, (
+        "an unrelated checkpoint was cleared")

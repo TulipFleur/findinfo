@@ -458,6 +458,24 @@ def _worker_flags() -> int:
     return 0
 
 
+def _windowless_python() -> str:
+    """The interpreter to run the detached worker under.
+
+    `sys.executable` is usually python.exe, a CONSOLE program. Started with
+    DETACHED_PROCESS on Windows, a console program still gets a console of its
+    own, so every `--background` run flashed a black cmd window on the user's
+    desktop and left it there for the length of the run. pythonw.exe is the
+    same interpreter without a console.
+    """
+    if os.name != "nt":
+        return sys.executable
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        cand = exe.with_name("pythonw.exe")
+        if cand.exists():
+            return str(cand)
+    return sys.executable
+
 def spawn(ref) -> int:
     """Start the detached worker for a prepared run dir; returns its pid."""
     rd = resolve(ref)
@@ -467,7 +485,7 @@ def spawn(ref) -> int:
     env.update(spec.get("env") or {})
     env["PYTHONIOENCODING"] = "utf-8"
     env["FINDINFO_JOB_ID"] = rd.name
-    cmd = [sys.executable, str(Path(root) / "findinfo.py"), "__worker", str(rd)]
+    cmd = [_windowless_python(), str(Path(root) / "findinfo.py"), "__worker", str(rd)]
     out = open(rd / "stdout.log", "ab")
     err = open(rd / "stderr.log", "ab")
     kw = {}

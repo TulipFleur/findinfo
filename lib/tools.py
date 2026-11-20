@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import atexit
 import json
+import ipaddress
 import os
 import urllib.error
 import urllib.request
 import uuid
 import re
 import socket
-import tempfile
 import threading
 import time
 import concurrent.futures as futures
@@ -26,18 +26,27 @@ from . import core
 
 # ---------------------------------------------------------------- helpers
 BASE_RE = re.compile(r"^([a-z0-9-]+\.)+[a-z]{2,}$", re.I)
-ICP_RE = re.compile(r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-Za-z]ICP[备证]\d+号(?:-\d+)?")
+# Real records read 湘ICP备05009865号-1 (no letter between the province and ICP); old
+# formats allow one letter, so it is optional rather than required. Requiring
+# it made every real ICP number invisible to the harvester.
+ICP_RE = re.compile(r"[\u4eac\u6d25\u6caa\u6e1d\u5180\u8c6b\u4e91\u8fbd\u9ed1\u6e58\u7696\u9c81\u65b0\u82cf\u6d59\u8d63\u9102\u6842\u7518\u664b\u8499\u9655\u5409\u95fd\u8d35\u7ca4\u9752\u85cf\u5ddd\u5b81\u743c][A-Za-z]?ICP[\u5907\u8bc1]\d+\u53f7(?:-\d+)?")
 DOMAIN_RE = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24})\b", re.I)
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 
 
-_TMP_FILES: list[str] = []
+# Tool input lists live in DATA/_tmp. Each call REUSES one slot per suffix
+# instead of minting a new mkstemp name: a long background run calls this on
+# every stage of every round, and with atexit-only cleanup the directory grew
+# without bound until the process exited (a 20-minute run left dozens of
+# multi-megabyte dnsx/httpx inputs behind). One file per stage is overwritten
+# in place, so the on-disk footprint stays at (#suffixes) files.
+_TMP_FILES: dict[str, str] = {}
 
 
 def _cleanup_tmp() -> None:
-    for p in _TMP_FILES:
+    for path in list(_TMP_FILES.values()):
         try:
-            os.remove(p)
+            os.remove(path)
         except Exception:
             pass
     _TMP_FILES.clear()
@@ -47,14 +56,20 @@ atexit.register(_cleanup_tmp)
 
 
 def _tmp_lines(rows: list[str], suffix: str = ".txt") -> str:
-    """Write a temp input list; auto-deleted at process exit."""
+    """Write a tool input list into a per-suffix slot, overwriting it.
+
+    The file is truncated in place, so nothing accumulates while a long run
+    is in flight. It is still removed at process exit.
+    """
     tmpdir = core.DATA / "_tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
-    fd, path = tempfile.mkstemp(suffix=suffix, dir=str(tmpdir))
-    with open(fd, "w", encoding="utf-8") as fh:
-        fh.write(chr(10).join([r for r in rows if r]))
-        fh.write(chr(10))
-    _TMP_FILES.append(path)
+    path = _TMP_FILES.get(suffix)
+    if not path:
+        path = str(tmpdir / ("stdin" + suffix))
+        _TMP_FILES[suffix] = path
+    body = chr(10).join([r for r in rows if r]) + chr(10)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(body)
     return path
 
 
@@ -68,7 +83,16 @@ def _uniq(seq) -> list:
 
 
 def _looks_public(domain: str) -> bool:
-    return bool(BASE_RE.match(domain or "")) and "." in domain
+    """True when the value is a host a recon run could plausibly see.
+
+    This is not a shape check: core.canon_domain already enforces the shape
+    and rejects JS property chains (`e.style.top`), file names (`x.js`) and
+    anything without a real public suffix. Testing the shape again with a
+    looser regex let every one of those back in -- a live run stored 145
+    bogus "domains" (`b.filter.id`, `math.pi`, `arg.lengths`) out of 181,
+    so 80% of the domain list was JavaScript noise.
+    """
+    return bool(core.canon_domain(domain or ""))
 
 
 BARE_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$", re.I)
@@ -192,10 +216,11 @@ class _FileLock:
         return False
 
 
-def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
+def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
              outdir: Path | None = None, timeout: int = 0,
-             field: str = "icp,app,wx_app,wechat,copyright,supplier,invest,enterprise_info",
-             delay: int = 2) -> dict:
+             field: str = "icp,app,wx_app,wechat,copyright,invest,enterprise_info",
+             delay: int = 2, supplier: bool = False,
+             branch: bool = False) -> dict:
     exe = core.tool("enscan")
     outdir = outdir or (core.RUNS_DIR / "enscan")
     outdir.mkdir(parents=True, exist_ok=True)
@@ -204,7 +229,14 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
     before = {p.resolve() for p in outdir.rglob("*.json")}
     cmd = [exe, "-n", name, "-invest", str(invest), "-deep", str(deep),
            "-json", "-out-dir", str(outdir), "-type", "aqc",
-           "-branch", "-supplier", "-delay", str(delay)]
+           "-delay", str(delay), "-is-fast"]
+    # Supplier/branch expansion walks OTHER companies (a supplier network
+    # depth-first for pages on end) and returns almost no asset rows for the
+    # target, so both are opt-in: coverage first, quota and time after.
+    if branch:
+        cmd += ["-branch"]
+    if supplier:
+        cmd += ["-supplier"]
     if field:
         cmd += ["-field", field]
     core.log("enscan: " + " ".join(cmd[1:]))
@@ -212,7 +244,23 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
     # run for tens of minutes against aiqicha. Say so up front and keep a beat,
     # so a waiting agent can tell "working" from "stuck".
     core.log("enscan: deep=" + str(deep) + " fields=" +
-             str(len(field.split(",")) if field else 0) + " — this can take 10+ min")
+             str(len(field.split(",")) if field else 0) + " - this can take 10+ min")
+    # ENScan persists its unfinished JOB queue in bin/enscan.gob and RESUMES it
+    # on the next start -- even when the new command asks for a different query.
+    # One interrupted deep query (a 79-page branch walk killed at the 20 min
+    # cap) then poisons every later run: each invocation reloads that queue and
+    # times out without exporting anything. Observed live: 350 s timeouts with
+    # 'remaining batch tasks=1' until the file was deleted, then 12 s and a
+    # normal export. Stale state is never worth resuming across runs here, so
+    # drop it before launching; the file is a cache, not a data source.
+    _enscan_cache = Path(exe).parent / "enscan.gob"
+    try:
+        _enscan_cache.unlink()
+        core.log("enscan: dropped stale job cache " + str(_enscan_cache))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        core.log("enscan: could not drop job cache: " + str(exc))
     # serialized: two enscan.exe at once return the first query's entity
     with _ENSCAN_LOCK, _FileLock(core.DATA / "enscan.lock", timeout=1800):
         rc, out, err = core.run(cmd, timeout=timeout, cwd=str(core.BIN),
@@ -244,13 +292,30 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
         got = harvest_entity(data)
         for k in merged:
             merged[k].extend(got[k])
-        store.upsert_asset("company", got_name(p, name), source="enscan",
-                           confidence=0.9, passivity="passive")
     for k in merged:
         merged[k] = _uniq(merged[k])
+    # ANCHORING GATE. Only entities that really are the requested one may
+    # contribute assets. aiqicha answers a MISS with a popular lookalike, so
+    # trusting the response wrote another company 42 domains and 27 ICP
+    # numbers into the store under the user name at confidence 0.9 -- the
+    # worst failure mode, because the report then looks authoritative.
+    kept, rejected = filter_entities(merged["companies"], name)
+    if not kept:
+        core.log("enscan: no entity matched " + str(name) +
+                 "; discarding " + str(len(rejected)) + " unrelated result(s)" +
+                 ((": " + ", ".join(rejected[:3])) if rejected else "") +
+                 " -- unanchored (coverage gap), not this entity")
+        return {"rc": rc, "json_files": files, "stderr": err[-800:],
+                "table_only": files == 0 and table,
+                "anchor_failed": True, "rejected": rejected[:20],
+                "companies": [], "icp": [], "domains": [], "apps": []}
+    merged["companies"] = kept
+    for c in kept:
+        store.upsert_asset("company", c, source="enscan",
+                           confidence=0.9, passivity="passive")
     for d in merged["domains"]:
         store.upsert_asset("domain", d, source="enscan", confidence=0.9,
-                           passivity="passive", parent=name)
+                           passivity="passive", parent=kept[0])
     # Keep ICP numbers as first-class assets: `icp --from-store` and later
     # reverse-lookup rounds read them back, so a run must not be the only place
     # they exist.
@@ -261,6 +326,10 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
         core.log("enscan: printed a report table but wrote no JSON to " +
                  str(outdir) + " — entity data could not be parsed; treat as a "
                  "coverage gap, not as 'this company has no assets'")
+    if kept and not merged["domains"]:
+        core.log("enscan: anchored " + kept[0] +
+                 " but this source filed no domain -- the company is real, its "
+                 "domain set is simply empty here")
     return {"rc": rc, "json_files": files, "stderr": err[-800:],
             "table_only": files == 0 and table,
             "companies": merged["companies"][:200],
@@ -268,7 +337,76 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 2,
             "apps": merged["apps"][:100]}
 
 
+# Entity-name anchoring: what makes an ENScan hit THIS target and not
+# another company. aiqicha answers a query that misses with a popular
+# lookalike (a search for a college name came back with 13 meituan-group
+# companies), and accepting those wrote another company's 42 domains into
+# the store under the user's name at confidence 0.9.
+_NAME_STRIP = " ()\uff08\uff09\u00b7.,\uff0c\u3001-\u2014_\u3000\u2308\u2309\u300c\u300d\u3010\u3011\u3008\u3009\u300a\u300b"
+_NAME_SUFFIX = (
+    "\u6709\u9650\u8d23\u4efb\u516c\u53f8", "\u80a1\u4efd\u6709\u9650\u516c\u53f8",
+    "\u6709\u9650\u516c\u53f8", "\u80a1\u4efd\u516c\u53f8", "\u5206\u516c\u53f8",
+    "\u96c6\u56e2", "\u516c\u53f8", "\u4f01\u4e1a", "\u5382", "\u5e97",
+)
+
+
+def norm_entity_name(name: str) -> str:
+    """Comparable form of a company/school name (no legal form, no spaces).
+
+    The legal suffix is dropped because the same entity is written both ways
+    ("X Tech Co Ltd" in the registry, "X Tech" in a report), and a suffix
+    mismatch must not read as "a different company".
+    """
+    s = str(name or "").strip()
+    for ch in _NAME_STRIP:
+        s = s.replace(ch, "")
+    s = s.lower()
+    for suf in _NAME_SUFFIX:
+        if s.endswith(suf) and len(s) > len(suf) + 1:
+            s = s[: -len(suf)]
+            break
+    return s
+
+
+def name_matches(wanted: str, got: str) -> bool:
+    """Whether entity ``got`` is plausibly the entity the user asked for.
+
+    Deliberately strict: a substring hit on one shared word is how a college
+    query got answered with a delivery company. Two rules pass: one name
+    contains the other after normalisation (a parent company vs its branch),
+    or the two share a long common prefix covering most of both names.
+    Anything else is reported as unanchored, never silently used.
+    """
+    a, b = norm_entity_name(wanted), norm_entity_name(got)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 4 and short in long_:
+        return True
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= 6 and n >= min(len(a), len(b)) - 1
+
+
+def filter_entities(companies: list, wanted: str) -> tuple:
+    """Split harvested company names into (kept, rejected).
+
+    ``kept`` is empty when NOTHING matched: the caller then reports an
+    unanchored entity instead of harvesting a stranger's assets.
+    """
+    kept, rejected = [], []
+    for c in companies or []:
+        (kept if name_matches(wanted, c) else rejected).append(c)
+    return _uniq(kept), _uniq(rejected)
+
+
 def got_name(p: Path, fallback: str) -> str:
+
     return p.stem or fallback
 
 
@@ -681,6 +819,24 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     return out
 
 
+# Clash/TUN and similar transparent proxies answer every A query with an
+# address in 198.18.0.0/15. Those are placeholders, not the host's real IP:
+# probing them reaches the proxy, not the target. Treated as "no evidence",
+# never as a hit.
+FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
+def is_fake_ip(value: str) -> bool:
+    """True for a proxy placeholder address (198.18.0.0/15)."""
+    ip = core.canon_ip(value)
+    if not ip:
+        return False
+    try:
+        return ipaddress.ip_address(ip) in FAKE_IP_NET
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------- 5. DNS resolve + wildcard
 def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
     """Resolve domains with wildcard filtering.
@@ -698,18 +854,39 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
         return {"count": 0, "domains": [], "wildcard": [], "ok": True, "rc": 0}
     # wildcard probe per registrable parent domain
     wildcard: dict[str, str] = {}
+    fake_resolver = False
     parents = sorted({core.registrable_domain(d) for d in domains
                       if core.registrable_domain(d)})
     if core.has_tool("dnsx"):
         for p in parents[:20]:
             probe = "findinfo-wildcard-probe-9f3a." + p
-            rc, out, err = core.run([core.tool("dnsx"), "-d", probe, "-a", "-resp",
-                                     "-silent", "-json"], timeout=timeout)
+            # The name goes in on STDIN. `-d` is dnsx's WORDLIST driver and
+            # fails with "missing wordlist(w) flag required with domain(d)
+            # input", so the old call returned rc=1 with an empty body: the
+            # wildcard table stayed empty and every name in a wildcard zone
+            # (hniu.com answers ANY label) was stored as a real asset.
+            rc, out, err = core.run([core.tool("dnsx"), "-a", "-resp",
+                                     "-silent", "-json"],
+                                    input_text=probe, timeout=timeout)
             for r in core.parse_jsonl(out):
                 for a in r.get("a", []) or []:
+                    # A fake-IP resolver (Clash/TUN, 198.18.0.0/15) answers
+                    # EVERY name, existing or not, so "this parent has a
+                    # wildcard" would be true for every parent and the filter
+                    # would drop the entire target. Detect the resolver lying
+                    # and skip the wildcard pass instead of trusting it.
+                    if is_fake_ip(a):
+                        fake_resolver = True
+                        continue
                     wildcard[p] = a
     exe = core.tool("dnsx")
     path = _tmp_lines(domains)
+    if fake_resolver:
+        wildcard.clear()
+        core.log("wildcard filtering disabled: the resolver answers "
+                 "every name with a fake-IP address (198.18.0.0/15), so a "
+                 "wildcard probe proves nothing; liveness/cert evidence "
+                 "decides which names are real")
     core.log("dnsx resolving " + str(len(domains)) +
              " (wildcard parents: " + str(len(wildcard)) + ")")
     rows: list[dict] = []
@@ -722,11 +899,22 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
 
         Shared by dnsx output and the system-resolver fallback so both paths
         apply identical filtering rules.
+
+        Fake-IP answers (Clash/TUN 198.18.0.0/15) are dropped HERE, not in one
+        branch: dnsx runs through the same tunnel as the system resolver, so a
+        filter applied only to the fallback let a live run store 35 IP assets
+        that were all 198.18.210.x -- every port scan and vhost test then
+        aimed at the proxy, not the target.
         """
         nonlocal total
+        ips = [x for x in (ips or []) if x and not is_fake_ip(x)]
+        # A name that answers with its OWN address in a wildcard zone is real;
+        # one that merely echoes the wildcard's address is unproven. The
+        # existence-only test cannot be used here: hosts inside a wildcard
+        # zone commonly share the address, so it would delete the target.
         wc = wildcard.get(core.registrable_domain(d) or "")
         if wc and wc in ips:
-            return            # wildcard zone: random names resolve here too
+            return
         total += 1
         for ip in ips:
             store.upsert_asset("ip", ip, source=source, confidence=0.6,
@@ -1307,7 +1495,8 @@ def extract_from_text(text: str, root_domains: list[str]) -> dict:
 
 
 def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
-              timeout: int = 0, fetch_limit: int = 40) -> dict:
+              timeout: int = 0, fetch_limit: int = 40,
+              scope: list[str] | None = None) -> dict:
     """Extract leaked domains/IPs/paths/secrets from crawl output and fetched JS.
 
     Inputs are complete work sets, not display samples: `urls` should come
@@ -1330,10 +1519,20 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
         parts.append(piece)
         used += len(piece)
     text = chr(10).join(parts)
-    got = extract_from_text(text, [])
-    hit = jsleak.extract(text, [])
+    # Scan with the ROOT DOMAINS, not []. jsleak.keep_domain() is the only
+    # filter that can tell a hostname from a property chain, because it knows
+    # what the target is: `i.find.id` and `li.eq` cannot be a name under
+    # hniu.cn, while every real hit is. Passing [] disabled it, so the whole
+    # minified-bundle vocabulary reached the scope split.
+    roots = [d for d in (scope or []) if d]
+    got = extract_from_text(text, roots)
+    hit = jsleak.extract(text, roots)
     got["domains"].extend(hit["domains"])
     got["ips"].extend(hit["ips"])
+    # Unfiltered view for the related-domain report ONLY. These names are
+    # never stored; they exist so an operator can see what a bundle leaked
+    # (a vendor CDN, a third-party API) without trusting it as scope.
+    loose = jsleak.extract(text, [])
 
     # fetch JS bundles and API-ish pages, extract paths / hosts / secrets
     candidates = []
@@ -1358,7 +1557,7 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
         rc, body, err = core.curl([u], timeout=timeout)
         if rc != 0 or not body:
             return None
-        hit = jsleak.extract(body, [])
+        hit = jsleak.extract(body, roots)
         hit["_url"] = u
         return hit
 
@@ -1407,9 +1606,39 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
             continue
         seen_ep.add(key)
         store.upsert_endpoint(host, verb, tpl, [], source="jsleak")
+    # Scope split: a crawl bundle yields the TARGET's own hosts plus whatever
+    # third parties the page happens to mention (cdn.jsdelivr.net, a chat
+    # widget, the vendor's telemetry host). Both are evidence, but they are not
+    # the same asset. Storing them at the same confidence made a live run
+    # report 181 "domains" of which 145 were JS noise and third-party CDNs.
+    # In-scope names are assets; out-of-scope names are recorded as related
+    # observations that never enter the active queue.
+    scope_list = [s for s in (scope or []) if s]
+    in_scope_domains: list[str] = []
+    related_domains: list[str] = []
     for d in got["domains"]:
+        if not scope_list or core.in_scope(d, scope_list):
+            in_scope_domains.append(d)
+        else:
+            related_domains.append(d)
+    # Out-of-scope names came back filtered out of got["domains"] above; the
+    # unfiltered scan is what keeps the third-party detail visible. Only names
+    # that survive canon_domain are reported, so pure property chains (which
+    # the ambiguity rule in core rejects) do not pad the list.
+    for d in _uniq(loose.get("domains") or []):
+        if d in in_scope_domains or d in related_domains:
+            continue
+        if not core.canon_domain(d):
+            continue
+        if not scope_list or not core.in_scope(d, scope_list):
+            related_domains.append(d)
+    for d in in_scope_domains:
         store.upsert_asset("domain", d, source="leak-extract", confidence=0.4,
                            passivity="passive")
+    # Out-of-scope hits are NOT stored. They are reported (related_domains) so
+    # a human can see what a bundle leaked, but writing them made 711 of 747
+    # "domain assets" on a live run pure JS property chains -- every query,
+    # count and report then described JavaScript instead of the target.
     for ip in got["ips"]:
         store.upsert_asset("ip", ip, source="leak-extract", confidence=0.4,
                            passivity="passive")
@@ -1433,8 +1662,12 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
             "outcome": (core.OUTCOME_PARTIAL if budget_hit and after["discovered"]
                         else core.OUTCOME_OK),
             "api_paths": api_paths[:300],
+            "api_paths": api_paths[:300],
             "api_hosts": len(seen_ep),
             "secrets": _redact_secrets(secrets),
+            "in_scope_domains": in_scope_domains[:1000],
+            "related_domains": related_domains[:1000],
+            "count_related": len(related_domains),
             "domains": got["domains"][:1000], "ips": got["ips"][:1000]}
 
 

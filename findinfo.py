@@ -120,7 +120,9 @@ def cmd_entity(args) -> None:
     try:
         res = tools.t_enscan(store, args.name, invest=args.invest, deep=args.deep,
                              outdir=Path(args.out) if args.out else None,
-                             timeout=args.tool_timeout)
+                             timeout=args.tool_timeout,
+                             supplier=getattr(args, "supplier", False),
+                             branch=getattr(args, "branch", False))
         out(res)
     finally:
         store.close()
@@ -357,7 +359,9 @@ def cmd_extract(args) -> None:
                     if not core.in_scope(h, only):
                         continue
                 urls.append(u)
-        out(tools.t_extract(store, rows, urls=urls, timeout=args.tool_timeout))
+        scope_arg = [d for d in (core.canon_user_scope(args.domain or [])[0] or [])]
+        out(tools.t_extract(store, rows, urls=urls, timeout=args.tool_timeout,
+                              scope=scope_arg))
     finally:
         store.close()
 
@@ -605,6 +609,10 @@ def cmd_clean(args) -> None:
             with store._write():
                 store.conn.execute("DELETE FROM endpoints")
                 store.conn.execute("DELETE FROM assets")
+            # Assets and their stage checkpoints go together: keeping 'step done'
+            # next to an empty store makes the next run skip the stage and starve
+            # every downstream stage for input.
+            res["steps_cleared"] = store.clear_steps()
         elif args.keep:
             res = store.purge(keep=args.keep, kinds=args.kind)
         elif args.match:
@@ -612,6 +620,9 @@ def cmd_clean(args) -> None:
         else:
             out({"error": "pass --keep <suffix> | --match <suffix> | --all"})
             return
+        if args.keep or args.match:
+            # A scoped purge invalidates the stages that read those assets.
+            res["steps_cleared"] = store.clear_steps(list(args.keep or args.match or []))
         if args.vacuum:
             store.vacuum()
         res["deleted"] = True
@@ -622,6 +633,14 @@ def cmd_clean(args) -> None:
         out(res)
     finally:
         store.close()
+
+
+def _seen_span(rows: list[dict]) -> dict:
+    """Range of first_seen/last_seen across `rows` (empty when none)."""
+    firsts = [r.get("first_seen") for r in rows if r.get("first_seen")]
+    lasts = [r.get("last_seen") for r in rows if r.get("last_seen")]
+    return {"first_seen_min": min(firsts) if firsts else "",
+            "last_seen_max": max(lasts) if lasts else ""}
 
 
 def cmd_assets(args) -> None:
@@ -637,8 +656,12 @@ def cmd_assets(args) -> None:
             return
         rows = store.get_assets(kind=None if args.kind == "all" else args.kind,
                                 min_conf=args.min_conf, limit=args.limit)
+        # first_seen / last_seen answer "is this new since the last run?".
+        # They are surfaced as timestamps untouched (UTC, trailing Z) so two
+        # runs can be diffed without re-parsing anything.
         out({"counts": store.count_assets(), "total": len(rows),
-             "endpoints": len(store.get_endpoints()), "rows": rows})
+             "endpoints": len(store.get_endpoints()),
+             "seen": _seen_span(rows), "rows": rows})
     finally:
         store.close()
 
@@ -1492,13 +1515,30 @@ def _run_pipeline(args) -> int:
                 # the partial result is kept and the stage is retried later.
                 entity_timeout = int(getattr(args, "entity_timeout", 1200) or 0)
                 r = tools.t_enscan(store, args.name, invest=args.invest, deep=args.deep,
-                                   outdir=run_dir / "enscan", timeout=entity_timeout)
+                                   outdir=run_dir / "enscan", timeout=entity_timeout,
+                                   supplier=getattr(args, "supplier", False),
+                                   branch=getattr(args, "branch", False))
                 if r.get("rc") == 124:
                     raise core.StageError(
                         "enscan timed out after " + str(entity_timeout) + "s",
                         result={"companies": len(r.get("companies", [])),
                                 "icp": len(r.get("icp", [])),
                                 "domains": len(r.get("domains", []))})
+                if r.get("anchor_failed"):
+                    # ENScan answered, but with companies that are NOT the one
+                    # asked for (aiqicha returns a popular lookalike when the
+                    # query misses). Nothing was stored, so this stage has no
+                    # result of its own: reporting it as a plain success made a
+                    # wrong entity look like a mapped target. A StageError
+                    # records it as a coverage gap the agent must read.
+                    raise core.StageError(
+                        "enscan returned no entity matching the requested name "
+                        "(rejected " + str(len(r.get("rejected") or [])) +
+                        " unrelated result(s)" +
+                        (": " + ", ".join((r.get("rejected") or [])[:3])
+                         if r.get("rejected") else "") + ")",
+                        result={"companies": 0, "icp": 0, "domains": 0,
+                                "anchor_failed": True})
                 if r.get("rc") not in (0, None) and not r.get("json_files"):
                     # rc != 0 with no JSON used to fail the stage outright. But
                     # ENScan can print a complete report table and still not
@@ -1840,7 +1880,8 @@ def _run_pipeline(args) -> int:
                     urls = [a["canonical"] for a in
                             store.get_assets(kind="url", min_conf=0.4, match=scope)
                             if a["canonical"].startswith("http")]
-                    ex = tools.t_extract(store, [], urls=urls, timeout=tool_timeout)
+                    ex = tools.t_extract(store, [], urls=urls, timeout=tool_timeout,
+                                            scope=scope)
                     # Keep the deliverable findings in the summary too: the run
                     # result is what an agent reads (and what lands in
                     # summary.jsonl), and dropping them here meant the redacted
@@ -1851,12 +1892,14 @@ def _run_pipeline(args) -> int:
                         "api_paths": ex.get("api_paths", [])[:200],
                         "api_hosts": ex.get("api_hosts", 0),
                         "secrets": ex.get("secrets") or {},
-                        "domains": ex.get("domains", [])[:200],
+                        "domains": ex.get("in_scope_domains", ex.get("domains", []))[:200],
+                        "related_domains": ex.get("related_domains", [])[:100],
                         "ips": ex.get("ips", [])[:200],
                     })
                     return {"new_domains": ex["count_domains"],
                             "new_ips": ex["count_ips"],
                             "fetched": ex["fetched"],
+                            "related_domains": ex.get("count_related", 0),
                             "js_pending": ex.get("js_pending", 0),
                             "js_discovered": ex.get("js_discovered", 0),
                             "api_hosts": ex.get("api_hosts", 0),
@@ -2077,7 +2120,13 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("entity", help="brand/company name -> subsidiaries, ICP, domains")
     e.add_argument("--name", required=True)
     e.add_argument("--invest", type=int, default=51)
-    e.add_argument("--deep", type=int, default=2)
+    e.add_argument("--deep", type=int, default=1,
+                    help="ENScan recursive company expansion depth (default 1)")
+    e.add_argument("--supplier", action="store_true",
+                    help="also walk the supplier network (slow, other companies)")
+    e.add_argument("--branch", action="store_true",
+                    help="also walk branch offices (slow, few assets)")
+    e.add_argument("--is-fast", action="store_true", default=True, help=argparse.SUPPRESS)
     e.add_argument("--out", default="")
     _add_tool_timeout(e)
     e.set_defaults(func=cmd_entity)
@@ -2305,7 +2354,12 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--brute-bandwidth", default="3m")
     rn.add_argument("--depth", type=int, default=3)
     rn.add_argument("--invest", type=int, default=51)
-    rn.add_argument("--deep", type=int, default=2)
+    rn.add_argument("--deep", type=int, default=1,
+                    help="ENScan recursive company expansion depth (default 1)")
+    rn.add_argument("--supplier", action="store_true",
+                    help="also walk the supplier network (slow, mostly other companies)")
+    rn.add_argument("--branch", action="store_true",
+                    help="also walk branch offices (slow, few assets)")
     rn.add_argument("--entity-timeout", type=int, default=1200,
                     help="max seconds for the ENScan entity stage (0 = unlimited); "
                          "on timeout the stage fails and is retried later")
