@@ -25,16 +25,22 @@ def test_t22_one_append_per_request_not_per_row():
                       status=metered.ST_OK, requested=1, returned=5000)
     assert led.totals(RUN)["requests"] == 1
     assert led.totals(RUN)["returned_rows"] == 5000
-    # a second identical request with same input hash and status is NOT a new
-    # spend record (replay guard) -- it is the same call, not billed twice
+    # a genuine SECOND dispatch of the same query is a second row: the paid
+    # call happened twice and must be visible (F08). Only an explicit replay
+    # of the SAME log event is deduplicated.
     assert led.record(RUN, "quake", metered.hash_input({"d": "mt-a.example.com"}),
-                      status=metered.ST_OK, requested=1, returned=5000) is False
-    assert led.totals(RUN)["requests"] == 1
+                      status=metered.ST_OK, requested=1, returned=5000) is True
+    assert led.totals(RUN)["requests"] == 2
+    # the SAME event logged twice (replay=True) is not a second charge
+    assert led.record(RUN, "quake", metered.hash_input({"d": "mt-a.example.com"}),
+                      status=metered.ST_OK, requested=1, returned=5000,
+                      replay=True) is False
+    assert led.totals(RUN)["requests"] == 2
     # a changed status IS a new record (retry after failure)
     assert led.record(RUN, "quake", metered.hash_input({"d": "mt-a.example.com"}),
                       status=metered.ST_FAILED, requested=1, returned=0,
                       error="timeout")
-    assert led.totals(RUN)["requests"] == 2
+    assert led.totals(RUN)["requests"] == 3
 
 
 def test_t23_status_vocabulary_is_typed():

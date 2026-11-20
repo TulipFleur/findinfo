@@ -25,8 +25,14 @@ General conventions:
 ## doctor — environment self-check
 
 ```bash
-python findinfo.py doctor
+python findinfo.py doctor            # full check: tools, egress, keys
+python findinfo.py doctor --offline  # read-only: no tool run, no DNS/HTTP, no key read
 ```
+
+`--offline` reports egress, fake-IP state and credentials as `not_checked`
+(never `false`, never "healthy"), lists tool presence from file metadata only,
+and creates nothing: no home, no cache/runs, no SQLite. The check runs before
+the runtime is imported, so it cannot read config or credentials.
 
 **Output**
 
@@ -555,6 +561,18 @@ python findinfo.py run --domain example.com --active --ports
 | `--max-seed` | cap on seed domains for certs/subs expansion (default 5) |
 | `--top-ports` | port-scan range (default 1000) |
 | `--max-vhost-ips` | cap on candidate IPs to collide (default 10) |
+| `--dry-run` | compile the plan only: `run_id: null`, no db/home/process/credential, works with `--background`/`--resume` read-only |
+
+`--domain` accepts hostnames and bare IPs. An explicit `IP:port` endpoint target
+is **rejected with `unsupported_target_kind`** rather than silently reduced to
+its host — this build's run path has no endpoint stage, and dropping the port
+while reporting "no seeds" would hide what was asked for. Pass the bare IP or a
+domain instead.
+
+**Convergence**: a stable domain count is not convergence while
+`coverage.work_queue.outstanding > 0` (this run's durable JS/DNS queue). The
+run stays `partial` with reason `work_pending` until the queue drains; a
+succeeded bundle is never re-opened, and HTML pages never enter the JS queue.
 
 **Output (summary)**
 

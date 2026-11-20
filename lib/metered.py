@@ -41,8 +41,16 @@ ST_TRUNCATED = "truncated"         # answered but cut by the provider
 ST_QUOTA = "quota"                 # ceiling reached (quota exhausted)
 ST_AUTH = "auth"                   # credential rejected -- never retry blind
 ST_FAILED = "failed"               # transport/tool failure, retry may help
+ST_UNCERTAIN = "uncertain"         # dispatch happened, outcome/billing unknown
 
-_ALL = (ST_OK, ST_EMPTY, ST_TRUNCATED, ST_QUOTA, ST_AUTH, ST_FAILED)
+_ALL = (ST_OK, ST_EMPTY, ST_TRUNCATED, ST_QUOTA, ST_AUTH, ST_FAILED,
+        ST_UNCERTAIN)
+
+# Count units. A provider HTTP request we make ourselves and one native-tool
+# process invocation are DIFFERENT observable facts; neither is a price.
+UNIT_PROVIDER_HTTP = "provider_http"     # the request count IS observable
+UNIT_NATIVE_DISPATCH = "native_dispatch"  # one process run; internal fan-out unknown
+_UNITS = (UNIT_PROVIDER_HTTP, UNIT_NATIVE_DISPATCH)
 
 
 def status_of(outcome: str, rc=None, count: int | None = None,
@@ -81,22 +89,50 @@ class MeteredLedger:
     def record(self, run_id: str = "", engine: str = "", input_hash: str = "",
                *, status: str = ST_OK, requested: int = 0,
                returned: int = 0, elapsed_sec: float = 0.0,
-               rc=None, error: str = "", quota: dict | None = None) -> bool:
-        """Append one billed request. False only for a duplicate no-change
-        replay of (run_id, engine, input_hash) with the same status."""
+               rc=None, error: str = "", quota: dict | None = None,
+               unit: str = UNIT_PROVIDER_HTTP, dispatch_id: str = "",
+               replay: bool = False, settled: bool = True) -> bool:
+        """Append one billed dispatch -- one row per REAL dispatch.
+
+        Two things are deliberately distinct (F08):
+
+        * a real second dispatch of the same query is TWO rows. The old
+          `_seen` guard collapsed "same input_hash + same status" into one,
+          which made a genuinely repeated paid query invisible. Deduplication
+          now happens ONLY when the caller marks the call as `replay=True`
+          (the same log event written twice);
+        * `unit` states WHAT was counted: `provider_http` (a provider HTTP
+          request we perform ourselves) or `native_dispatch` (one process
+          invocation of a native tool whose internal per-provider calls we
+          cannot see). A native dispatch is NOT one HTTP request and not a
+          price -- callers and reports must not read it as either.
+
+        `settled=False` records a dispatch whose outcome is unknown right now
+        (a crash/deadline that may already have been billed); recovery keeps
+        it unsettled rather than inventing a charge or a free call.
+        """
         st = status_of(status, rc=rc, count=returned, error=error)
+        if not settled:
+            st = ST_UNCERTAIN
         run_id = run_id or getattr(self, "run_id", "") or ""
         engine = engine or "unknown"
-        key = (run_id, engine, input_hash or "")
-        if input_hash and self._seen.get(key) == st:
+        if unit not in _UNITS:
+            unit = UNIT_PROVIDER_HTTP
+        key = (run_id, engine, input_hash or "", unit)
+        if replay and input_hash and self._seen.get(key) == st:
             return False
         if input_hash:
             self._seen[key] = st
         row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "run_id": run_id, "engine": engine,
+               "unit": unit,
+               "dispatch_id": dispatch_id or (
+                   "%s:%s:%s" % (engine, (input_hash or "nohash")[:12],
+                                 len(self.buffer) + 1)),
                "input_hash": input_hash or "",
                "status": st, "requested": int(requested or 0),
                "returned": int(returned or 0),
+               "settled": bool(settled),
                "elapsed_sec": round(float(elapsed_sec or 0.0), 3)}
         if rc is not None:
             row["rc"] = rc
@@ -123,15 +159,30 @@ class MeteredLedger:
         return out
 
     def totals(self, run_id: str | None = None) -> dict:
-        """Spend summary: per-status request counts and returned rows."""
+        """Spend summary: per-status dispatch counts, returned rows, by unit.
+
+        `requests` counts DISPATCHES, not a bill: a native dispatch fans out
+        to provider calls we cannot see. `by_unit` keeps the two observable
+        units apart, and `unsettled` counts dispatches whose outcome is still
+        unknown (never folded into "free").
+        """
         per_status: dict = {s: 0 for s in _ALL}
-        requests = returned = 0
+        by_unit: dict = {u: 0 for u in _UNITS}
+        requests = returned = unsettled = 0
         for r in self.rows(run_id):
             per_status[r["status"]] = per_status.get(r["status"], 0) + 1
+            unit = r.get("unit") or UNIT_PROVIDER_HTTP
+            by_unit[unit] = by_unit.get(unit, 0) + 1
+            if r.get("settled") is False or r.get("status") == ST_UNCERTAIN:
+                unsettled += 1
             requests += 1
             returned += int(r.get("returned") or 0)
-        return {"requests": requests, "returned_rows": returned,
-                "by_status": per_status}
+        return {"requests": requests, "dispatch_units": by_unit,
+                "unsettled": unsettled,
+                "returned_rows": returned, "by_status": per_status,
+                "note": ("dispatch counts, not a price: provider_http is an "
+                         "HTTP request we make; native_dispatch is one native "
+                         "process whose internal fan-out is not observable")}
 
     def by_engine(self, run_id: str | None = None) -> dict:
         out: dict = {}

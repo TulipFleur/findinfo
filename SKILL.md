@@ -95,7 +95,7 @@ Stage 3   crawl    python findinfo.py crawl --from-store --domain example.com
 
 **Key points**: eyeball the ENScan entity tree once; `passive`+`certs` is the fastest first pass; `dns` is mandatory (unfiltered wildcards turn 300 rows into 30k fake assets); **vhost has the best ROI** — Jenkins/GitLab/Swagger hide behind Host-header collisions; new domains/IPs from `crawl`+`extract` flow back in.
 
-Convergence (as implemented): each round compares in-scope domain counts — **stop when nothing new** (`stop_reason=no_new_assets`); `--rounds` defaults to 1, more rounds must be explicit; `coverage.js_queue.pending > 0` is not converged (`js_pending`).
+Convergence: stable domain count is **not** convergence while `coverage.work_queue.outstanding > 0` (still `partial`/`work_pending`). Succeeded bundles never re-open; HTML is never JS work. Counts are this run's only; reuse keeps the original `observed_at`.
 
 ## 3. Command quick reference
 

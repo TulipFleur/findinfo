@@ -126,6 +126,23 @@ Reading rules:
   rows attach only with provable ownership (`work.import_js_queue`), so one run
   never drains another target's backlog (T33).
 
+### Key semantics (ownership and honest reuse)
+
+- `run_assets` rows are per run. Membership is reconciled from what THIS run's
+  collectors stored; an asset that exists only because of an earlier run joins
+  as `producer=reuse` with its ORIGINAL `observed_at` preserved -- it is never
+  written as a fresh observation.
+- `work_items` is the only claimable queue **in run mode**. `claim` honours
+  `retry_at` (a failed item inside its backoff is not claimable), reclaims an
+  expired `running` lease atomically, and mints a NEW token per claim: the old
+  holder can neither write a result nor acknowledge. `commit_result` writes the
+  result's membership + observations + the ack in one transaction under a
+  valid lease.
+- `stage_invocations` gets one row per dispatch (`dispatch_seq` orders them).
+  A retry APPENDS; it never replaces the previous attempt's row, so history
+  stays auditable. `effective_invocations` reads the latest dispatch of the
+  current attempt; `invocation_history` returns every row.
+
 ## 5. Metered ledger (`<run_dir>/metered.jsonl`)
 
 Every **billed** provider request appends exactly one JSON line (one row per REQUEST,
@@ -139,6 +156,14 @@ never per result row; free sources never touch it). Fields:
 - `blocked_engines` lists engines whose LAST request was `quota` or `auth`
   (transport failures stay retryable) — the verdict's `quota_exhausted` reads
   this list, not just the stage payload.
+- `unit` distinguishes observable facts: `provider_http` (an HTTP request we
+  make ourselves) vs `native_dispatch` (one native-tool process whose internal
+  per-provider fan-out is NOT observable). Neither is a price.
+- Every dispatch gets its own `dispatch_id`; `replay=true` suppresses a
+  duplicated log event, while a genuine second dispatch is a second row.
+- `settled=false` (status `uncertain`) marks a dispatch whose billing outcome
+  is unknown (crash/deadline). Recovery keeps it unsettled — it is never
+  silently counted as a free call or as a charge.
 - The run's `coverage.metered` block carries `totals`/`by_engine`/
   `blocked_engines`/`ledger_path`; `brief --run <id>` summarises the same block
   from the persisted file, so a later session answers "what would another round

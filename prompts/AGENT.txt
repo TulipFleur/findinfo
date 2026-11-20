@@ -135,7 +135,7 @@ new domains from extract
 ```
 
 **Convergence (as implemented — invent no percentages)**: each round compares in-scope domain counts; **stop when this round adds nothing** (`stop_reason = no_new_assets`); `--rounds` **defaults to 1**, more rounds must be explicit.
-Not converged: `coverage.js_queue.pending > 0` → `stop_reason = js_pending`, keep going. Record per-round counts of new domains/IPs/endpoints/internal services.
+Not converged: `coverage.work_queue.outstanding > 0` -> keep going (`partial`/`work_pending` until it drains); `coverage.js_queue` mirrors the same run-scoped queue. A wait timeout is not a failure: call wait again on the SAME run id, never start a second run.
 
 ## 6. Long jobs: background + bounded wait (no nohup)
 
