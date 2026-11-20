@@ -1749,23 +1749,45 @@ def _run_pipeline(args) -> int:
                      if core.source_tools(a.get("sources") or "") & _DNS_SOURCES]
             return {"resolved": len(hosts), "hosts": hosts, "resumed": True}
 
+        # Per-name resolution record, kept for the whole run so round N+1 does
+        # not re-query what round N already answered. NXDOMAIN is final; a
+        # transient failure stays open and is retried (once per round).
+        dns_states: dict = {}
+        # Names a certificate named this round; merged into the next round's
+        # dns input so a SAN is verified instead of merely recorded.
+        cert_queue: set = set()
+
         def run_round(round_no: int) -> None:
-            # Union of: everything already in scope at >=0.4, plus the
-            # user-named seeds. A seed stored at 0.5 qualifies, but keep the
-            # explicit union so a future confidence change cannot silently drop
-            # the target the caller named.
-            all_domains = sorted(set(scoped_domains(0.4)) | set(named))
+            # EVERY in-scope name, at any confidence, plus the user-named
+            # seeds. DNS costs no quota, and the 0.4 floor that gates the
+            # active stages (probe/crawl) used to gate this one too: a name a
+            # passive source mentioned once at 0.1 was never resolved, so a
+            # real asset stayed invisible for the sake of a threshold that
+            # protects nothing here. The confidence floor stays where it
+            # belongs -- on the stages that send traffic to the target.
+            all_domains = sorted(set(scope) | set(scoped_domains(0.0)) | set(named) |
+                               set(cert_queue))
 
             def _dns():
-                r = tools.t_dns(store, all_domains, timeout=tool_timeout)
+                r = tools.t_dns(store, all_domains, timeout=tool_timeout,
+                                states=dns_states)
                 res = {"resolved": r["count"], "wildcard": len(r.get("wildcard", [])),
-                       "truncated": r.get("truncated", False)}
+                       "truncated": r.get("truncated", False),
+                       "queried": r.get("queried", 0),
+                       "nxdomain": r.get("nxdomain", 0),
+                       "transient": r.get("transient", 0),
+                       "skipped_nxdomain": r.get("skipped_nxdomain", 0),
+                       "fake_ip_dropped": r.get("fake_ip_dropped", 0),
+                       "resolution": r.get("resolution") or {}}
                 if not r.get("ok", True):
                     raise core.StageError("dnsx rc=" + str(r.get("rc")), result=res)
                 return res
             _stage(store, run_dir, summary, "dns",
                    {"domains": all_domains, "round": round_no}, args, _dns,
-                   lambda r: {"resolved": r["resolved"], "wildcard": r["wildcard"]},
+                   lambda r: {"resolved": r["resolved"], "wildcard": r["wildcard"],
+                              "nxdomain": r.get("nxdomain", 0),
+                              "transient": r.get("transient", 0),
+                              "skipped_nxdomain": r.get("skipped_nxdomain", 0)},
                    resume=dns_resumed)
             # probe input is ALWAYS the full scoped store set (every resolved
             # row), never the ROW_LIMIT-truncated display list a tool returned
@@ -1776,14 +1798,38 @@ def _run_pipeline(args) -> int:
                 return
             if dns_hosts:
                 def _probe():
-                    p = tools.t_httpx(store, dns_hosts, timeout=tool_timeout)
-                    res = {"live": p["count"], "truncated": p.get("truncated", False)}
+                    p = tools.t_httpx(store, dns_hosts, timeout=tool_timeout,
+                                      scope=scope)
+                    # Certificate names are how a host reveals the rest of its
+                    # family: in-scope names join next round's dns queue,
+                    # out-of-scope ones are kept as related assets (part
+                    # p4-ip-cert owns that storage).
+                    for ent in p.get("cert_in_scope") or []:
+                        cert_queue.add(ent["host"])
+                        store.upsert_asset("domain", ent["host"],
+                                           source="cert-san", confidence=0.45,
+                                           passivity="passive", parent=ent["host"])
+                    for ent in p.get("cert_related") or []:
+                        store.upsert_asset("domain", ent["host"],
+                                           source="cert-related", confidence=0.3,
+                                           passivity="passive", parent=ent["host"])
+                        if ent.get("source"):
+                            store.link_asset("domain", ent["source"], "cert-related",
+                                             ent["host"], source="cert-san")
+                    summary.setdefault("cert_names", {"in_scope": 0, "related": 0})
+                    summary["cert_names"]["in_scope"] += len(p.get("cert_in_scope") or [])
+                    summary["cert_names"]["related"] += len(p.get("cert_related") or [])
+                    res = {"live": p["count"], "truncated": p.get("truncated", False),
+                           "cert_in_scope": len(p.get("cert_in_scope") or []),
+                           "cert_related": len(p.get("cert_related") or [])}
                     if not p.get("ok", True):
                         raise core.StageError("httpx rc=" + str(p.get("rc")), result=res)
                     return res
                 _stage(store, run_dir, summary, "probe",
                        {"hosts": dns_hosts, "round": round_no}, args, _probe,
-                       lambda r: {"live": r["live"]},
+                       lambda r: {"live": r["live"],
+                                  "cert_in_scope": r.get("cert_in_scope", 0),
+                                  "cert_related": r.get("cert_related", 0)},
                        resume=lambda: {"live": len(dns_hosts)})
             else:
                 summary["stages"].append({"stage": "probe", "skipped": True,

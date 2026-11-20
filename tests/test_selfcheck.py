@@ -30,9 +30,9 @@ def _args(**over):
 
 def _quiet(**over):
     base = {
-        "t_certs": lambda s, d, timeout=0: {"count": 0, "ok": True},
-        "t_subs": lambda s, d, engines="", timeout=0: {"count": 0, "ok": True},
-        "t_dns": lambda s, d, timeout=0: {"count": 0, "ok": True, "rc": 0,
+        "t_certs": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True},
+        "t_subs": lambda s, d, engines="", timeout=0, **kw: {"count": 0, "ok": True},
+        "t_dns": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True, "rc": 0,
                                          "domains": [], "wildcard": []},
     }
     base.update(over)
@@ -80,7 +80,7 @@ def test_missing_required_tool_blocks_but_keeps_results():
     tools = fresh_tools(core)
     fi = import_findinfo()
     # dns is the only blocking tool; make it fail as if the binary were gone
-    def dns_missing(store, domains, timeout=0):
+    def dns_missing(store, domains, timeout=0, **kw):
         return {"count": 0, "ok": False, "rc": 127, "error": "dnsx not found",
                 "domains": [], "wildcard": []}
     rc, _ = _run(fi, _args(), _quiet(t_dns=dns_missing))

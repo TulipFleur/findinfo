@@ -51,7 +51,26 @@ def fresh_tools(core_mod):
     """Reload lib.tools bound to the given (already reloaded) core module."""
     import lib.tools as tools
     importlib.reload(tools)
+    pin_environment()
     return tools
+
+
+def pin_environment(fake_ip_dns: bool = False):
+    """Pin the fake-IP environment probe so tests never depend on the network.
+
+    `lib.doh` asks the OS resolver whether a name that cannot exist comes back
+    with a 198.18.0.0/15 address, and moves the whole DNS stage to DoH when it
+    does. On a developer machine behind Clash/TUN that answer is "yes", so the
+    same test took the DoH path, reached for the public resolver and asserted
+    against live answers -- it failed on that machine and passed on CI. A test
+    that pins resolver behaviour must not inherit the host's tunnel.
+
+    Pass `fake_ip_dns=True` in the tests that exercise the fake-IP path.
+    """
+    import lib.doh as doh
+    block = doh.detect_environment(fake_ip_dns)
+    doh._ENV_CACHE["value"] = block
+    return block
 
 
 def import_findinfo():

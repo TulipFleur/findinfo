@@ -65,9 +65,9 @@ def _latest_summary(core):
 def _quiet(**fakes):
     """Collectors that answer instantly with empty success."""
     base = {
-        "t_certs": lambda s, d, timeout=0: {"count": 0, "ok": True},
-        "t_subs": lambda s, d, engines="", timeout=0: {"count": 0, "ok": True},
-        "t_dns": lambda s, d, timeout=0: {"count": 0, "ok": True, "rc": 0,
+        "t_certs": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True},
+        "t_subs": lambda s, d, engines="", timeout=0, **kw: {"count": 0, "ok": True},
+        "t_dns": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True, "rc": 0,
                                          "domains": [], "wildcard": []},
     }
     base.update(fakes)
@@ -98,7 +98,7 @@ def test_partial_stage_reports_gap_and_exit_5():
     tools = fresh_tools(core)
     fi = import_findinfo()
     rc, _ = _run_quiet(fi, _args(), _quiet(
-        t_certs=lambda s, d, timeout=0: {"count": 0, "ok": False, "rc": 124}))
+        t_certs=lambda s, d, timeout=0, **kw: {"count": 0, "ok": False, "rc": 124}))
     assert rc == 5, "finished with a failed stage must not exit 0"
     rd, summary = _latest_summary(core)
     assert summary["result"]["status"] == "partial"
@@ -141,7 +141,7 @@ def test_rounds_stop_when_no_new_asset():
     fi = import_findinfo()
     calls = {"dns": 0}
 
-    def fake_dns(store, domains, timeout=0):
+    def fake_dns(store, domains, timeout=0, **kw):
         calls["dns"] += 1
         for d in domains:
             store.upsert_asset("domain", d, source="dnsx", confidence=0.8)
@@ -163,13 +163,13 @@ def test_rounds_repeat_while_new_assets_appear():
     _seed_resolved(core, "a.example.com")     # a host to verify in round 1
     state = {"round": 0, "dns": 0}
 
-    def fake_probe(store, hosts, timeout=0):
+    def fake_probe(store, hosts, timeout=0, **kw):
         state["round"] += 1
         store.upsert_asset("domain", "n%d.example.com" % state["round"],
                            source="httpx", confidence=0.9)
         return {"count": len(hosts), "ok": True, "rc": 0, "truncated": False}
 
-    def fake_dns(store, domains, timeout=0):
+    def fake_dns(store, domains, timeout=0, **kw):
         state["dns"] += 1
         for d in domains:
             store.upsert_asset("domain", d, source="dnsx", confidence=0.8)
@@ -200,13 +200,13 @@ def test_time_budget_stops_rounds_and_marks_partial():
     _seed_resolved(core, "a.example.com")
     state = {"n": 0}
 
-    def fake_probe(store, hosts, timeout=0):
+    def fake_probe(store, hosts, timeout=0, **kw):
         state["n"] += 1
         store.upsert_asset("domain", "b%d.example.com" % state["n"],
                            source="httpx", confidence=0.9)
         return {"count": len(hosts), "ok": True, "rc": 0}
 
-    def fake_dns(store, domains, timeout=0):
+    def fake_dns(store, domains, timeout=0, **kw):
         for d in domains:
             store.upsert_asset("domain", d, source="dnsx", confidence=0.8)
         return {"count": len(domains), "ok": True, "rc": 0, "domains": [], "wildcard": []}

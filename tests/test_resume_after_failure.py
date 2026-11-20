@@ -41,11 +41,11 @@ def test_failed_stage_retried_succeeded_stage_skipped():
         store.upsert_asset("domain", "api." + domain, source="crt.sh", confidence=0.5)
         return {"count": 1, "ok": True, "upstream": "crt.sh"}
 
-    def fake_subs(store, domain, engines="", timeout=0):
+    def fake_subs(store, domain, engines="", timeout=0, **kw):
         seen["subs"] += 1
         return {"count": 0, "ok": True}
 
-    def fake_dns(store, domains, timeout=0):
+    def fake_dns(store, domains, timeout=0, **kw):
         seen["dns"] += 1
         for d in domains:
             store.upsert_asset("domain", d, source="dnsx", confidence=0.8)
@@ -100,7 +100,7 @@ def test_rerun_after_failure_keeps_previous_assets():
     patches = [
         mock.patch.object(tools, "t_certs", side_effect=certs),
         mock.patch.object(tools, "t_subs", return_value={"count": 0, "ok": True}),
-        mock.patch.object(tools, "t_dns", side_effect=lambda s, d, timeout=0: {
+        mock.patch.object(tools, "t_dns", side_effect=lambda s, d, timeout=0, **kw: {
             "count": 0, "ok": True, "rc": 0, "domains": [], "wildcard": []}),
     ]
     for p in patches:

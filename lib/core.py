@@ -330,6 +330,15 @@ DEFAULT_CONFIG = {
         "chaos": {"key": ""},
     },
     "http": {"timeout": 25, "user_agent": "Mozilla/5.0 findinfo"},
+    "dns": {
+        # "auto" probes the OS resolver with a non-existent name at run time;
+        # "on"/"off" force the DoH path. See lib/doh.py.
+        "fake_ip": "auto",
+        "doh_url": "https://cloudflare-dns.com/dns-query",
+        "doh_concurrency": 20,
+        "doh_timeout": 8,
+        "doh_retry": 1,
+    },
     "limits": {
         "dns_concurrency": 100,
         "http_concurrency": 50,

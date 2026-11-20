@@ -197,11 +197,11 @@ def test_passive_then_active_resumes_and_probes():
 
     probed = {}
 
-    def fake_probe(store_, hosts, timeout=0):
+    def fake_probe(store_, hosts, timeout=0, **kw):
         probed["n"] = len(hosts)
         return {"count": len(hosts), "truncated": False, "ok": True, "rc": 0}
 
-    def fake_dns(store_, domains, timeout=0):
+    def fake_dns(store_, domains, timeout=0, **kw):
         for d in domains:
             store_.upsert_asset("domain", d, source="dnsx", confidence=0.8,
                                 passivity="passive")
@@ -291,7 +291,7 @@ def test_rc124_never_checkpoints_done():
     store.upsert_asset("domain", "s.example.com", source="dnsx",
                        confidence=0.8, passivity="passive")
 
-    def probe_fails(store_, hosts, timeout=0):
+    def probe_fails(store_, hosts, timeout=0, **kw):
         return {"count": 3, "rows": [], "truncated": False, "ok": False, "rc": 124}
 
     with mock.patch.object(tools, "t_onepass", return_value={"count": 0, "ok": True}), \

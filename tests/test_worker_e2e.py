@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # A tiny stand-in for lib.tools: the worker imports it as "lib.tools", so no
 # real binary or network call is ever made.
 FAKE_TOOLS = chr(10).join([
-    "def t_dns(store, domains, timeout=0):",
+    "def t_dns(store, domains, timeout=0, states=None, **kw):",
     "    for d in domains:",
     "        store.upsert_asset(\"domain\", d, source=\"dnsx\", confidence=0.8)",
     "    return {\"count\": len(domains), \"ok\": True, \"rc\": 0,",
@@ -77,7 +77,8 @@ def _make_worker_root(tmp: Path) -> Path:
         shutil.rmtree(root)
     (root / "lib").mkdir(parents=True)
     shutil.copy2(ROOT / "findinfo.py", root / "findinfo.py")
-    for mod in ("__init__.py", "core.py", "jobs.py", "report.py", "jsleak.py"):
+    for mod in ("__init__.py", "core.py", "jobs.py", "report.py", "jsleak.py",
+                "doh.py"):
         shutil.copy2(ROOT / "lib" / mod, root / "lib" / mod)
     (root / "lib" / "tools.py").write_text(FAKE_TOOLS, encoding="utf-8")
     (root / "wordlists").mkdir(exist_ok=True)

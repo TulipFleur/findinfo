@@ -12,6 +12,7 @@ import tests.util  # noqa: F401
 import json
 import unittest.mock as mock
 
+from lib import doh
 from tests.util import fresh_core, fresh_tools
 
 
@@ -19,9 +20,9 @@ def test_is_fake_ip_covers_the_whole_benchmark_block():
     core = fresh_core()
     tools = fresh_tools(core)
     for fake in ("198.18.0.1", "198.18.210.124", "198.19.255.255"):
-        assert tools.is_fake_ip(fake), fake
+        assert doh.is_fake_ip(fake), fake
     for real in ("1.2.3.4", "192.168.1.1", "10.0.0.1", "198.20.0.1", ""):
-        assert not tools.is_fake_ip(real), real
+        assert not doh.is_fake_ip(real), real
 
 
 def _feed(payload):

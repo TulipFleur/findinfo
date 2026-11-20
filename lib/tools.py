@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from . import core
+from . import doh
 
 # ---------------------------------------------------------------- helpers
 BASE_RE = re.compile(r"^([a-z0-9-]+\.)+[a-z]{2,}$", re.I)
@@ -819,26 +820,35 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     return out
 
 
-# Clash/TUN and similar transparent proxies answer every A query with an
-# address in 198.18.0.0/15. Those are placeholders, not the host's real IP:
-# probing them reaches the proxy, not the target. Treated as "no evidence",
-# never as a hit.
-FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+def _accept_dns(store, domain: str, ips: list[str], cnames: list[str],
+                source: str, wildcard: dict, rows: list) -> bool:
+    """Store a resolved name unless the answer is a wildcard artefact.
+
+    Shared by the dnsx path, the system-resolver fallback and the DoH path so
+    all three apply identical rules: a name whose address is the one the
+    wildcard probe got for a random label is not a finding, and a fake IP was
+    already removed before this is called.
+
+    Returns True when the name was stored. `rows` is the display list only;
+    every row is stored regardless of the display cap.
+    """
+    wc = wildcard.get(core.registrable_domain(domain) or "")
+    if wc and wc in ips:
+        return False              # wildcard zone: random names resolve here too
+    for ip in ips:
+        store.upsert_asset("ip", ip, source=source, confidence=0.6,
+                           passivity="passive", parent=domain)
+    store.upsert_asset("domain", domain, source=source, confidence=0.8,
+                       passivity="passive")
+    if len(rows) < core.ROW_LIMIT:      # display cap only; store gets all
+        rows.append({"domain": domain, "a": ips, "cname": cnames})
+    return True
 
 
-def is_fake_ip(value: str) -> bool:
-    """True for a proxy placeholder address (198.18.0.0/15)."""
-    ip = core.canon_ip(value)
-    if not ip:
-        return False
-    try:
-        return ipaddress.ip_address(ip) in FAKE_IP_NET
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------- 5. DNS resolve + wildcard
-def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
+def t_dns(store, domains: list[str], timeout: int = 0,
+           states: dict | None = None, doh_client=None,
+           plan: "doh.ResolutionPlan | None" = None,
+           check_again: bool = False) -> dict:
     """Resolve domains with wildcard filtering.
 
     The wildcard filter is keyed on the REGISTRABLE parent (public-suffix
@@ -848,18 +858,96 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
     random subdomains into "trusted assets".
     `ok=False` means dnsx itself failed (rc!=0); partial results may still be
     present and the caller must not checkpoint the stage as done.
+
+    Every path also drops fake-IP answers (198.18.0.0/15, see lib.doh): a
+    Clash/TUN resolver answers EVERY name with 198.18.x.x, and the old
+    "198.18." prefix test let 198.19.x.x through. When such a resolver is
+    detected the whole resolution moves to DoH (`plan`), because the local
+    one cannot be trusted at all.
+
+    `states` is the per-name resolution record ({name: {state, a, cname}}).
+    It is read (a NXDOMAIN name is never queried again) and updated in place,
+    so a later round does not redo work. `doh_client` injects a resolver for
+    tests.
     """
     domains = _uniq([core.canon_domain(d) for d in domains if core.canon_domain(d)])
+    plan = plan or doh.ResolutionPlan.for_run()
     if not domains:
-        return {"count": 0, "domains": [], "wildcard": [], "ok": True, "rc": 0}
+        return {"count": 0, "domains": [], "wildcard": [], "ok": True, "rc": 0,
+                "states": states if states is not None else {},
+                "resolution": doh.resolution_payload(plan, plan.resolution_mode())}
+    # states is the round-to-round record: a NXDOMAIN answer is final (asking
+    # again costs a query and returns the same thing), a transient failure is
+    # left open so a later round retries it. check_again forces the re-query
+    # (--force-stage / a resolver change), which is how a name that was
+    # NXDOMAIN while the network was down gets a second chance.
+    states = doh.ensure_name_states(states)
+    skipped_nx = [] if check_again else [d for d in domains
+                                         if not doh.should_query(d, states)]
+    todo = [d for d in domains if check_again or doh.should_query(d, states)]
     # wildcard probe per registrable parent domain
     wildcard: dict[str, str] = {}
     fake_resolver = False
     parents = sorted({core.registrable_domain(d) for d in domains
                       if core.registrable_domain(d)})
+    use_doh = plan.fake_ip
+    if use_doh:
+        # dnsx has no DoH flag (checked against `dnsx -h`: resolvers are plain
+        # UDP/TCP endpoints), so the DoH path resolves and wildcard-detects in
+        # Python instead of shelling out.
+        client = doh_client or doh.DohClient(
+            url=plan.doh_url,
+            concurrency=doh.doh_config()["doh_concurrency"],
+            timeout=doh.doh_config()["doh_timeout"])
+        rows: list[dict] = []
+        resolved = 0
+        transient: list[str] = []
+        nxnames: list[str] = []
+        fake_dropped = 0
+        probers = ["findinfo-wildcard-probe-9f3a." + "wild." + p for p in parents[:20]]
+        probes = client.resolve_many(probers)
+        for name, res in probes.items():
+            fake = doh.fake_ip_in(res.get("a") or [])
+            if fake:
+                wildcard[name.split(".", 1)[-1]] = fake
+        answers = client.resolve_many(todo)
+        for d in todo:
+            got = answers.get(d) or {"state": doh.NAME_TRANSIENT, "a": [], "cname": []}
+            st = doh.name_state(got)
+            ips, fake = doh.filter_fake_ips(got.get("a") or [])
+            fake_dropped += len(fake)
+            states[d] = {"state": st if ips or st != doh.NAME_RESOLVED else doh.NAME_NXDOMAIN,
+                         "a": ips, "cname": got.get("cname") or [],
+                         "retried": bool(got.get("retried"))}
+            if ips:
+                accepted = _accept_dns(store, d, ips, got.get("cname") or [], "doh",
+                                       wildcard, rows)
+                if accepted:
+                    resolved += 1
+                else:
+                    states[d]["state"] = "wildcard"
+            elif st == doh.NAME_TRANSIENT:
+                transient.append(d)
+            else:
+                nxnames.append(d)
+        for d in skipped_nx:
+            rec = states.get(d) or {}
+            if rec.get("a"):
+                accepted = _accept_dns(store, d, rec["a"], rec.get("cname") or [],
+                                       "doh", wildcard, rows)
+                if accepted:
+                    resolved += 1
+        total = resolved
+        return {"count": total, "domains": rows, "truncated": total > len(rows),
+                "wildcard": [{"parent": k, "ip": v} for k, v in wildcard.items()],
+                "system_fallback": 0, "resolved": resolved,
+                "transient": len(transient), "nxdomain": len(nxnames),
+                "skipped_nxdomain": len(skipped_nx), "fake_ip_dropped": fake_dropped,
+                "states": states, "lines": 0, "rc": 0, "ok": True,
+                "resolution": doh.resolution_payload(plan, doh.RESOLVER_DOH)}
     if core.has_tool("dnsx"):
         for p in parents[:20]:
-            probe = "findinfo-wildcard-probe-9f3a." + p
+            probe = "findinfo-wildcard-probe-9f3a." + "wild." + p
             # The name goes in on STDIN. `-d` is dnsx's WORDLIST driver and
             # fails with "missing wordlist(w) flag required with domain(d)
             # input", so the old call returned rc=1 with an empty body: the
@@ -874,25 +962,27 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
                     # EVERY name, existing or not, so "this parent has a
                     # wildcard" would be true for every parent and the filter
                     # would drop the entire target. Detect the resolver lying
-                    # and skip the wildcard pass instead of trusting it.
-                    if is_fake_ip(a):
+                    # and stand the filter down instead of trusting it.
+                    if doh.is_fake_ip(a):
                         fake_resolver = True
                         continue
                     wildcard[p] = a
     exe = core.tool("dnsx")
-    path = _tmp_lines(domains)
+    path = _tmp_lines(todo)
     if fake_resolver:
         wildcard.clear()
         core.log("wildcard filtering disabled: the resolver answers "
                  "every name with a fake-IP address (198.18.0.0/15), so a "
                  "wildcard probe proves nothing; liveness/cert evidence "
                  "decides which names are real")
-    core.log("dnsx resolving " + str(len(domains)) +
-             " (wildcard parents: " + str(len(wildcard)) + ")")
+    core.log("dnsx resolving " + str(len(todo)) +
+             " (wildcard parents: " + str(len(wildcard)) + ")" +
+             (" [fake-IP resolver detected: querying " + plan.doh_url + "]" if use_doh else ""))
     rows: list[dict] = []
     seen_dns: set[str] = set()
     pending: list[tuple[str, list, list]] = []   # parsed off-thread, stored here
     total = 0
+    fake_dropped = 0
 
     def accept(d: str, ips: list[str], cnames: list[str], source: str) -> None:
         """Store + count a resolved domain, unless it is a wildcard answer.
@@ -907,22 +997,8 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
         aimed at the proxy, not the target.
         """
         nonlocal total
-        ips = [x for x in (ips or []) if x and not is_fake_ip(x)]
-        # A name that answers with its OWN address in a wildcard zone is real;
-        # one that merely echoes the wildcard's address is unproven. The
-        # existence-only test cannot be used here: hosts inside a wildcard
-        # zone commonly share the address, so it would delete the target.
-        wc = wildcard.get(core.registrable_domain(d) or "")
-        if wc and wc in ips:
-            return
-        total += 1
-        for ip in ips:
-            store.upsert_asset("ip", ip, source=source, confidence=0.6,
-                               passivity="passive", parent=d)
-        store.upsert_asset("domain", d, source=source, confidence=0.8,
-                           passivity="passive")
-        if len(rows) < core.ROW_LIMIT:      # display cap only; store gets all
-            rows.append({"domain": d, "a": ips, "cname": cnames})
+        if _accept_dns(store, d, ips, cnames, source, wildcard, rows):
+            total += 1
 
     def handle(line: str) -> None:
         # run_stream hands lines to a READER THREAD. SQLite objects may only be
@@ -940,21 +1016,36 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
         if not d:
             return
         seen_dns.add(d)
-        ips = [x for x in (core.canon_ip(x) for x in (r.get("a") or [])) if x]
+        # fake-IP answers are never addresses: drop them before anything else
+        # so neither the store nor the wildcard signal sees one.
+        raw_ips = [x for x in (core.canon_ip(x) for x in (r.get("a") or [])) if x]
+        ips, fake = doh.filter_fake_ips(raw_ips)
+        if fake:
+            pending_fake_drops.append(len(fake))
         cnames = [x for x in (core.canon_domain(x) for x in (r.get("cname") or [])) if x]
-        pending.append((d, ips, cnames))
+        pending.append((d, ips, cnames, bool(fake)))
 
+    pending_fake_drops: list[int] = []
     rc, lines, err = core.run_stream(
         [exe, "-l", path, "-a", "-cname", "-resp", "-silent", "-json",
          "-t", str(core.CFG["limits"]["dns_concurrency"])],
         handle, timeout=timeout)
-    for d, ips, cnames in pending:
+    for d, ips, cnames, had_fake in pending:
+        states[d] = {"state": doh.NAME_RESOLVED if ips or cnames or had_fake
+                     else doh.NAME_NXDOMAIN, "a": ips, "cname": cnames}
+        if not ips and not had_fake:
+            continue
+        # A name whose every address was a fake IP still EXISTS: the resolver
+        # answered it. Dropping the address is right; dropping the name threw
+        # away the only real evidence in the answer.
         accept(d, ips, cnames, "dnsx")
+    fake_dropped += sum(pending_fake_drops)
     # ---- system resolver fallback -------------------------------------
     # dnsx uses public resolvers (8.8.8.8 etc). In CN networks those are often
     # blocked or poisoned; fall back to the OS resolver for anything unresolved.
-    missing = [d for d in domains if d not in seen_dns]
+    missing = [d for d in todo if d not in seen_dns]
     sys_rows: list[dict] = []
+    transient: list[str] = []
     if missing:
         core.log("system-dns fallback for " + str(len(missing)) + " domains")
 
@@ -964,38 +1055,75 @@ def t_dns(store, domains: list[str], timeout: int = 0) -> dict:
                 return d, sorted({core.canon_ip(i[4][0]) for i in infos} -
                                  {None})
             except Exception:
-                return d, []
+                return d, None
 
         with futures.ThreadPoolExecutor(max_workers=50) as pool:
             for d, ips in pool.map(resolve_one, missing):
-                # 198.18.0.0/15 = Clash/TUN fake-IP benchmark range
-                ips = [x for x in ips if x and not x.startswith("198.18.")]
-                if not ips:
+                if ips is None:
+                    # a resolver error is NOT "this name does not exist": it is
+                    # an open question that a later round may answer
+                    states[d] = {"state": doh.NAME_TRANSIENT, "a": [], "cname": []}
+                    transient.append(d)
                     continue
+                # 198.18.0.0/15 = Clash/TUN fake-IP benchmark range: the whole
+                # /15, not just the 198.18.x half
+                ips, fake = doh.filter_fake_ips(ips)
+                if fake:
+                    fake_dropped += len(fake)
+                if not ips:
+                    if d in states and states[d].get("state") == doh.NAME_RESOLVED:
+                        continue
+                    states.setdefault(d, {"state": doh.NAME_NXDOMAIN,
+                                          "a": [], "cname": []})
+                    if not states[d].get("a"):
+                        states[d]["state"] = doh.NAME_NXDOMAIN
+                    continue
+                states[d] = {"state": doh.NAME_RESOLVED, "a": ips, "cname": []}
                 sys_rows.append((d, ips))
         for d, ips in sys_rows:
             accept(d, ips, [], "system-dns")
     ok = rc == 0
     return {"count": total, "domains": rows, "truncated": total > len(rows),
             "wildcard": [{"parent": k, "ip": v} for k, v in wildcard.items()],
-            "system_fallback": len(sys_rows), "lines": lines, "rc": rc, "ok": ok}
+            "system_fallback": len(sys_rows), "resolved": total,
+            "transient": len(transient), "nxdomain": len([d for d in todo
+                                                          if states.get(d, {}).get("state")
+                                                          == doh.NAME_NXDOMAIN]),
+            "skipped_nxdomain": len(skipped_nx), "fake_ip_dropped": fake_dropped,
+            "states": states, "lines": lines, "rc": rc, "ok": ok,
+            "resolution": doh.resolution_payload(
+                plan, doh.RESOLVER_SYSTEM if sys_rows else doh.RESOLVER_DNSX)}
 
 
 # ---------------------------------------------------------------- 6. httpx probe
-def t_httpx(store, hosts: list[str], timeout: int = 0) -> dict:
+def t_httpx(store, hosts: list[str], timeout: int = 0,
+            scope: list[str] | None = None) -> dict:
+    """Probe hosts and read the certificate each one serves.
+
+    `-tls-grab` makes httpx report the TLS block (`subject_an`, `subject_cn`,
+    `issuer_dn`) for every https responder. Those names are evidence, not
+    decoration: `doh.cert_queue_entries` routes the in-scope ones to the next
+    round's dns queue and the rest to related assets, so a shared certificate
+    is how a new asset is discovered instead of being lost. `scope` decides
+    that split; without it every certificate name is out of scope and lands in
+    `related`, never in the dns queue.
+    """
     hosts = _uniq([h for h in hosts if h])
     if not hosts:
-        return {"count": 0, "rows": []}
+        return {"count": 0, "rows": [], "cert_in_scope": [], "cert_related": []}
     path = _tmp_lines(hosts)
     lim = core.CFG["limits"]
     cmd = [core.tool("httpx"), "-l", path, "-silent", "-json",
            "-sc", "-title", "-tech-detect", "-ip", "-cname", "-cdn", "-favicon",
+           "-tls-grab",
            "-threads", str(lim["http_concurrency"]),
            "-timeout", "10", "-retries", "1"]
     core.log("httpx probing " + str(len(hosts)))
     rows: list[dict] = []          # only ROW_LIMIT of them: the rest live in the store
     staged: list = []              # store writes happen on the caller's thread
+    cstaged: list = []             # certificate rows, same deferral
     total = 0
+    cert_rows = 0
 
     def handle(line: str) -> None:
         nonlocal total
@@ -1025,14 +1153,25 @@ def t_httpx(store, hosts: list[str], timeout: int = 0) -> dict:
                "port": r.get("port"), "length": r.get("content_length"),
                "cdn": r.get("cdn_name") or r.get("cdn"),
                "favicon": r.get("favicon"), "webserver": r.get("webserver")}
+        # Certificate identities travel with the row: parsed here so the
+        # caller's thread only has to route and store them.
+        cert = doh.parse_cert_names(r)
+        if cert.get("san"):
+            rec["cert"] = cert
         if len(rows) < core.ROW_LIMIT:
             rows.append(rec)
         attrs = {"status": status, "title": title, "tech": tech, "url": url,
                  "ip": ip, "port": r.get("port"), "cdn": rec["cdn"],
                  "webserver": rec["webserver"]}
+        if cert.get("san"):
+            attrs["cert"] = {"cn": cert.get("cn", ""),
+                             "issuer": cert.get("issuer", ""),
+                             "san": cert["san"]}
         # store writes are deferred to the caller's thread (SQLite is
         # thread-bound; run_stream calls this from its reader thread)
         staged.append((host, ip, url, attrs, status, title))
+        if cert.get("san"):
+            cstaged.append((host, ip, cert))
 
     staged: list = []
 
@@ -1052,9 +1191,45 @@ def t_httpx(store, hosts: list[str], timeout: int = 0) -> dict:
     rc, lines, err = core.run_stream(cmd, handle, timeout=timeout)
     for item in staged:
         live(item)
-    core.log("httpx: " + str(total) + " live hosts (" + str(lines) + " lines) rc=" + str(rc))
+    # ---- certificate names -> dns queue / related assets ------------------
+    # cert_ip is the address the certificate was observed on. A fake-IP answer
+    # is not an address (see lib.doh); storing one here would pin every SAN to
+    # a phantom host.
+    cert_in_scope: list[dict] = []
+    cert_related: list[dict] = []
+    cert_skipped: list[dict] = []
+    seen_cert: set = set()
+    for host, ip, cert in cstaged:
+        cert_rows += 1
+        if ip and doh.is_fake_ip(ip):
+            ip = ""                # synthesised address: not an observation
+        routed = doh.cert_queue_entries(cert, [host], scope, ip=ip or "",
+                                        seen=seen_cert)
+        cert_in_scope.extend(routed["in_scope"])
+        cert_related.extend(routed["related"])
+        cert_skipped.extend(routed["skipped"])
+        if ip:
+            store.upsert_asset("ip", ip, source="httpx-tls", confidence=0.7,
+                               passivity="active", parent=host)
+            store.upsert_asset("domain", host, source="httpx-tls", confidence=0.9,
+                               passivity="active",
+                               attrs={"cert": {"cn": cert.get("cn", ""),
+                                               "issuer": cert.get("issuer", ""),
+                                               "san": cert.get("san", [])}})
+            for name in cert.get("san") or []:
+                if name.startswith("*"):
+                    continue
+                store.link_asset("domain", host, "cert-name", name,
+                                 source="httpx-tls")
+    core.log("httpx: " + str(total) + " live hosts (" + str(lines) + " lines) rc=" + str(rc) +
+             (" | certificates: " + str(cert_rows) + " rows, " + str(len(cert_in_scope)) +
+              " in-scope names queued, " + str(len(cert_related)) + " related"
+              if cert_rows else ""))
     return {"count": total, "rows": rows, "truncated": total > len(rows),
-            "lines": lines, "rc": rc, "ok": rc == 0, "stderr": err[-400:]}
+            "lines": lines, "rc": rc, "ok": rc == 0, "stderr": err[-400:],
+            "cert_rows": cert_rows,
+            "cert_in_scope": cert_in_scope, "cert_related": cert_related,
+            "cert_skipped": cert_skipped}
 
 
 # ---------------------------------------------------------------- 7. IP aggregate + CDN
@@ -1117,7 +1292,186 @@ def t_ipagg(store, ips: list[str] | None = None, timeout: int = 0,
 
 
 # ---------------------------------------------------------------- 8. port scan
-def t_ports(store, ips: list[str], top_ports: int = 1000, timeout: int = 0) -> dict:
+# Certificate grabbing is an active handshake per ip:port; a 1000-port scan of
+# 40 IPs would open 40000 of them. The budget is a ceiling, and whatever it
+# skips is reported as a coverage gap instead of vanishing.
+_TLS_GRAB_MAX_PORTS = 40
+
+def _tls_grab(ip: str, port: int, timeout: float = 8.0) -> dict:
+    """Read the certificate one ip:port serves, with no external binary.
+
+    naabu has no TLS grabbing flag (checked against `naabu -h`: JSON output
+    only), and an open 8443 with no certificate behind it is a very different
+    finding from an open 8443 that answers for twenty hostnames. The handshake
+    is done by httpx (which has `-tls-grab`) when it is available; the stdlib
+    path below is the one tests exercise and the one that works without it.
+
+    Returns {} when nothing was negotiated (no TLS, timeout, garbage), so the
+    caller never stores a half-read certificate.
+    """
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, int(port)), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=ip) as tls:
+                der = tls.getpeercert(binary_form=True)
+                if not der:
+                    return {}
+    except (OSError, ssl.SSLError, ValueError):
+        return {}
+    return parse_cert_der(der)
+
+
+def _der_tlv(buf: bytes, k: int) -> tuple[int, int, int]:
+    """(tag, value_start, value_end) for the TLV at `k`.
+
+    A malformed or truncated length collapses to an empty range at the end of
+    `buf`, so a caller can never read past the certificate it was handed.
+    """
+    if k >= len(buf):
+        return 0, len(buf), len(buf)
+    tag = buf[k]
+    if k + 1 >= len(buf):
+        return tag, len(buf), len(buf)
+    b = buf[k + 1]
+    pos = k + 2
+    if b < 0x80:
+        ln = b
+    else:
+        extra = b & 0x7f
+        if extra == 0 or pos + extra > len(buf):
+            return tag, len(buf), len(buf)
+        ln = 0
+        for i in range(extra):
+            ln = (ln << 8) | buf[pos + i]
+        pos += extra
+    return tag, pos, min(len(buf), pos + ln)
+
+
+def _der_walk(buf: bytes, start: int, end: int, visit) -> None:
+    """Depth-first walk of the TLVs in buf[start:end], calling `visit`.
+
+    Hand-rolled instead of recursive so a crafted certificate with deep
+    nesting cannot exhaust the interpreter stack. `visit(buf, tag, vstart,
+    vend)` on every element; containers (SEQUENCE / SET / context-tagged
+    wrappers such as an explicit [0]) are descended into as well, because
+    the extension block is wrapped one level deeper than the attributes.
+    """
+    stack = [(start, end)]
+    while stack:
+        cur, stop = stack.pop()
+        while cur < stop:
+            tag, vs, ve = _der_tlv(buf, cur)
+            if vs <= cur or vs > stop:
+                return
+            if visit(buf, tag, vs, ve) is False:
+                return
+            descends = (tag in (0x30, 0x31) or
+                        (0x80 <= tag <= 0xbf and tag not in (0x80, 0x81, 0x82,
+                                                             0x84, 0x86, 0x87)))
+            if descends:
+                stack.append((vs, ve))
+            cur = ve
+
+
+def parse_cert_der(der: bytes) -> dict:
+    """Best-effort name extraction from a DER certificate, stdlib only.
+
+    `ssl.getpeercert()` returns an empty dict for an unverified certificate
+    (that is what CERT_NONE buys us), so the names have to come out of the DER
+    bytes. This walks the TLVs, looks for the three OIDs a certificate uses
+    for identity -- subjectAltName, commonName, organizationName -- and reads
+    the values that follow them. It is deliberately conservative: a structure
+    it does not recognise yields fewer names, never invented ones, and a
+    certificate with no dNSName comes back with an empty `san` so the caller
+    can tell "no names" from "not read".
+
+    Returns the same shape as `doh.parse_cert_names`: {"san", "cn", "issuer"}.
+    """
+    out = {"san": [], "cn": "", "issuer": ""}
+    if not der:
+        return out
+    _CN_OID = bytes.fromhex("550403")      # 2.5.4.3 commonName
+    _O_OID = bytes.fromhex("55040a")       # 2.5.4.10 organizationName
+    _SAN_OID = bytes.fromhex("551d11")     # 2.5.29.17 subjectAltName
+    cn: list[str] = []
+    org: list[str] = []
+    sans: list[str] = []
+
+    def visit(buf, tag, vs, ve) -> bool:
+        # OIDs are primitive and always live in a container. The attribute
+        # value follows the OID directly (SEQUENCE { OID, value }); a SAN
+        # extension value is an OCTET STRING wrapping the GeneralNames
+        # SEQUENCE, so the OCTET STRING is skipped first.
+        if tag == 0x06:
+            oid = buf[vs:ve]
+            if oid == _SAN_OID:
+                _read_general_names(buf, ve)
+            elif oid in (_CN_OID, _O_OID):
+                _read_attribute(buf, ve, cn if oid == _CN_OID else org)
+        return True
+
+    def _read_attribute(buf: bytes, k: int, into: list) -> None:
+        """Read the <type> <len> <bytes> string right after a name OID."""
+        if k >= len(buf):
+            return
+        if buf[k] not in (0x0c, 0x13, 0x16):   # utf8 / printable / ia5
+            return
+        _tag, vs, ve = _der_tlv(buf, k)
+        txt = buf[vs:ve].decode("utf-8", "ignore").strip()
+        if txt:
+            into.append(txt)
+
+    def _read_general_names(buf: bytes, k: int) -> None:
+        """Collect every dNSName in the GeneralNames that follow the SAN OID."""
+        # skip the OCTET STRING wrapper(s), then walk the SEQUENCE
+        end = len(buf)
+        while k < end:
+            tag, vs, ve = _der_tlv(buf, k)
+            if ve <= k:
+                return
+            if tag == 0x04:                     # OCTET STRING
+                k = vs
+                end = ve
+                continue
+            if tag == 0x30:                     # GeneralNames SEQUENCE
+                pos = vs
+                while pos < ve:
+                    t2, v2, e2 = _der_tlv(buf, pos)
+                    if e2 <= pos:
+                        return
+                    # [2] dNSName: context class, primitive, tag 2 ->
+                    # 0x82. OpenSSL and most CAs emit this form rather than
+                    # the [7] otherName variant, so both are accepted (0x87
+                    # is what some stacks use; 0xA7 is the constructed bit).
+                    if t2 in (0x82, 0x87, 0xa7):
+                        txt = buf[v2:e2].decode("ascii", "ignore").strip().strip(".")
+                        if txt and "." in txt and txt.lower() not in sans:
+                            sans.append(txt.lower())
+                    pos = e2
+                return
+            k = ve
+
+    _der_walk(der, 0, len(der), visit)
+    if sans:
+        out["san"] = sans
+    if cn:
+        out["cn"] = cn[0]
+        root = cn[0].lower().rstrip(".")
+        # a CN without a dot is a product name ("Default"), not a hostname
+        if "." in root and root not in out["san"]:
+            out["san"].insert(0, root)
+    if org:
+        # the issuer O follows the subject O in a self-signed certificate;
+        # keeping the LAST one yields the issuer when both are present
+        out["issuer"] = org[-1]
+    return out
+
+
+def t_ports(store, ips: list[str], top_ports: int = 1000, timeout: int = 0,
+            scope: list[str] | None = None) -> dict:
     targets = _uniq([core.canon_ip(i) for i in ips if core.canon_ip(i)])
     if not targets:
         raise core.FindInfoError("no valid ip for naabu")
@@ -1148,8 +1502,49 @@ def t_ports(store, ips: list[str], top_ports: int = 1000, timeout: int = 0) -> d
         store.upsert_asset("endpoint", ip + ":" + str(port), source="naabu",
                            confidence=0.8, passivity="active", parent=ip,
                            attrs={"port": port})
+    # ---- certificate grabbing on TLS ports -------------------------------
+    # A TLS port that answers for names is how an IP is tied back to the
+    # domains it serves: the certificate is the only artefact that states it.
+    cert_ports: list[dict] = []
+    cert_in_scope: list[dict] = []
+    cert_related: list[dict] = []
+    tls_failed: list[dict] = []
+    seen_cert: set = set()
+    tls_ports = [p for p in _uniq([str(p) for _i, p in staged])
+                 if doh.is_tls_port(int(p))]
+    core.log("naabu: " + str(len(tls_ports)) + " TLS port(s) to grab certificates on")
+    for port in tls_ports[: _TLS_GRAB_MAX_PORTS]:
+        for ip in targets:
+            if (ip, int(port)) not in {(i, int(p)) for i, p in staged}:
+                continue
+            cert = _tls_grab(ip, int(port))
+            if not cert.get("san"):
+                tls_failed.append({"ip": ip, "port": int(port)})
+                continue
+            cert_ports.append({"ip": ip, "port": int(port),
+                               "cn": cert.get("cn", ""),
+                               "issuer": cert.get("issuer", ""),
+                               "san": cert.get("san", [])})
+            # map the IP back to the names it serves: cert_ip is the
+            # observation, the name is the asset
+            owners = [a["canonical"] for a in store.get_assets(kind="domain",
+                                                               match=list(scope or []) or None)
+                      if (a.get("attrs") or {}).get("ip") == ip]
+            routed = doh.cert_queue_entries(cert, owners or [], scope, ip=ip,
+                                            seen=seen_cert)
+            cert_in_scope.extend(routed["in_scope"])
+            cert_related.extend(routed["related"])
+    if len(tls_ports) > _TLS_GRAB_MAX_PORTS:
+        # never silently: the grabbed ports are listed, the rest is a gap
+        tls_failed.append({"skipped": "budget",
+                           "ports": tls_ports[_TLS_GRAB_MAX_PORTS:]})
+    core.log("naabu: certificates on " + str(len(cert_ports)) + " port(s), " +
+             str(len(cert_in_scope)) + " in-scope name(s), " +
+             str(len(cert_related)) + " related")
     return {"targets": targets, "count": total, "rows": rows,
-            "truncated": total > len(rows), "lines": lines, "rc": rc, "ok": rc == 0}
+            "truncated": total > len(rows), "lines": lines, "rc": rc, "ok": rc == 0,
+            "cert_ports": cert_ports, "cert_in_scope": cert_in_scope,
+            "cert_related": cert_related, "tls_grab_failed": tls_failed}
 
 
 # ---------------------------------------------------------------- 9. vhost collision
@@ -2150,6 +2545,16 @@ def doctor() -> dict:
               "max": (u or {}).get("maxQueries"),
               "usable": (u or {}).get("usable")}
     env = _env_selfcheck()
+    # fake-IP detection: a Clash/TUN resolver answers EVERY name with an
+    # address from 198.18.0.0/15, which makes the whole resolution graph
+    # untrustworthy. Publishing the verdict here means status/brief and the dns
+    # stage quote one detection instead of each probing on their own.
+    env["fake_ip_dns"] = doh.detect_environment()
+    env["resolution"] = doh.ResolutionPlan.for_run().payload()
+    if env["fake_ip_dns"].get("fake_ip_dns"):
+        env["fake_ip_hint"] = ("the local resolver synthesises addresses "
+                               "(198.18.0.0/15); dns and probe stages use DoH at "
+                               + str(env["resolution"].get("doh_url") or ""))
     return {"python": "ok" if env["python_ok"] else "incompatible:" + env["python_version"],
             "skill_version": core.skill_version(),
             "environment": env,
