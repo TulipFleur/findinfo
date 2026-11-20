@@ -212,6 +212,20 @@ class RunSpec:
         return cls(**{k: v for k, v in d.items() if k in fields})
 
 
+def _explicit_or(args, name, default):
+    """A numeric option only takes its default when the caller did NOT type it.
+
+    `getattr(...) or 1200` turned an explicitly typed 0 into 1200, so
+    `--entity-timeout 0` ("no ceiling") silently became the default ceiling
+    (F15). None/absent still means "use the default"; a real 0 or any other
+    number is preserved verbatim.
+    """
+    val = getattr(args, name, None)
+    if val is None or val == "":
+        return default
+    return val
+
+
 def from_cli(args) -> RunSpec:
     """Build a RunSpec from a parsed run namespace (the single source)."""
     return RunSpec(
@@ -230,7 +244,7 @@ def from_cli(args) -> RunSpec:
         depth=int(getattr(args, "depth", 3)),
         invest=int(getattr(args, "invest", 51)),
         deep=int(getattr(args, "deep", 2)),
-        entity_timeout=int(getattr(args, "entity_timeout", 1200) or 1200),
+        entity_timeout=int(_explicit_or(args, "entity_timeout", 1200)),
         engines=getattr(args, "engines",
                         "fofa,quake,hunter,shodan,censys"),
         top_ports=int(getattr(args, "top_ports", 1000)),
@@ -239,8 +253,8 @@ def from_cli(args) -> RunSpec:
         no_icp=bool(getattr(args, "no_icp", False)),
         no_onepass=bool(getattr(args, "no_onepass", False)),
         force_stage=bool(getattr(args, "force_stage", False)),
-        rounds=int(getattr(args, "rounds", 1) or 1),
-        time_budget=float(getattr(args, "time_budget", 0) or 0),
-        task_timeout=float(getattr(args, "task_timeout", 0) or 0),
-        tool_timeout=int(getattr(args, "tool_timeout", 0) or 0),
+        rounds=int(_explicit_or(args, "rounds", 1)),
+        time_budget=float(_explicit_or(args, "time_budget", 0)),
+        task_timeout=float(_explicit_or(args, "task_timeout", 0)),
+        tool_timeout=int(_explicit_or(args, "tool_timeout", 0)),
     )

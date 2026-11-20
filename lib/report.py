@@ -1399,6 +1399,46 @@ BRIEF_TOP = 20              # default number of high-priority hosts
 BRIEF_LEAKS = 20            # default number of leak examples
 BRIEF_MAX_BYTES = 32 * 1024
 BRIEF_MAX_COVERAGE = 40
+# A brief smaller than this cannot carry its own envelope (schema, counts,
+# coverage summary, truncation flags). Refusing is honest; emitting a
+# half-document that quietly exceeds the ceiling is not (F14).
+BRIEF_MIN_BYTES = 512
+
+
+def fit_brief(brief: dict, max_bytes, ascii_safe=None) -> dict:
+    """Final fit+measure of a COMPLETE brief, using the stdout encoder.
+
+    Call this after every section (coverage, metered, note) has been merged:
+    it shrinks in the documented order, then writes brief_bytes equal to the
+    real stdout byte count under the same ASCII/UTF-8 policy emit() uses. After
+    this call nothing may append to the object -- the number would be a lie.
+    """
+    if max_bytes is None:
+        max_bytes = BRIEF_MAX_BYTES
+    max_bytes = int(max_bytes)
+    if max_bytes < BRIEF_MIN_BYTES:
+        raise core.FindInfoError(
+            "max_bytes is too small for a brief envelope (minimum "
+            + str(BRIEF_MIN_BYTES) + "): " + str(max_bytes))
+    if ascii_safe is None:
+        ascii_safe = core.emit_ascii_default()
+    brief.setdefault("truncated", {})
+    brief["brief_max_bytes"] = max_bytes
+    brief["truncated"].update(_shrink_brief(brief, max_bytes, ascii_safe))
+    # Fixpoint: the size number is part of the document, so writing it can
+    # change its own digit count. Iterate until the value is stable AND fits.
+    for _ in range(8):
+        size = _brief_size(brief, ascii_safe)
+        if brief.get("brief_bytes") == size and size <= max_bytes:
+            break
+        brief["brief_bytes"] = size
+        if size > max_bytes:
+            brief["truncated"].update(_shrink_brief(brief, max_bytes,
+                                                    ascii_safe))
+    else:
+        brief["brief_bytes"] = _brief_size(brief, ascii_safe)
+    return brief
+
 
 _BRIEF_HOST_FIELDS = ("host", "score", "priority", "reasons", "provenance")
 
@@ -1500,7 +1540,8 @@ def _brief_coverage(data=None, coverage=None):
     return out
 
 
-def build_brief(data, top=None, leak_limit=None, max_bytes=None, coverage=None) -> dict:
+def build_brief(data, top=None, leak_limit=None, max_bytes=None,
+                coverage=None, ascii_safe=None) -> dict:
     """Shape one collection pass into a brief small enough to read whole.
 
     Only what an agent needs to decide the next action: how much was found,
@@ -1565,25 +1606,25 @@ def build_brief(data, top=None, leak_limit=None, max_bytes=None, coverage=None) 
     # be measured under a payload that already carries them; otherwise the
     # final write is a few bytes larger than what was measured and the
     # promise "never exceeds max_bytes" is off by a rounding error.
+    if ascii_safe is None:
+        ascii_safe = core.emit_ascii_default()
+    # The caller may still merge metered/note and call fit_brief() again; this
+    # pass makes build_brief() usable on its own (report --with-brief).
     brief["brief_bytes"] = 0
-    brief["brief_max_bytes"] = max_bytes
-    brief["truncated"].update(_shrink_brief(brief, max_bytes))
-    brief["brief_bytes"] = _brief_size(brief)
-    # one final pass in case the number itself pushed it over
-    if brief["brief_bytes"] > max_bytes:
-        extra = _shrink_brief(brief, max_bytes)
-        if extra:
-            brief["truncated"].update(extra)
-        brief["brief_bytes"] = _brief_size(brief)
-    return brief
+    return fit_brief(brief, max_bytes, ascii_safe)
 
 
-def _brief_size(brief) -> int:
-    return len(json.dumps(brief, ensure_ascii=False,
-                          separators=(",", ":")).encode("utf-8"))
+def _brief_size(brief, ascii_safe=None) -> int:
+    """Real stdout bytes of this brief (the SAME encoder emit() uses).
+
+    Includes the separators and the trailing newline, and honours the
+    ASCII/UTF-8 emission mode: brief_bytes is the true byte count an agent
+    reads on stdout, not a differently-encoded approximation (F14).
+    """
+    return len(core.encode_json_line(brief, ascii_safe).encode("utf-8"))
 
 
-def _shrink_brief(brief, max_bytes) -> dict:
+def _shrink_brief(brief, max_bytes, ascii_safe=None) -> dict:
     """Cut the cheapest things first until the brief fits, recording each cut.
 
     Order matters: prose goes before findings, findings go before counts, and
@@ -1593,7 +1634,7 @@ def _shrink_brief(brief, max_bytes) -> dict:
     cuts = {}
 
     def fits():
-        return _brief_size(brief) <= max_bytes
+        return _brief_size(brief, ascii_safe) <= max_bytes
 
     if fits():
         return cuts
@@ -1649,34 +1690,69 @@ def _shrink_brief(brief, max_bytes) -> dict:
     if fits():
         return cuts
 
-    # 6. last resort: shrink the gaps and next steps, and SAY so loudly
-    while brief["coverage"]["unavailable"] and not fits():
+    # 6. metered detail: the SPEND COUNTS stay, per-engine rows shrink first
+    metered = brief.get("metered") or {}
+    if isinstance(metered, dict) and metered.get("by_engine"):
+        while metered["by_engine"] and not fits():
+            metered["by_engine"].popitem()
+        if not metered["by_engine"]:
+            metered.pop("by_engine", None)
+        cuts["metered.by_engine"] = ("per-engine rows dropped; totals kept")
+    if fits():
+        return cuts
+
+    # 7. long free text (warnings / stage errors): keep the family, cut the
+    # prose. A truncated gap still names WHAT failed.
+    for key in ("warnings",):
+        arr = list(brief.get("environment", {}).get(key) or [])
+        if arr:
+            brief["environment"][key] = [
+                (str(w)[:160] + ("..." if len(str(w)) > 160 else ""))
+                for w in arr[:5]]
+            cuts["environment." + key] = ("warnings shortened to 5 x 160 chars")
+    gaps = brief.get("coverage", {}).get("gaps") or []
+    if gaps:
+        for g in gaps:
+            if isinstance(g, dict) and isinstance(g.get("reason"), str):
+                g["reason"] = g["reason"][:160]
+        cuts["coverage.reasons"] = "gap reasons shortened to 160 chars"
+    if fits():
+        return cuts
+
+    # 8. last resort: shrink the gap list and next steps, and SAY so loudly.
+    # The COUNT is preserved in coverage so "how much is missing" survives.
+    while brief["coverage"].get("unavailable") and not fits():
         brief["coverage"]["unavailable"].pop()
-    while len(brief["next_steps"]) > 2 and not fits():
+    while len(brief.get("next_steps") or []) > 2 and not fits():
         brief["next_steps"].pop()
+    while len(brief.get("top_hosts") or []) > 0 and not fits():
+        brief["top_hosts"].pop()
     cuts["coverage"] = {
-        "kept": len(brief["coverage"]["unavailable"]),
+        "kept": len(brief["coverage"].get("unavailable") or []),
         "total": brief["coverage"].get("unavailable_total", 0)}
     return cuts
 
 
 def write_brief(data, base, top=None, leak_limit=None, max_bytes=None,
                 coverage=None) -> dict:
-    """Write report.brief.json next to report.json; returns path + stats."""
+    """Write report.brief.json next to report.json; returns path + stats.
+
+    The file is measured with the SAME content it writes (no compact-vs-file
+    mix-up): brief_bytes describes the bytes on disk, and the ceiling applies
+    to that document too.
+    """
     brief = build_brief(data, top=top, leak_limit=leak_limit,
-                        max_bytes=max_bytes, coverage=coverage)
+                        max_bytes=max_bytes, coverage=coverage, ascii_safe=False)
     p = Path(base) / "report.brief.json"
+    # The FILE has no trailing newline, so it is measured without one; stdout
+    # (brief command) adds the newline and reports that byte count instead.
     blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
-    p.write_text(blob, encoding="utf-8")
-    # brief_bytes is written INTO the file, so its own digit count can shift
-    # the total. Re-state the real size and rewrite once if it moved.
-    actual = len(blob.encode("utf-8"))
-    if brief.get("brief_bytes") != actual:
-        brief["brief_bytes"] = actual
+    for _ in range(8):
+        size = len(blob.encode("utf-8"))
+        if brief.get("brief_bytes") == size:
+            break
+        brief["brief_bytes"] = size
         blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
-        if len(blob.encode("utf-8")) != actual:
-            brief["brief_bytes"] = len(blob.encode("utf-8"))
-            blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
-        p.write_text(blob, encoding="utf-8")
+    p.write_text(blob, encoding="utf-8")
     return {"path": str(p), "bytes": len(blob.encode("utf-8")),
             "truncated": brief["truncated"]}

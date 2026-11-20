@@ -269,6 +269,26 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def emit_ascii_default() -> bool:
+    """Whether stdout JSON is ASCII-escaped (the default) or raw UTF-8."""
+    return (os.environ.get("FINDINFO_EMIT_UTF8") or "").lower() not in (
+        "1", "true", "yes")
+
+
+def encode_json_line(obj, ascii_safe: bool | None = None) -> str:
+    """THE one encoder for stdout: compact separators plus the final newline.
+
+    Everything that MEASURES a payload or prints it must go through this, or
+    the declared size and the real stdout bytes disagree (F14: the brief was
+    measured as compact UTF-8 while stdout wrote ASCII-escaped text, so a
+    declared 32749 bytes became 32845 on the wire).
+    """
+    if ascii_safe is None:
+        ascii_safe = emit_ascii_default()
+    return json.dumps(obj, ensure_ascii=ascii_safe,
+                      separators=(",", ":")) + chr(10)
+
+
 def emit(obj: Any) -> None:
     """Machine-readable result goes to stdout; everything else to stderr.
 
@@ -276,7 +296,8 @@ def emit(obj: Any) -> None:
     in summary.jsonl, so when we are not the ones publishing those (i.e. we are
     just checking progress) repeating them on every call is pure token cost.
     FINDINFO_EMIT=minimal drops the bulky echo fields; behaviour of the data
-    itself is unchanged.
+    itself is unchanged -- except that a brief keeps the fields it is REQUIRED
+    to carry (a minimal mode must not strip a brief's decision surface).
 
     stdout is ASCII-escaped by default (ensure_ascii=True): the JSON line is
     consumed by scripts and agents, and pure ASCII decodes identically under
@@ -284,13 +305,17 @@ def emit(obj: Any) -> None:
     default (code page 936), where raw UTF-8 bytes make ConvertFrom-Json fail
     on the first CJK string. Set FINDINFO_EMIT_UTF8=1 to emit raw UTF-8 (for
     humans piping to a UTF-8-aware terminal); the JSON value content is the
-    same either way.
+    same either way. Both paths share encode_json_line(), so a caller that
+    measured these bytes sees the same number on stdout.
     """
     if (os.environ.get("FINDINFO_EMIT") or "").lower() == "minimal" and isinstance(obj, dict):
-        drop = ("progress", "coverage", "summary", "params", "paths")
-        obj = {k: v for k, v in obj.items() if k not in drop}
-    ascii_safe = (os.environ.get("FINDINFO_EMIT_UTF8") or "").lower() not in ("1", "true", "yes")
-    sys.stdout.write(json.dumps(obj, ensure_ascii=ascii_safe) + chr(10))
+        if obj.get("schema") == "findinfo.brief/1":
+            # never strip a brief's required fields under minimal mode
+            pass
+        else:
+            drop = ("progress", "coverage", "summary", "params", "paths")
+            obj = {k: v for k, v in obj.items() if k not in drop}
+    sys.stdout.write(encode_json_line(obj))
     sys.stdout.flush()
 
 

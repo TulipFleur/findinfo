@@ -42,8 +42,13 @@ def test_emit_is_one_line_and_opt_out_flag_exists():
     from lib import core
     src = (ROOT / "lib" / "core.py").read_text(encoding="utf-8")
     assert "FINDINFO_EMIT_UTF8" in src, "the raw-UTF-8 opt-out flag must exist"
-    assert 'ascii_safe = (os.environ.get("FINDINFO_EMIT_UTF8") or "").lower() not in' in src, \
+    # ASCII escaping is the DEFAULT: the UTF-8 flag turns it OFF. One predicate
+    # (emit_ascii_default) is shared by emit() and the brief measurement, so a
+    # caller that measured the bytes sees exactly those bytes on stdout.
+    assert 'os.environ.get("FINDINFO_EMIT_UTF8") or "").lower() not in' in src, \
         "ASCII escaping must be the DEFAULT (opt-out, not opt-in)"
+    assert "def emit_ascii_default" in src, "one ASCII-mode predicate"
+    assert "encode_json_line(obj)" in src, "emit must use the shared encoder"
 
 
 # ---------------------------------------------------------------- P1-1
