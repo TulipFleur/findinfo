@@ -1706,7 +1706,15 @@ def _run_pipeline(args) -> int:
                {"seeds": seeds, "engines": args.engines,
                 "usable_engines": _usable_engines},
                args, _subs,
-               lambda r: ({"found": r["found"]} |
+               # Project the OUTCOME, not just the count: _subs merged the
+               # per-source outcomes through core.combine_outcome, and the
+               # stage entry defaulted it to OUTCOME_OK. A partial run (one
+               # engine timed out, the rest answered) was then written as
+               # "succeeded" and checkpointed "done", so a later run skipped
+               # the stage forever while half the sources never answered.
+               lambda r: ({"found": r["found"],
+                          "outcome": r.get("outcome") or core.OUTCOME_OK,
+                          "sources": len(r.get("per_source") or [])} |
                           ({"quota_exhausted": True} if r.get("quota_exhausted") else {})))
 
         # 3.5 brute force (active, raw socket)
@@ -2021,11 +2029,23 @@ def _run_pipeline(args) -> int:
         unavailable = _fold_runtime_unavailable(unavailable, summary["stages"])
         source_errors = sum(int(s.get("sources_error") or 0)
                             for s in summary["stages"] if isinstance(s, dict))
+        # Stages that finished but explicitly reported themselves
+        # incomplete (OUTCOME_PARTIAL/BUDGET). _stage checkpoints them
+        # "partial" so a re-run retries them, but the final verdict used
+        # to ignore the outcome entirely: done_stages counted every
+        # entry with an elapsed field, so a run whose only real work
+        # was half-collected still claimed "complete".
+        partial_stages = [{"stage": s["stage"], "outcome": s.get("outcome")}
+                          for s in summary["stages"]
+                          if isinstance(s, dict) and not s.get("failed")
+                          and s.get("outcome") in (core.OUTCOME_PARTIAL,
+                                                    core.OUTCOME_BUDGET)]
         coverage = {
             "planned_stages": planned,
             "done_stages": done_stages,
             "skipped_stages": skipped_stages,
             "failed_stages": failed_stages,
+            "partial_stages": partial_stages,
             # planned stages that never produced a result, failed, or were skipped
             # for a reason (e.g. probe with no resolved host) -- the gaps a user
             # has to be told about, distinct from checkpoint skips
@@ -2083,6 +2103,21 @@ def _run_pipeline(args) -> int:
             status, reason, rc = "partial", "js_queue_failed", 5
         elif stop_reason == "js_pending":
             status, reason, rc = "partial", "js_pending", 5
+        elif partial_stages:
+            # A stage that ran but reported itself incomplete is not a
+            # completed collection. Name the stage so the agent can read
+            # which one to retry instead of guessing from counts.
+            reason = ("partial_stages:" +
+                      ",".join(sorted({p_["stage"] for p_ in partial_stages})))
+            status, rc = "partial", 5
+        elif coverage["not_run_stages"]:
+            # A planned, required stage that never produced a result is an
+            # obligation gap, not "done": the run cannot claim complete
+            # coverage of the requested work. _not_run_stages already
+            # excludes informational stages and justified no_input ones.
+            reason = ("planned_stage_not_run:" +
+                      ",".join(coverage["not_run_stages"]))
+            status, rc = "partial", 5
         else:
             status, reason, rc = "complete", (stop_reason or "all_stages_done"), 0
         coverage["complete"] = status == "complete"
