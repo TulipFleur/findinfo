@@ -69,6 +69,7 @@ MODULES = [
     "tests.test_asset_timestamps",
     "tests.test_w1_pipeline_work",
     "tests.test_w2_spec_wiring",
+    "tests.test_w3_metered_wiring",
 ]
 
 

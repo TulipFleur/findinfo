@@ -68,19 +68,25 @@ def status_of(outcome: str, rc=None, count: int | None = None,
 class MeteredLedger:
     """Append-only billed-request ledger for one engagement."""
 
-    def __init__(self, path=None, buffer: list | None = None):
+    def __init__(self, path=None, buffer: list | None = None,
+                 run_id: str = ""):
         self.path = path
         self.buffer = buffer if buffer is not None else []
+        # The run every record() call stamps by default; collectors receive
+        # the ledger and do not need to know the run's public id.
+        self.run_id = run_id or ""
         self._seen: dict = {}
 
     # ---------------------------------------------------------------- record
-    def record(self, run_id: str, engine: str, input_hash: str = "",
+    def record(self, run_id: str = "", engine: str = "", input_hash: str = "",
                *, status: str = ST_OK, requested: int = 0,
                returned: int = 0, elapsed_sec: float = 0.0,
                rc=None, error: str = "", quota: dict | None = None) -> bool:
         """Append one billed request. False only for a duplicate no-change
         replay of (run_id, engine, input_hash) with the same status."""
         st = status_of(status, rc=rc, count=returned, error=error)
+        run_id = run_id or getattr(self, "run_id", "") or ""
+        engine = engine or "unknown"
         key = (run_id, engine, input_hash or "")
         if input_hash and self._seen.get(key) == st:
             return False
@@ -179,6 +185,33 @@ def _norm_quota(quota: dict) -> dict:
     if quota and quota.get("source"):
         out["source"] = str(quota["source"])
     return out
+
+
+def load_ledger(path, run_id: str = "") -> "MeteredLedger":
+    """Read a run's persisted metered.jsonl back into a ledger (brief/report).
+
+    The file is the durable spend record: a later session summarises the
+    engagement without the process that incurred it. A missing file is an
+    empty ledger, not an error.
+    """
+    led = MeteredLedger(run_id=run_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                led.buffer.append(row)
+                if row.get("input_hash"):
+                    led._seen[(row.get("run_id") or "", row.get("engine") or "",
+                               row["input_hash"])] = row.get("status")
+    except OSError:
+        pass
+    return led
 
 
 def hash_input(value) -> str:

@@ -715,7 +715,19 @@ def _gateway_rows_to_domains(res: dict) -> tuple[list[str], list[str]]:
 
 # ---------------------------------------------------------------- 3. ICP reverse lookup
 def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
-          timeout: int = 0) -> dict:
+          timeout: int = 0, ledger=None) -> dict:
+    """ICP reverse lookup; `ledger` records one row per billed request."""
+    from . import metered as _metered
+
+    def _billed(engine: str, input_hash: str = "", **kw) -> None:
+        if ledger is None:
+            return
+        try:
+            ledger.record(engine=engine, input_hash=input_hash or
+                          _metered.hash_input({"engine": engine}), **kw)
+        except Exception:
+            pass
+
     try:
         exe = core.tool("uncover")
     except core.ToolMissing:
@@ -736,7 +748,18 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
                            passivity="passive")
         # A self-hosted FOFA relay covers ICP reverse lookup without uncover.
         if core.api_base("fofa"):
+            _t0 = time.time()
             res = fofa_gateway_query('icp="' + code + '"', size=10000, timeout=timeout)
+            _billed("fofa-gateway",
+                    input_hash=_metered.hash_input({"icp": code}),
+                    status=_metered.ST_QUOTA if (res and res.get("quota_exhausted"))
+                    else (_metered.ST_FAILED if res is None else
+                          (_metered.ST_EMPTY if not (res or {}).get("count")
+                           else _metered.ST_OK)),
+                    requested=1, returned=int((res or {}).get("count") or 0),
+                    elapsed_sec=time.time() - _t0,
+                    quota={"remaining": (res or {}).get("remaining"),
+                           "maxQueries": (res or {}).get("maxQueries")})
             if res:
                 gd, gip = _gateway_rows_to_domains(res)
                 for d in gd:
@@ -768,8 +791,18 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
         q = 'icp="' + code + '"'
         core.throttle("fofa")
         core.mapping_wait()
+        _t1 = time.time()
         rc, out, err = core.run([exe, "-q", q, "-e", ",".join(usable), "-json",
                                  "-silent"], timeout=timeout)
+        _n = sum(1 for _ in core.parse_jsonl(out))
+        _billed("uncover", input_hash=_metered.hash_input(
+                    {"icp": code, "engines": usable}),
+                rc=rc, requested=1, returned=_n,
+                elapsed_sec=time.time() - _t1,
+                error=(err or "")[-200:] if rc not in (0, None) else "",
+                status=("failed" if rc == 124 else
+                        "empty" if _n == 0 and rc in (0, None) else
+                        "ok" if rc in (0, None) else "failed"))
         if rc != 0 or not (out or "").strip():
             # uncover swallows upstream API errors (bad key -> empty stdout with
             # rc=0), so a silent zero is indistinguishable from "no results".
@@ -797,12 +830,31 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
 
 # ---------------------------------------------------------------- 4. passive subdomains
 def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
-           timeout: int = 0) -> dict:
+           timeout: int = 0, ledger=None) -> dict:
+    """Passive subdomain enumeration across the mapping engines.
+
+    `ledger` is the run's MeteredLedger: every BILLed provider request
+    (fofa-gateway call, uncover dispatch) appends exactly one row -- one row
+    per REQUEST, never per result row (docs/RELIABILITY-PLAN.md par.10). None
+    of the free sources (subfinder, chaos, onepass CT) is recorded.
+    """
+    from . import metered as _metered
     raw = domain
     domain = core.canon_domain(domain)
     if not domain:
         raise core.FindInfoError("invalid domain: " + str(raw))
     found: dict[str, set] = {}
+
+    def _billed(engine: str, input_hash: str = "", **kw) -> None:
+        """One ledger row per billed provider REQUEST (ledger is optional)."""
+        if ledger is None:
+            return
+        try:
+            ledger.record(engine=engine,
+                          input_hash=input_hash or _metered.hash_input(
+                              {"domain": domain, "engine": engine}), **kw)
+        except Exception:
+            pass
 
     def add(d: str, src: str) -> None:
         cd = core.canon_domain(d)
@@ -817,7 +869,17 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     quota_exhausted = False
     if core.api_base("fofa"):
         core.log("fofa gateway " + domain)
+        _gw_t0 = time.time()
         res = fofa_gateway_query('domain="' + domain + '"', size=10000, timeout=timeout)
+        _billed("fofa-gateway",
+                status=_metered.ST_QUOTA if (res and res.get("quota_exhausted"))
+                else (_metered.ST_FAILED if res is None else
+                      (_metered.ST_EMPTY if not (res or {}).get("count")
+                       else _metered.ST_OK)),
+                requested=1, returned=int((res or {}).get("count") or 0),
+                elapsed_sec=time.time() - _gw_t0,
+                quota={"remaining": (res or {}).get("remaining"),
+                       "maxQueries": (res or {}).get("maxQueries")})
         if res and res.get("quota_exhausted"):
             # Reported, not silent: the source produced nothing because its
             # budget ran out, which is a coverage gap, not "no assets exist".
@@ -843,8 +905,10 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     # string to the agent. Each entry below is (id, outcome, found, error).
     per_source: list[dict] = []
 
-    def run_source(sid: str, cmd: list[str], *, key: str, tool: str) -> None:
+    def run_source(sid: str, cmd: list[str], *, key: str, tool: str,
+                   billed: bool = False) -> None:
         core.log(tool + " " + domain)
+        _t0 = time.time()
         rc, out, err = core.run(cmd, timeout=timeout)
         before = len(found)
         for r in core.parse_jsonl(out):
@@ -857,6 +921,15 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
                                      (err or "")[-200:].strip() if rc not in (0, None) else "")})
         if outcome in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT):
             core.log(sid + ": " + outcome + " rc=" + str(rc))
+        if billed:
+            # uncover is the billed dispatcher (its engines all cost quota);
+            # free sources (subfinder, chaos) never reach the ledger.
+            _billed("uncover", rc=rc, requested=1, returned=n,
+                    elapsed_sec=time.time() - _t0,
+                    error=(err or "")[-200:] if rc not in (0, None) else "",
+                    status=("failed" if rc == 124 else
+                            "empty" if n == 0 and rc in (0, None) else
+                            "ok" if rc in (0, None) else "failed"))
 
     if core.has_tool("subfinder"):
         run_source("subfinder",
@@ -882,7 +955,7 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
         run_source("uncover",
                    [core.tool("uncover"), "-q", 'domain:"' + domain + '"',
                     "-e", ",".join(usable_engines), "-json", "-silent"],
-                   key="host", tool="uncover")
+                   key="host", tool="uncover", billed=True)
     elif not core.has_tool("uncover"):
         per_source.append({"id": "uncover", "outcome": core.OUTCOME_UNAVAILABLE,
                            "found": 0, "rc": None, "error": "binary not found"})

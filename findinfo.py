@@ -504,6 +504,21 @@ def cmd_brief(args) -> None:
     brief = report.build_brief(data, top=args.top,
                                max_bytes=args.max_bytes,
                                coverage=coverage)
+    # Billed-spend summary from the run's ledger (batch F): what was spent,
+    # per engine, and which engines are blocked (quota/auth) -- an agent
+    # deciding "is another round worth it" needs the quota evidence, not a
+    # guess. A run with no ledger (or none reachable) simply omits the block.
+    try:
+        rid = str(getattr(args, "run", "") or "").strip()
+        rd = jobs.resolve(rid) if rid else None
+        if rd is not None and (rd / "metered.jsonl").exists():
+            led = metered_mod.load_ledger(rd / "metered.jsonl", run_id=rd.name)
+            if led.rows():
+                brief["metered"] = {"totals": led.totals(),
+                                    "by_engine": led.by_engine(),
+                                    "blocked_engines": led.blocked_engines()}
+    except Exception:
+        pass
     brief["note"] = ("Unified agent read API: queries the store, writes no "
                      "files. report produces the human md/html only; full data "
                      "via assets --export or report --with-json.")
@@ -1130,23 +1145,37 @@ def _coverage_unavailable(args, active) -> dict:
     }
 
 
-def _fold_runtime_unavailable(unavailable: dict, stages: list) -> dict:
+def _fold_runtime_unavailable(unavailable: dict, stages: list,
+                               blocked_engines: list | None = None) -> dict:
     """Add gaps that only become known while the run is executing.
 
     A source whose quota runs out mid-engagement must show up as a coverage
     gap. Left in the stage payload nobody reads it, and the source then looks
     like it simply "found nothing" -- the exact confusion this project forbids.
+
+    The typed engine verdict comes from the metered ledger (blocked_engines:
+    quota/auth on the LAST request, docs par.10) -- not from a stage payload
+    flag alone: a partial stage entry can drop it, and the ledger is the
+    per-request record the stage answer cannot contradict.
     """
     hits = [st.get("stage") or "subs" for st in stages
             if isinstance(st, dict) and st.get("quota_exhausted")]
-    if not hits:
+    blocked = sorted(set(blocked_engines or []))
+    if not hits and not blocked:
         return unavailable
     out = dict(unavailable)
-    names = sorted(set(hits))
-    out["quota_exhausted"] = names
+    if hits:
+        names = sorted(set(hits))
+        out["quota_exhausted"] = names
+    if blocked:
+        out["blocked_engines"] = blocked
+    parts: list = []
+    if hits:
+        parts.append("quota exhausted during run: " + ",".join(sorted(set(hits))))
+    if blocked:
+        parts.append("engines blocked (quota/auth): " + ",".join(blocked))
     note = out.get("note") or ""
-    out["note"] = (note + "; " if note else "") + \
-        "quota exhausted during run: " + ",".join(names)
+    out["note"] = (note + "; " if note else "") + "; ".join(parts)
     return out
 
 
@@ -1646,6 +1675,13 @@ def _run_pipeline(args) -> int:
     # prints), never the legacy integer runs.id.
     summary["_run_public_id"] = run_dir.name
     summary["run_dir"] = str(run_dir)
+    # Per-request ledger for every billed provider call (batch F): the file
+    # lives in the run dir, so a later session reads the spend without the
+    # process that incurred it. Collectors receive it as `ledger=` and record
+    # one row per REQUEST (never per result row).
+    ledger = metered_mod.MeteredLedger(path=run_dir / "metered.jsonl",
+                                       run_id=run_dir.name)
+    summary["_ledger"] = ledger
     rounds = max(1, int(getattr(args, "rounds", 1) or 1))
     time_budget = float(getattr(args, "time_budget", 0) or 0)
     tool_timeout = int(getattr(args, "tool_timeout", 0) or 0)
@@ -1844,7 +1880,7 @@ def _run_pipeline(args) -> int:
             per_source: list = []
             for d in seeds:
                 r = tools.t_subs(store, d, engines=args.engines,
-                                 timeout=tool_timeout)
+                                 timeout=tool_timeout, ledger=summary.get("_ledger"))
                 total += r["count"]
                 quota = quota or bool(r.get("quota_exhausted"))
                 outcomes.append(r.get("outcome") or core.OUTCOME_OK)
@@ -1911,7 +1947,8 @@ def _run_pipeline(args) -> int:
         # 4. icp reverse
         if icp_codes and not args.no_icp:
             def _icp():
-                r = tools.t_icp(store, icp_codes, engines=args.engines, timeout=tool_timeout)
+                r = tools.t_icp(store, icp_codes, engines=args.engines,
+                                timeout=tool_timeout, ledger=summary.get("_ledger"))
                 res = {"domains": len(r.get("domains", [])),
                        "errors": len(r.get("errors", []))}
                 ok = bool(r.get("domains")) or not r.get("errors")
@@ -2257,10 +2294,17 @@ def _run_pipeline(args) -> int:
                          for s in summary["stages"] if s.get("failed")]
         unavailable = _coverage_unavailable(args, active)
         # A source can also become unusable DURING the run (the relay's quota
-        # runs out mid-engagement). That is only known from the stage results,
-        # so fold the runtime finding into the same "unavailable" block instead
-        # of leaving it in the stage payload where nobody reads it.
-        unavailable = _fold_runtime_unavailable(unavailable, summary["stages"])
+        # runs out mid-engagement). That is only known from the stage results
+        # and the per-request ledger, so fold the runtime findings into the
+        # same "unavailable" block instead of leaving them in stage payloads
+        # where nobody reads them.
+        ledger = summary.get("_ledger")
+        try:
+            blocked_engines = ledger.blocked_engines() if ledger else []
+        except Exception:
+            blocked_engines = []
+        unavailable = _fold_runtime_unavailable(unavailable, summary["stages"],
+                                                blocked_engines)
         source_errors = sum(int(s.get("sources_error") or 0)
                             for s in summary["stages"] if isinstance(s, dict))
         # Stages that finished but explicitly reported themselves
@@ -2318,6 +2362,18 @@ def _run_pipeline(args) -> int:
             # bundles are still queued.
             "js_queue": (store.js_stats() if hasattr(store, "js_stats") else {}),
         }
+        # The billed-spend summary from the per-request ledger (batch F):
+        # totals, per-engine requests and the blocked list the verdict reads.
+        try:
+            if ledger and ledger.rows():
+                coverage["metered"] = {
+                    "totals": ledger.totals(),
+                    "by_engine": ledger.by_engine(),
+                    "blocked_engines": blocked_engines,
+                    "ledger_path": str(run_dir / "metered.jsonl"),
+                }
+        except Exception:
+            pass
         # The run's own durable queue is the same obligation set (T16): a
         # pending/failed/running work item means the collection is unfinished,
         # whatever the shared legacy queue says.
@@ -2386,6 +2442,10 @@ def _run_pipeline(args) -> int:
                           "stderr_log": str(run_dir / "stderr.log"),
                           "spec": str(run_dir / "job.json")},
         }
+        # Private pass-through keys (the ledger object) never serialise: the
+        # summary is the persisted record; the spend facts live in its
+        # metered.jsonl and the coverage.metered block above.
+        summary.pop("_ledger", None)
         core.write_jsonl(run_dir / "summary.jsonl", [summary])
         store.finish_run(run_id, summary)
         _write_status(run_dir, stage="done", state="completed", stage_state="done",

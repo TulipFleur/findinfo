@@ -311,7 +311,7 @@ def test_failed_source_keeps_other_sources_assets():
     def certs_down(store, d, timeout=0):
         return {"count": 0, "ok": False, "rc": 124}
 
-    def subs_finds_three(store, d, engines="", timeout=0):
+    def subs_finds_three(store, d, engines="", timeout=0, **kw):
         for h in ("a.example.com", "b.example.com", "c.example.com"):
             store.upsert_asset("domain", h, source="subfinder", confidence=0.8)
         return {"domain": d, "count": 3, "domains": []}
