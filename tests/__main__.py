@@ -70,6 +70,7 @@ MODULES = [
     "tests.test_w1_pipeline_work",
     "tests.test_w2_spec_wiring",
     "tests.test_w3_metered_wiring",
+    "tests.test_w4_identity_gate",
 ]
 
 

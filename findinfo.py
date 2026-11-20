@@ -1752,6 +1752,31 @@ def _run_pipeline(args) -> int:
                         msg,
                         result={"companies": 0, "icp": 0, "domains": 0,
                                 "table_only": bool(r.get("table_only"))})
+                # Subject gate (docs par.8, T06): a brand that matches MORE
+                # than one plausible legal subject is ambiguous. Without an
+                # explicit --domain seed the run must stop and ask, never
+                # guess a company and probe the wrong target. With a seed the
+                # brand is context only and the gate passes.
+                verdict = tools.resolve_entity_identity(
+                    raw=args.name,
+                    candidates=[{"name": c, "id": c} for c in
+                                (r.get("companies") or [])],
+                    explicit_domains=list(args.domain or []))
+                if verdict.get("status") == "identity_ambiguous":
+                    summary["_identity_ambiguous"] = {
+                        "brand": args.name,
+                        "candidates": (r.get("companies") or [])[:10],
+                        "next_steps": verdict.get("next_steps") or []}
+                    raise core.StageError(
+                        "identity_ambiguous: brand '" + str(args.name) +
+                        "' matches " + str(len(r.get("companies") or [])) +
+                        " plausible subjects (" +
+                        ", ".join((r.get("companies") or [])[:3]) +
+                        "); " + "; ".join(verdict.get("next_steps") or []),
+                        result={"companies": len(r.get("companies") or []),
+                                "icp": 0, "domains": 0,
+                                "identity_ambiguous": True,
+                                "subject_candidates": (r.get("companies") or [])[:10]})
                 return r
             _stage(store, run_dir, summary, "entity",
                    {"name": args.name, "invest": args.invest, "deep": args.deep},
@@ -1785,6 +1810,58 @@ def _run_pipeline(args) -> int:
                     icp_codes.append(a["canonical"])
                     _attach(store, summary, "icp", a["canonical"],
                             producer="entity", upstream="enscan", route=None)
+        if summary.get("_identity_ambiguous"):
+            # docs par.8: launch NO downstream traffic on a guessed subject.
+            # The gap is already recorded on the failed entity stage; skipping
+            # straight to the verdict keeps every downstream stage out of
+            # not_run (the run was never supposed to run them) while the
+            # result carries the input-required next steps.
+            summary["identity_ambiguous"] = summary.pop("_identity_ambiguous")
+            summary["planned_stages"] = ["entity"]
+            summary["_stage_total"] = 1
+            coverage = {
+                "planned_stages": ["entity"],
+                "done_stages": [],
+                "skipped_stages": [],
+                "failed_stages": [
+                    {"stage": s["stage"], "error": s.get("error"),
+                     "elapsed": s.get("elapsed")}
+                    for s in summary["stages"] if s.get("failed")],
+                "partial_stages": [],
+                "not_run_stages": [],
+                "unavailable": _coverage_unavailable(args, active),
+                "identity_ambiguous": True,
+                "subject_candidates": summary["identity_ambiguous"]["candidates"],
+                "next_steps": summary["identity_ambiguous"]["next_steps"],
+                "stage_states": {"entity": "failed"},
+                "disabled_stages": [x for x in ("entity", "onepass", "icp", "brute")
+                                    if x != "entity"],
+                "js_queue": {}, "work_queue": {}, "complete": False,
+            }
+            summary["counts"] = store.count_assets()
+            summary["coverage"] = coverage
+            summary["result"] = {
+                "status": "partial", "reason": "identity_ambiguous",
+                "run_id": run_dir.name, "attempt": attempt,
+                "target": target_label, "scope": [], "active": False,
+                "counts": summary["counts"], "endpoints": 0,
+                "elapsed_sec": round(time.monotonic() - t_start, 1),
+                "next_steps": summary["identity_ambiguous"]["next_steps"],
+                "artifacts": {"summary": str(run_dir / "summary.jsonl"),
+                              "state": str(run_dir / "status.json"),
+                              "stdout_log": str(run_dir / "stdout.log"),
+                              "stderr_log": str(run_dir / "stderr.log"),
+                              "spec": str(run_dir / "job.json")},
+            }
+            summary.pop("_ledger", None)
+            core.write_jsonl(run_dir / "summary.jsonl", [summary])
+            store.finish_run(run_id, summary)
+            _write_status(run_dir, stage="done", state="completed",
+                          stage_state="done", counts=summary["counts"],
+                          result=summary["result"], coverage=coverage,
+                          stage_index=1, stage_total=1)
+            out(summary)
+            return 5
         # Order matters: the domains the caller named come FIRST, then the ones
         # entity anchoring discovered. certs/subs/brute only walk the first
         # --max-seed entries, and a company anchor can surface hundreds of
