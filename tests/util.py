@@ -55,6 +55,32 @@ def fresh_tools(core_mod):
     return tools
 
 
+def pin_dns_environment(fake_ip: bool = False) -> None:
+    """Pin the resolver verdict AND the config switch for the whole process.
+
+    Same contract as pin_environment, plus core.CFG["dns"]["fake_ip"] so a
+    config file on the host cannot turn the DoH path on behind a test's back
+    (a test that exercises DoH pins it on and injects a doh_client).
+    """
+    import lib.doh as doh
+    doh.reset_environment_cache()
+    doh._ENV_CACHE["value"] = {
+        "fake_ip_dns": bool(fake_ip), "probe": "", "answers": [],
+        "reason": "pinned by tests.util"}
+    import lib.core as core
+    core.CFG["dns"] = dict(core.CFG.get("dns") or {})
+    core.CFG["dns"]["fake_ip"] = "on" if fake_ip else "off"
+
+
+def unpin_dns_environment() -> None:
+    """Forget the pinned verdict (a test that wants the real detection)."""
+    import lib.doh as doh
+    doh.reset_environment_cache()
+    import lib.core as core
+    core.CFG["dns"] = dict(core.CFG.get("dns") or {})
+    core.CFG["dns"]["fake_ip"] = "auto"
+
+
 def pin_environment(fake_ip_dns: bool = False):
     """Pin the fake-IP environment probe so tests never depend on the network.
 

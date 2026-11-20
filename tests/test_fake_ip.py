@@ -85,11 +85,13 @@ def test_dnsx_path_drops_198_19_answers():
          __import__("unittest.mock", fromlist=["mock"]).patch.object(
             core, "run_stream", _fake_run_stream(lines)):
         r = tools.t_dns(store, ["fake.example.com"])
-    assert r["count"] == 0
     assert r["fake_ip_dropped"] == 1
     assert store.get_assets(kind="ip") == [], "a fake IP must never be stored"
+    # Baseline semantics (947bfaa): the NAME is still evidence -- the resolver
+    # answered it -- so it is stored as a domain even when every address was
+    # a placeholder. Only the address is worthless, not the existence.
     stored = {a["canonical"] for a in store.get_assets(kind="domain")}
-    assert "fake.example.com" not in stored
+    assert "fake.example.com" in stored
     store.close()
 
 

@@ -2480,6 +2480,74 @@ def _probe_url(req, timeout: float = 8.0) -> bool:
         return False
 
 
+def doctor_offline() -> dict:
+    """doctor without any tool execution, network probe or key validation.
+
+    Everything a subprocess or a socket would answer is reported as
+    ``not_checked`` -- never false (``false`` means "checked and failed",
+    which this mode never does). The tool table lists file presence and
+    metadata only; runtime health, egress, credentials and the relay stay
+    unknown. Default doctor keeps its full behaviour (docs/RELIABILITY-PLAN
+    par.12: offline diagnostics must be usable in an air-gapped build).
+    """
+    import sys as _sys
+    names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "cdncheck",
+             "uncover", "katana", "chaos", "ksubdomain", "onepass",
+             "hostCollision"]
+    report = {}
+    missing = []
+    for n in names:
+        try:
+            exe = core.tool(n)
+        except core.ToolMissing:
+            report[n] = {"present": False}
+            missing.append(n)
+            continue
+        entry = {"present": True, "path": exe, "source": "bundle"}
+        try:
+            st = Path(exe).stat()
+            entry["size"] = st.st_size
+            entry["mtime"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                           time.gmtime(st.st_mtime))
+        except OSError as exc:
+            entry["stat_error"] = str(exc)[:120]
+        entry["health"] = "not_checked"
+        report[n] = entry
+    env = {"python_version": ".".join(map(str, _sys.version_info[:3])),
+           "python_ok": _sys.version_info >= (3, 10),
+           "python_required": ">=3.10",
+           # egress/fake-IP would require sockets: unknown in this mode
+           "net_egress": {"probes": {}, "any_reachable": None,
+                          "checked": False},
+           "fake_ip_dns": {"fake_ip_dns": None, "checked": False,
+                           "reason": "offline mode: resolver not probed"}}
+    keys = {k: "not_checked" for k in ["fofa", "quake", "hunter", "shodan",
+                                        "chaos", "securitytrails", "virustotal",
+                                        "urlscan"]}
+    return {"python": "ok" if env["python_ok"] else "incompatible:" + env["python_version"],
+            "skill_version": core.skill_version(),
+            "mode": "offline",
+            "environment": env,
+            "tools": report, "api_keys": keys,
+            "fofa_gateway": {"base": "not_checked", "reachable": None,
+                             "checked": False},
+            "tools_summary": {
+                "total": len(names),
+                "in_bin": len(names) - len(missing),
+                "outside_bin": [],
+                "missing": missing,
+                "suspect": "not_checked",
+                "stale_binary": "not_checked",
+                "not_executable": "not_checked",
+                "all_in_bin": None,  # runtime health unknown
+                "checked": False,
+            },
+            "bin_dir": str(core.BIN_PLATFORM),
+            "bin_platform": core.PLATFORM,
+            "db": str(core.DATA / "findinfo.db"),
+            "root": str(core.ROOT), "home": str(core.HOME)}
+
+
 def doctor() -> dict:
     names = ["enscan", "subfinder", "httpx", "dnsx", "naabu", "cdncheck",
              "uncover", "katana", "chaos", "ksubdomain", "onepass",

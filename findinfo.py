@@ -112,6 +112,9 @@ def out(obj) -> None:
 
 # ---------------------------------------------------------------- commands
 def cmd_doctor(args) -> None:
+    if getattr(args, "offline", False):
+        out(tools.doctor_offline())
+        return
     out(tools.doctor())
 
 
@@ -2154,13 +2157,78 @@ def _run_pipeline(args) -> int:
         store.close()
 
 
+def cmd_dry_run(args) -> int:
+    """Compile the plan without starting anything (docs/RELIABILITY-PLAN par.12).
+
+    Read-only in every combination: with --resume it may read the existing
+    job's spec to preview the effective configuration, but no PID, attempt,
+    cancellation flag or job state changes; with --background nothing is
+    spawned. run_id is null (a plan has no live job identity); a spec hash is
+    offered for reference. Runtime capabilities (tool presence, egress, keys)
+    are reported as unverified rather than importing collectors to pretend
+    they were checked.
+    """
+    from lib import spec as spec_mod
+    rs = spec_mod.from_cli(args)
+    active = _active_enabled(args)
+    planned = _plan_stages(args, active)
+    identity_questions = []
+    if args.name and not args.domain:
+        identity_questions.append(
+            "brand-only run: entity anchoring must resolve the subject before "
+            "any discovery runs; ambiguous identity reports identity_ambiguous")
+    if args.name and args.domain:
+        identity_questions.append(
+            "explicit domains seed the run directly; the brand is only extra "
+            "context for related-asset evidence")
+    effective: dict = {}
+    if getattr(args, "resume", ""):
+        try:
+            spec_blob = jobs.read_spec(args.resume)
+            effective = {"source": "job.json", "run_id": spec_blob.get("run_id"),
+                        "note": "preview only: no job state is changed"}
+        except Exception as exc:
+            effective = {"source": "error", "error": str(exc)[:160]}
+    out({
+        "run_id": None,
+        "spec_hash": rs.dedupe_identity(),
+        "dry_run": True,
+        "target": rs.target_label,
+        "scope": list(rs.domain),
+        "planned_stages": planned,
+        "active": active,
+        "disabled_stages": [x for x in ("entity", "onepass", "icp", "brute")
+                            if x not in planned],
+        "identity_questions": identity_questions,
+        "limits": {"rounds": rs.rounds, "time_budget_sec": rs.time_budget,
+                   "task_timeout_sec": rs.task_timeout,
+                   "tool_timeout_sec": rs.tool_timeout,
+                   "engines": rs.engines, "max_seed": rs.max_seed,
+                   "top_ports": rs.top_ports, "max_vhost_ips": rs.max_vhost_ips,
+                   "depth": rs.depth},
+        "possible_requests": {"note": "network requestability is not checked "
+                                       "in a dry run; counts are unknown"},
+        "capabilities": {"checked": False,
+                          "note": "tool presence, egress and credentials are "
+                                  "not verified by a dry run"},
+        "background_requested": bool(getattr(args, "background", False)),
+        "resume_requested": getattr(args, "resume", "") or None,
+        "effective": effective or None,
+    })
+    return 0
+
+
 def cmd_run(args) -> int:
     """Start or resume a collection.
 
     Three modes, one pipeline: foreground (default), --background (detached
     worker + run id returned immediately) and --resume <run_id> (reattach to an
-    existing run, honouring its checkpoints).
+    existing run, honouring its checkpoints). --dry-run overlays any of them
+    read-only: it compiles the plan and answers with run_id null, starting
+    nothing, creating no database and touching no job state.
     """
+    if getattr(args, "dry_run", False):
+        return cmd_dry_run(args)
     if getattr(args, "resume", ""):
         return _resume_run(args)
     if getattr(args, "background", False):
@@ -2196,6 +2264,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("doctor", help="check bundled tools and api keys")
+    d.add_argument("--offline", action="store_true",
+                   help="inspect python/platform/paths/file metadata only: no tool "
+                        "execution, no DNS, no HTTP, no key validation; egress and "
+                        "tool health report not_checked, never healthy")
     d.set_defaults(func=cmd_doctor)
 
     e = sub.add_parser("entity", help="brand/company name -> subsidiaries, ICP, domains")
@@ -2464,6 +2536,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="hard limit for the whole job in background mode (0 = none)")
     rn.add_argument("--tool-timeout", type=int, default=0,
                     help="per-tool timeout in seconds passed to each collector (0 = tool default)")
+    rn.add_argument("--dry-run", action="store_true",
+                    help="compile the plan without starting a job: no database, no "
+                         "credentials, no process, no network")
     rn.set_defaults(func=cmd_run)
 
     # Accept --task AFTER the subcommand too ("run --task X"), which the docs
