@@ -1001,21 +1001,36 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     return out
 
 
+def _wildcard_report(evidence: dict) -> list:
+    """Display rows for a wildcard evidence table (parent, address, probes)."""
+    return [{"parent": k, "ip": v.get("ip") or v.get("fake") or "",
+             "cname": v.get("cname") or "", "probes": int(v.get("probes") or 0),
+             "signature": bool(doh.wildcard_signature_complete(evidence, k))}
+            for k, v in sorted(evidence.items())]
+
+
 def _accept_dns(store, domain: str, ips: list[str], cnames: list[str],
                 source: str, wildcard: dict, rows: list) -> bool:
-    """Store a resolved name unless the answer is a wildcard artefact.
+    """Store a resolved name unless the answer is ONLY a wildcard artefact.
 
     Shared by the dnsx path, the system-resolver fallback and the DoH path so
-    all three apply identical rules: a name whose address is the one the
-    wildcard probe got for a random label is not a finding, and a fake IP was
-    already removed before this is called.
+    all three apply identical rules (docs par.9):
+
+    * the evidence table is keyed by the REGISTRABLE parent -- one key for
+      every resolver path, never the probe name or a "wild." label;
+    * only a COMPLETE signature (>=2 ordinary probe answers) filters, and
+      only when the candidate's addresses are ALL the wildcard's own answer:
+      a name carrying an additional independent A/AAAA/CNAME is mixed
+      evidence and is kept, not erased;
+    * a fake IP was already removed before this is called.
 
     Returns True when the name was stored. `rows` is the display list only;
     every row is stored regardless of the display cap.
     """
-    wc = wildcard.get(core.registrable_domain(domain) or "")
-    if wc and wc in ips:
-        return False              # wildcard zone: random names resolve here too
+    parent = core.registrable_domain(domain) or ""
+    if (parent and doh.wildcard_signature_complete(wildcard, parent)
+            and doh.wildcard_answer_matches(wildcard, parent, ips)):
+        return False              # wildcard echo: random names resolve here too
     for ip in ips:
         store.upsert_asset("ip", ip, source=source, confidence=0.6,
                            passivity="passive", parent=domain)
@@ -1066,8 +1081,13 @@ def t_dns(store, domains: list[str], timeout: int = 0,
     skipped_nx = [] if check_again else [d for d in domains
                                          if not doh.should_query(d, states)]
     todo = [d for d in domains if check_again or doh.should_query(d, states)]
-    # wildcard probe per registrable parent domain
-    wildcard: dict[str, str] = {}
+    # One wildcard evidence table for EVERY resolver path (docs par.9): key is
+    # the registrable parent, value counts ordinary A/CNAME probe answers.
+    # The old code kept two shapes (dnsx keyed by registrable parent, DoH
+    # keyed by the probe name minus its first label -- i.e. "wild.example.com"
+    # WITH the wild. label) so the same zone was two unrelated entries and a
+    # name seen by one path was never filtered by the other's evidence.
+    wildcard_ev: dict = doh.new_wildcard_evidence()
     fake_resolver = False
     parents = sorted({core.registrable_domain(d) for d in domains
                       if core.registrable_domain(d)})
@@ -1085,12 +1105,16 @@ def t_dns(store, domains: list[str], timeout: int = 0,
         transient: list[str] = []
         nxnames: list[str] = []
         fake_dropped = 0
-        probers = ["findinfo-wildcard-probe-9f3a." + "wild." + p for p in parents[:20]]
+        # Multiple unpredictable probes, no "wild." label: one lucky hit is
+        # not a signature (par.9), and fake/timeout answers prove nothing --
+        # record_wildcard_probe keeps the fake address as evidence but never
+        # counts it toward the signature.
+        probers = doh.wildcard_probe_names(parents[:20])
         probes = client.resolve_many(probers)
         for name, res in probes.items():
-            fake = doh.fake_ip_in(res.get("a") or [])
-            if fake:
-                wildcard[name.split(".", 1)[-1]] = fake
+            parent = doh.wildcard_parent(name)
+            if parent:
+                doh.record_wildcard_probe(wildcard_ev, parent, res)
         answers = client.resolve_many(todo)
         for d in todo:
             got = answers.get(d) or {"state": doh.NAME_TRANSIENT, "a": [], "cname": []}
@@ -1102,7 +1126,7 @@ def t_dns(store, domains: list[str], timeout: int = 0,
                          "retried": bool(got.get("retried"))}
             if ips:
                 accepted = _accept_dns(store, d, ips, got.get("cname") or [], "doh",
-                                       wildcard, rows)
+                                       wildcard_ev, rows)
                 if accepted:
                     resolved += 1
                 else:
@@ -1115,12 +1139,12 @@ def t_dns(store, domains: list[str], timeout: int = 0,
             rec = states.get(d) or {}
             if rec.get("a"):
                 accepted = _accept_dns(store, d, rec["a"], rec.get("cname") or [],
-                                       "doh", wildcard, rows)
+                                       "doh", wildcard_ev, rows)
                 if accepted:
                     resolved += 1
         total = resolved
         return {"count": total, "domains": rows, "truncated": total > len(rows),
-                "wildcard": [{"parent": k, "ip": v} for k, v in wildcard.items()],
+                "wildcard": _wildcard_report(wildcard_ev),
                 "system_fallback": 0, "resolved": resolved,
                 "transient": len(transient), "nxdomain": len(nxnames),
                 "skipped_nxdomain": len(skipped_nx), "fake_ip_dropped": fake_dropped,
@@ -1128,36 +1152,41 @@ def t_dns(store, domains: list[str], timeout: int = 0,
                 "resolution": doh.resolution_payload(plan, doh.RESOLVER_DOH)}
     if core.has_tool("dnsx"):
         for p in parents[:20]:
-            probe = "findinfo-wildcard-probe-9f3a." + "wild." + p
             # The name goes in on STDIN. `-d` is dnsx's WORDLIST driver and
             # fails with "missing wordlist(w) flag required with domain(d)
             # input", so the old call returned rc=1 with an empty body: the
             # wildcard table stayed empty and every name in a wildcard zone
             # (hniu.com answers ANY label) was stored as a real asset.
-            rc, out, err = core.run([core.tool("dnsx"), "-a", "-resp",
-                                     "-silent", "-json"],
-                                    input_text=probe, timeout=timeout)
-            for r in core.parse_jsonl(out):
-                for a in r.get("a", []) or []:
-                    # A fake-IP resolver (Clash/TUN, 198.18.0.0/15) answers
-                    # EVERY name, existing or not, so "this parent has a
-                    # wildcard" would be true for every parent and the filter
-                    # would drop the entire target. Detect the resolver lying
-                    # and stand the filter down instead of trusting it.
-                    if doh.is_fake_ip(a):
+            # Multiple probes share the SAME evidence table as the DoH path,
+            # and a fake-IP answer stands the filter down rather than
+            # marking every parent a wildcard.
+            for probe in doh.wildcard_probe_names([p]):
+                rc, out, err = core.run([core.tool("dnsx"), "-a", "-resp",
+                                         "-silent", "-json"],
+                                        input_text=probe, timeout=timeout)
+                for r in core.parse_jsonl(out):
+                    ans = {"a": [x for x in r.get("a", []) or []],
+                           "cname": [x for x in r.get("cname", []) or []]}
+                    if any(doh.is_fake_ip(x) for x in ans["a"]):
+                        # A fake-IP resolver (Clash/TUN, 198.18.0.0/15) answers
+                        # EVERY name, existing or not, so "this parent has a
+                        # wildcard" would be true for every parent and the
+                        # filter would drop the entire target. Detect the
+                        # resolver lying and stand the filter down instead of
+                        # trusting it.
                         fake_resolver = True
                         continue
-                    wildcard[p] = a
+                    doh.record_wildcard_probe(wildcard_ev, p, ans)
     exe = core.tool("dnsx")
     path = _tmp_lines(todo)
     if fake_resolver:
-        wildcard.clear()
+        wildcard_ev.clear()
         core.log("wildcard filtering disabled: the resolver answers "
                  "every name with a fake-IP address (198.18.0.0/15), so a "
                  "wildcard probe proves nothing; liveness/cert evidence "
                  "decides which names are real")
     core.log("dnsx resolving " + str(len(todo)) +
-             " (wildcard parents: " + str(len(wildcard)) + ")" +
+             " (wildcard parents: " + str(len(wildcard_ev)) + ")" +
              (" [fake-IP resolver detected: querying " + plan.doh_url + "]" if use_doh else ""))
     rows: list[dict] = []
     seen_dns: set[str] = set()
@@ -1178,7 +1207,7 @@ def t_dns(store, domains: list[str], timeout: int = 0,
         aimed at the proxy, not the target.
         """
         nonlocal total
-        if _accept_dns(store, d, ips, cnames, source, wildcard, rows):
+        if _accept_dns(store, d, ips, cnames, source, wildcard_ev, rows):
             total += 1
 
     def handle(line: str) -> None:
@@ -1265,7 +1294,7 @@ def t_dns(store, domains: list[str], timeout: int = 0,
             accept(d, ips, [], "system-dns")
     ok = rc == 0
     return {"count": total, "domains": rows, "truncated": total > len(rows),
-            "wildcard": [{"parent": k, "ip": v} for k, v in wildcard.items()],
+            "wildcard": _wildcard_report(wildcard_ev),
             "system_fallback": len(sys_rows), "resolved": total,
             "transient": len(transient), "nxdomain": len([d for d in todo
                                                           if states.get(d, {}).get("state")
