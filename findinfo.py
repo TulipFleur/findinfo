@@ -103,7 +103,8 @@ _HOME = _prescan_option(sys.argv, "--home")
 if _HOME:
     os.environ["FINDINFO_HOME"] = _HOME
 
-from lib import core, jobs, report, tools
+from lib import core, jobs, report, tools, work
+from lib import metered as metered_mod
 
 
 def out(obj) -> None:
@@ -857,13 +858,38 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
     `inputs` must contain every parameter that changes the result (seeds,
     engine lists, budgets): changed inputs change the hash and re-run the
     stage. A failed stage never writes "done", so re-runs retry it.
+
+    Every dispatch also lands in work.stage_invocations (before and after
+    execution, docs par.5): one row per (run, attempt, stage, unit) so a
+    retry or a later round can never overwrite the previous dispatch's
+    state. Work-context failures fall back to the old behaviour (the stage
+    itself is still executed and checkpointed) -- an ingestion bookkeeping
+    error must never stop collection.
     """
     ih = _input_hash(inputs)
+    rid = summary.get("_run_public_id") or ""
+    attempt = int(summary.get("attempt") or 1)
+    inv = None
+    if rid:
+        try:
+            inv = work.start_invocation(store, rid, attempt, name,
+                                        unit_key=str(inputs.get("round") or
+                                                      summary.get("_stage_unit") or "root"),
+                                        input_revision=summary.get("_input_revision") or 1,
+                                        input_fingerprint=ih)
+        except Exception as exc:
+            core.log("invocation start failed for " + name + ": " + repr(exc)[:160])
     if not getattr(args, "force_stage", False) and store.step_done(ENGAGEMENT, name, ih):
         res = resume() if resume else None
         core.log("stage " + name + " skipped (done for these inputs; --force-stage to redo)")
         summary["stages"].append({"stage": name, "skipped": True,
                                   "resumed": res is not None})
+        if inv:
+            try:
+                work.finish_invocation(store, inv, "succeeded", "reused",
+                                        "checkpoint_hit")
+            except Exception:
+                pass
         _write_status(run_dir, stage=name, stage_state="skipped",
                       stage_index=len(summary["stages"]),
                       stage_total=max(int(summary.get("_stage_total") or 0),
@@ -891,6 +917,11 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
             entry.update({k: v for k, v in exc.result.items()
                           if isinstance(v, (int, float, str, bool))})
         summary["stages"].append(entry)
+        if inv:
+            try:
+                work.finish_invocation(store, inv, "failed", _oc, _err[:200])
+            except Exception:
+                pass
         _write_status(run_dir, stage=name, stage_state="failed", error=str(exc)[:500])
         core.log("stage " + name + " FAILED (recorded; re-run will retry): " + str(exc)[:200])
         _write_status(run_dir, stage_index=len(summary["stages"]),
@@ -922,6 +953,16 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
            else "failed")
     store.set_step(ENGAGEMENT, name, ih, _cp)
     summary["stages"].append(entry)
+    if inv:
+        try:
+            _inv_state = ("succeeded" if entry["status"] == "succeeded"
+                          else "partial")
+            work.finish_invocation(store, inv, _inv_state, _oc or "",
+                                   counts={k: entry.get(k) for k in
+                                           ("found", "resolved", "live", "urls")
+                                           if isinstance(entry.get(k), (int, float))})
+        except Exception:
+            pass
     _write_status(run_dir, stage=name, stage_state="done", elapsed=entry["elapsed"],
                   stage_index=len(summary["stages"]),
                   stage_total=max(int(summary.get("_stage_total") or 0),
@@ -934,6 +975,57 @@ def _stage(store, run_dir, summary, name, inputs, args, fn, entry_fn, resume=Non
 # Domains proven "resolved" by these collectors -- the dns stage's output is
 # rebuilt from the store with this set when a checkpoint skip resumes the run.
 _DNS_SOURCES = frozenset(("dnsx", "system-dns", "ksubdomain", "httpx"))
+
+
+def _attach(store, summary, kind, canonical, producer, upstream="", route=None):
+    """Record one observation into the run's own membership tables.
+
+    Failure here never stops a stage: the collector already stored the asset;
+    the membership/observation rows are bookkeeping the run's reflow and
+    reports read. A broken bookkeeping write must not throw away the data.
+    """
+    rid = summary.get("_run_public_id") or ""
+    if not rid:
+        return
+    try:
+        work.attach_asset(store, rid, kind, canonical,
+                          producer=producer or "pipeline",
+                          upstream=upstream or producer or "pipeline",
+                          route=route)
+    except Exception as exc:
+        core.log("attach failed for " + str(canonical) + ": " + repr(exc)[:160])
+
+
+def _adopt_membership(store, summary, scope, min_conf: float = 0.0) -> int:
+    """Sweep the scoped graph into this run's membership (checkpoint re-entry).
+
+    Round inputs come from run_assets, but collectors upsert into the shared
+    asset graph directly (Store.upsert_asset predates the work tables). After
+    each stage -- and once before the first round, so a resumed run adopts
+    what its earlier attempt discovered -- every in-scope row joins the run.
+    This is the T08/T11 fix's compatibility seam: the graph stays the source
+    of truth for assets; membership decides whose reflow reads it.
+    """
+    rid = summary.get("_run_public_id") or ""
+    if not rid or not scope:
+        return 0
+    adopted = 0
+    try:
+        rows = store.get_assets(kind="domain", min_conf=min_conf, match=scope)
+    except Exception:
+        return 0
+    for a in rows:
+        canonical = a.get("canonical") or ""
+        if not canonical:
+            continue
+        try:
+            if work.attach_asset(store, rid, "domain", canonical,
+                                 producer="pipeline", upstream="pipeline",
+                                 route=work.ROUTE_DNS):
+                adopted += 1
+        except Exception:
+            pass
+    return adopted
 
 
 
@@ -1582,6 +1674,10 @@ def _current_attempt() -> int:
 def _run_pipeline(args) -> int:
     """The collection pipeline itself (foreground, or inside a worker)."""
     store = core.Store()
+    try:
+        work.ensure_schema(store)
+    except Exception as exc:
+        core.log("work schema init failed: " + repr(exc)[:200])
     active = _active_enabled(args)
     attempt = _current_attempt()
     summary: dict = {"engagement": ENGAGEMENT, "active": active, "stages": [],
@@ -1589,6 +1685,9 @@ def _run_pipeline(args) -> int:
     target_label = args.name or (",".join(args.domain) if args.domain else "?")
     run_id = store.start_run(ENGAGEMENT, target_label)
     run_dir = _worker_run_dir() or core.new_run_dir(target_label)
+    # Work tables key on the PUBLIC run-directory id (the one every command
+    # prints), never the legacy integer runs.id.
+    summary["_run_public_id"] = run_dir.name
     summary["run_dir"] = str(run_dir)
     rounds = max(1, int(getattr(args, "rounds", 1) or 1))
     time_budget = float(getattr(args, "time_budget", 0) or 0)
@@ -1685,9 +1784,14 @@ def _run_pipeline(args) -> int:
             for a in store.get_assets(kind="domain", min_conf=0.9):
                 if (a.get("parent") or "") == args.name:
                     domains.append(a["canonical"])
+                    _attach(store, summary, "domain", a["canonical"],
+                            producer="entity", upstream="enscan",
+                            route=work.ROUTE_DNS)
             for a in store.get_assets(kind="icp"):
                 if (a.get("parent") or "") == args.name:
                     icp_codes.append(a["canonical"])
+                    _attach(store, summary, "icp", a["canonical"],
+                            producer="entity", upstream="enscan", route=None)
         # Order matters: the domains the caller named come FIRST, then the ones
         # entity anchoring discovered. certs/subs/brute only walk the first
         # --max-seed entries, and a company anchor can surface hundreds of
@@ -1708,6 +1812,8 @@ def _run_pipeline(args) -> int:
         for d in domains:
             store.upsert_asset("domain", d, source="seed:user", confidence=0.5,
                                passivity="passive", parent=d)
+            _attach(store, summary, "domain", d, producer="seed:user",
+                    upstream="seed:user", route=work.ROUTE_DNS)
         seeds = domains[: args.max_seed]
         if len(named) > args.max_seed:
             core.log("notice: " + str(len(named)) + " named domains but --max-seed " +
@@ -1873,15 +1979,23 @@ def _run_pipeline(args) -> int:
         cert_queue: set = set()
 
         def run_round(round_no: int) -> None:
-            # EVERY in-scope name, at any confidence, plus the user-named
-            # seeds. DNS costs no quota, and the 0.4 floor that gates the
-            # active stages (probe/crawl) used to gate this one too: a name a
-            # passive source mentioned once at 0.1 was never resolved, so a
-            # real asset stayed invisible for the sake of a threshold that
-            # protects nothing here. The confidence floor stays where it
-            # belongs -- on the stages that send traffic to the target.
-            all_domains = sorted(set(scope) | set(scoped_domains(0.0)) | set(named) |
-                               set(cert_queue))
+            # Round input = the run's OWN membership (run_assets), not the
+            # shared graph re-scoped on the fly (T08/T11): a sibling run of
+            # the same root used to feed the resolver thousands of foreign
+            # names. Members come from what this run observed/adopted; the
+            # union with scope/named keeps explicit seeds resolvable even
+            # when no source answered yet (they were attached at seed time).
+            member_domains = set(work.run_assets(store, summary["_run_public_id"],
+                                                 "domain"))
+            # EVERY member at any confidence, plus the user-named seeds. DNS
+            # costs no quota, and the 0.4 floor that gates the active stages
+            # (probe/crawl) used to gate this one too: a name a passive source
+            # mentioned once at 0.1 was never resolved, so a real asset stayed
+            # invisible for the sake of a threshold that protects nothing
+            # here. The confidence floor stays where it belongs -- on the
+            # stages that send traffic to the target.
+            all_domains = sorted(member_domains | set(scope) | set(named) |
+                                 set(cert_queue))
 
             def _dns():
                 r = tools.t_dns(store, all_domains, timeout=tool_timeout,
@@ -1897,6 +2011,17 @@ def _run_pipeline(args) -> int:
                 if not r.get("ok", True):
                     raise core.StageError("dnsx rc=" + str(r.get("rc")), result=res)
                 return res
+            # Lease and settle the run's own dns work items around the stage
+            # call (durable queue, T08/T10): the claim/finish pair wraps BOTH
+            # the executed and the checkpoint-skip path, so an item enqueued
+            # by seed attachment cannot stay pending merely because the stage
+            # was skipped for identical inputs.
+            _dns_claimed = []
+            try:
+                _dns_claimed = work.claim(store, summary["_run_public_id"],
+                                          work.ROUTE_DNS, limit=100000)
+            except Exception as exc:
+                core.log("dns work claim failed: " + repr(exc)[:160])
             _stage(store, run_dir, summary, "dns",
                    {"domains": all_domains, "round": round_no}, args, _dns,
                    lambda r: {"resolved": r["resolved"], "wildcard": r["wildcard"],
@@ -1904,6 +2029,20 @@ def _run_pipeline(args) -> int:
                               "transient": r.get("transient", 0),
                               "skipped_nxdomain": r.get("skipped_nxdomain", 0)},
                    resume=dns_resumed)
+            for _item in _dns_claimed:
+                try:
+                    work.finish(store, summary["_run_public_id"],
+                                _item["id"], _item["lease_token"],
+                                ok=True, reason="round settled")
+                except Exception:
+                    pass
+            # Whatever dnsx/the system resolver just accepted becomes this
+            # run's membership (compatibility seam: collectors write to the
+            # shared graph; membership records whose reflow reads it).
+            for host in dns_resumed()["hosts"]:
+                _attach(store, summary, "domain", host, producer="dns",
+                        upstream="dns", route=None)
+            _adopt_membership(store, summary, scope)
             # probe input is ALWAYS the full scoped store set (every resolved
             # row), never the ROW_LIMIT-truncated display list a tool returned
             dns_hosts = dns_resumed()["hosts"]
@@ -1924,10 +2063,16 @@ def _run_pipeline(args) -> int:
                         store.upsert_asset("domain", ent["host"],
                                            source="cert-san", confidence=0.45,
                                            passivity="passive", parent=ent["host"])
+                        _attach(store, summary, "domain", ent["host"],
+                                producer="cert-san", upstream="cert-san",
+                                route=work.ROUTE_DNS)
                     for ent in p.get("cert_related") or []:
                         store.upsert_asset("domain", ent["host"],
                                            source="cert-related", confidence=0.3,
                                            passivity="passive", parent=ent["host"])
+                        _attach(store, summary, "domain", ent["host"],
+                                producer="cert-related", upstream="cert-related",
+                                route=None)
                         if ent.get("source"):
                             store.link_asset("domain", ent["source"], "cert-related",
                                              ent["host"], source="cert-san")
@@ -2043,11 +2188,23 @@ def _run_pipeline(args) -> int:
                             if a["canonical"].startswith("http")]
                     ex = tools.t_extract(store, [], urls=urls, timeout=tool_timeout,
                                             scope=scope)
+                    # The JS backlog this run just queued adopts into the run's
+                    # durable work queue (T33): pending/failed items survive a
+                    # restart and drain in a later round instead of being
+                    # rebuilt -- and lost -- from a fresh candidates list.
+                    try:
+                        attached = work.adopt_js_backlog(
+                            store, summary["_run_public_id"], urls)
+                        if attached:
+                            core.log("js backlog: adopted " + str(attached) +
+                                     " bundle(s) into the run work queue")
+                    except Exception as exc:
+                        core.log("js backlog adopt failed: " + repr(exc)[:160])
                     # Keep the deliverable findings in the summary too: the run
                     # result is what an agent reads (and what lands in
                     # summary.jsonl), and dropping them here meant the redacted
                     # secrets / api paths existed only in a transient stdout
-                    # line nobody could see afterwards.
+                    # line nobody could ever see afterwards.
                     summary.setdefault("extract_findings", {})
                     summary["extract_findings"].update({
                         "api_paths": ex.get("api_paths", [])[:200],
@@ -2073,6 +2230,10 @@ def _run_pipeline(args) -> int:
                                   "js_pending": r.get("js_pending", 0),
                                   "outcome": r.get("outcome")})
 
+        # A resumed run adopts what its earlier attempt discovered before the
+        # first round: membership is the round input now, so skipping this
+        # would make every checkpoint hit look like "no work".
+        _adopt_membership(store, summary, scope)
         for round_no in range(1, rounds + 1):
             if time_budget and (time.monotonic() - t_start) > time_budget:
                 stop_reason = "time_budget"
@@ -2088,17 +2249,26 @@ def _run_pipeline(args) -> int:
                                            and "elapsed" in s or s.get("skipped")]),
                           stage_total=summary["_stage_total"])
             run_round(round_no)
+            _adopt_membership(store, summary, scope)
             after = len(scoped_domains(0.4))
             new_domains = max(0, after - before)
             # "No new domains" is NOT convergence while JS work is queued: the
             # bundles whose extraction would surface new domains have simply
             # not been fetched yet. Observed live: 41 candidates, budget 40,
             # one pending -- and the run still declared itself complete.
+            # The run's OWN durable queue counts the same way (T16): endpoint
+            # and JS work items are outstanding obligations, and a stable
+            # domain count never settles them.
             try:
                 _q = store.js_stats()
             except Exception:
                 _q = {}
             js_pending = int(_q.get("pending") or 0) + int(_q.get("failed") or 0)
+            try:
+                _wq = work.queue_stats(store, summary["_run_public_id"])
+                js_pending += int(_wq.get("outstanding") or 0)
+            except Exception:
+                pass
             if new_domains == 0 and js_pending == 0:
                 stop_reason = "no_new_assets"
             elif new_domains == 0 and js_pending > 0:
@@ -2191,6 +2361,16 @@ def _run_pipeline(args) -> int:
             # bundles are still queued.
             "js_queue": (store.js_stats() if hasattr(store, "js_stats") else {}),
         }
+        # The run's own durable queue is the same obligation set (T16): a
+        # pending/failed/running work item means the collection is unfinished,
+        # whatever the shared legacy queue says.
+        try:
+            coverage["work_queue"] = work.queue_stats(
+                store, summary["_run_public_id"])
+        except Exception:
+            coverage["work_queue"] = {}
+        _wq_outstanding = int((coverage.get("work_queue") or {}).get(
+            "outstanding") or 0)
         if failed_stages and not done_stages:
             status, reason, rc = "failed", "all_stages_failed", 1
         elif failed_stages:
@@ -2210,6 +2390,11 @@ def _run_pipeline(args) -> int:
             status, reason, rc = "partial", "js_queue_failed", 5
         elif stop_reason == "js_pending":
             status, reason, rc = "partial", "js_pending", 5
+        elif _wq_outstanding > 0:
+            # The durable queue settles with its own reason: pending/failed/
+            # running work items are named obligations, distinct from the legacy
+            # JS queue's counters (work_pending, docs par.6/7).
+            status, reason, rc = "partial", "work_pending", 5
         elif partial_stages:
             # A stage that ran but reported itself incomplete is not a
             # completed collection. Name the stage so the agent can read

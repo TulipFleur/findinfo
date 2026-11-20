@@ -23,6 +23,8 @@ reports; new tables never use it.
 """
 from __future__ import annotations
 
+import json
+
 from . import core
 
 WORK_SCHEMA = """
@@ -95,6 +97,42 @@ def ensure_schema(store) -> None:
         store.conn.executescript(WORK_SCHEMA)
 
 
+# ---------------------------------------------------------------- invocations
+def start_invocation(store, run_id: str, attempt: int, stage: str,
+                     unit_key: str = "", input_revision: int = 1,
+                     input_fingerprint: str = "") -> str:
+    """Persist one dispatch before it runs (docs par.5).
+
+    invocation_id embeds run/attempt/stage/unit so a retry or a later round
+    can never overwrite a previous dispatch's row: each gets its own.
+    """
+    inv = "%s|%d|%s|%s|%d" % (run_id, max(1, int(attempt)), stage,
+                              unit_key or "root", max(1, int(input_revision)))
+    ts = core.now()
+    with store._write():
+        store.conn.execute(
+            "INSERT OR REPLACE INTO stage_invocations(invocation_id, run_id,"
+            " attempt, stage, unit_key, input_revision, input_fingerprint,"
+            " state, started_at) VALUES(?,?,?,?,?,?,?, 'running', ?)",
+            (inv, run_id, max(1, int(attempt)), stage, unit_key or "root",
+             max(1, int(input_revision)), input_fingerprint[:64], ts))
+    return inv
+
+
+def finish_invocation(store, invocation_id: str, state: str,
+                      outcome: str = "", reason: str = "",
+                      counts: dict | None = None) -> bool:
+    """Settle one dispatch after completion (state from ONE vocabulary)."""
+    ts = core.now()
+    with store._write():
+        cur = store.conn.execute(
+            "UPDATE stage_invocations SET state=?, outcome=?, reason=?,"
+            " counts=?, finished_at=? WHERE invocation_id=?",
+            (state, outcome, reason[:200],
+             json.dumps(counts or {}, sort_keys=True), ts, invocation_id))
+        return bool(cur.rowcount)
+
+
 # ---------------------------------------------------------------- membership
 def attach_asset(store, run_id: str, kind: str, canonical: str,
                  producer: str, upstream: str = "",
@@ -128,6 +166,12 @@ def attach_asset(store, run_id: str, kind: str, canonical: str,
                 " canonical, input_revision, status, created_at, updated_at)"
                 " VALUES(?,?,?,?,?, 'pending', ?, ?)",
                 (run_id, route, kind, canonical, input_revision, ts, ts))
+
+
+# record_observation is the name docs/RELIABILITY-PLAN.md par.6 uses for the
+# ingestion path; attach_asset is what batch C shipped. One function, two
+# names, so callers never fork the transaction boundary.
+record_observation = attach_asset
 
 
 def run_assets(store, run_id: str, kind: str | None = None) -> list[str]:
@@ -286,3 +330,35 @@ def import_js_queue(store, run_id: str) -> int:
         if hit and enqueue(store, run_id, ROUTE_JS, "url", url):
             attached += 1
     return attached
+
+
+def adopt_js_backlog(store, run_id: str, urls: list) -> int:
+    """Attach legacy JS rows the run itself queued (T33 import path).
+
+    The store's js_enqueue is still the write path inside t_extract; after it
+    has run, the run needs those URLs as work_items so the durable queue can
+    drain them across restarts. Only URLs this run just enqueued adopt: the
+    rest of the shared global backlog stays untouched, exactly like
+    import_js_queue.
+    """
+    attached = 0
+    for u in urls or []:
+        if u and enqueue(store, run_id, ROUTE_JS, "url", u):
+            attached += 1
+    return attached
+
+
+def effective_invocations(store, run_id: str, attempt: int) -> dict:
+    """Newest invocation per (stage, unit) for THIS attempt (docs par.5).
+
+    A reused/failed older dispatch cannot poison this verdict; historical
+    rows stay auditable but the effective one is the latest attempt's.
+    """
+    out: dict = {}
+    for r in store.conn.execute(
+            "SELECT stage, unit_key, state, outcome, reason FROM"
+            " stage_invocations WHERE run_id=? AND attempt=? ORDER BY id",
+            (run_id, max(1, int(attempt)))):
+        out[(r["stage"], r["unit_key"])] = {
+            "state": r["state"], "outcome": r["outcome"], "reason": r["reason"]}
+    return out

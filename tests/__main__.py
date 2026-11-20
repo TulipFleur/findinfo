@@ -67,6 +67,7 @@ MODULES = [
     "tests.test_js_property_chains",
     "tests.test_dns_wildcard_probe",
     "tests.test_asset_timestamps",
+    "tests.test_w1_pipeline_work",
 ]
 
 
