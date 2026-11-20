@@ -528,6 +528,38 @@ def spawn(ref) -> int:
     return pid
 
 
+def claim_launch(rd, spec: dict) -> str | None:
+    """Atomically claim the CURRENT launch token of a run.
+
+    The resume path publishes a fresh token while holding the resume lock;
+    a worker (or a stale attempt writing state) must match it to publish or
+    update anything (docs/RELIABILITY-PLAN.md par.11: a superseded attempt
+    cannot update state, acknowledge work, or publish a verdict). Returns the
+    token when this worker owns the launch, None when it is superseded.
+    """
+    token = spec.get("launch_token")
+    if not token:
+        return ""            # legacy spec: nothing to fence, keep old behaviour
+    current = read_state(rd)
+    if (current.get("launch_token") or "") != token:
+        return None
+    return token
+
+
+def fenced_write(rd, token, **fields) -> bool:
+    """update_state that first revalidates the launch token.
+
+    Every state mutation the worker performs goes through here once a token
+    exists; a superseded attempt's write is dropped instead of overwriting the
+    newer attempt's progress (T18).
+    """
+    st = read_state(rd)
+    if token and (st.get("launch_token") or "") != token:
+        return False
+    update_state(rd, **fields)
+    return True
+
+
 def worker_main(ref) -> int:
     """Entry point of the detached worker process (called by __worker)."""
     rd = resolve(ref)
@@ -548,8 +580,14 @@ def worker_main(ref) -> int:
     # provenance of THIS execution (the pipeline cannot read job.json itself
     # without re-resolving the run dir).
     os.environ["FINDINFO_ATTEMPT"] = str(int(spec.get("attempt") or 1))
+    token = claim_launch(rd, spec)
+    if token is None:
+        core.log("[job] superseded attempt (launch token mismatch); exiting "
+                 "without touching state")
+        return 4                     # fenced out: a newer attempt owns the job
     update_state(rd, state="running", pid=os.getpid(), started_ts=now_ts(),
                  attempt=int(spec.get("attempt") or 1),
+                 launch_token=token or None,
                  target=spec.get("target"), scope=spec.get("scope") or [],
                  budget=spec.get("budget") or {})
     core.log("[job] worker started pid=" + str(os.getpid()) + " argv=" + " ".join(argv))

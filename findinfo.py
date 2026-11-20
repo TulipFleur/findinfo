@@ -1335,7 +1335,20 @@ def _start_background_locked(args, payload, key) -> int:
 
 
 def _resume_run(args) -> int:
+    """Resume under a per-run cross-process lock (one worker, one attempt).
+
+    The whole decision -- reread state, check liveness, bump the attempt,
+    publish the launch token, persist the queued spec, spawn, publish the
+    PID -- happens while holding the lock, so two simultaneous resumes of
+    the same run produce ONE new attempt and ONE worker; the loser of the
+    race sees the winner's live job and reports reuse (T18).
+    """
     rd = jobs.resolve(args.resume)
+    with jobs.start_lock("resume:" + rd.name, timeout=60.0):
+        return _resume_run_locked(args, rd)
+
+
+def _resume_run_locked(args, rd) -> int:
     st = jobs.derive(jobs.read_state(rd))
     if st.get("state") in jobs.ACTIVE and st.get("alive"):
         out(dict({"run_id": rd.name, "state": st.get("state"), "reused": True,
@@ -1373,6 +1386,11 @@ def _resume_run(args) -> int:
         _tt = _argv_value(argv, "--task-timeout")
         spec["task_timeout"] = float(_tt) if _tt is not None else 0.0
     spec["attempt"] = int(spec.get("attempt") or 1) + 1
+    # Launch token: fencing for THIS attempt. The worker must present it to
+    # publish state; a stale attempt (this resume raced with another) can
+    # no longer overwrite the newer attempt's progress.
+    import secrets as _secrets
+    spec["launch_token"] = rd.name + "|" + str(spec["attempt"]) + "|" + _secrets.token_hex(8)
     jobs.write_spec(rd, **spec)
     try:
         (rd / "cancel").unlink()
@@ -1383,6 +1401,7 @@ def _resume_run(args) -> int:
     # state=queued/running -- an agent reading it would report a finished run.
     jobs.update_state(rd, state="queued", stage="resume", stage_state="queued",
                       attempt=spec["attempt"], last_error=None, pid=None,
+                      launch_token=spec["launch_token"],
                       result={"status": "running", "reason": "resume_started",
                               "attempt": spec["attempt"],
                               "note": "attempt in progress; previous attempt's "
