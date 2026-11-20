@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+### 接线批次（docs/RELIABILITY-PLAN.md 落地收尾）
+
+- **W1：主流水线接入运行成员与持久工作队列**（`aa9a840`）。轮次输入改为读
+  本 run 的 run_assets 成员（不再从共享图重新 scoped），兄弟 run 的资产不再
+  喂进本 run 的解析器；种子落库 / entity 域 / cert SAN / dns 结果全部经
+  attach_asset（成员+观测+下游工作单事务提交）；每个阶段派发写入
+  stage_invocations（checkpoint 命中记 reused）；dns 阶段对自有工作项
+  claim/finish（执行与跳过两条路径都结算）；extract 把本 run 排队的 JS
+  bundle 收编进持久队列；未完成工作项进 coverage.work_queue，判定链新增
+  work_pending（域名数稳定 ≠ 收敛）。
+- **W2：启动/回放/resume 统一走 RunSpec**（`61759f3`）。删除手写
+  _foreground_argv 与 argv 拼接合并：worker argv 来自
+  RunSpec.from_cli().to_worker_argv()，job.json 存 run_spec；复用路径经
+  diff 报告 request_differences（不把新限制悄悄套到运行中的作业）；
+  resume 走 resume_patch 语义——显式限制字段可改，显式给出的
+  身份/范围/引擎变更直接拒绝（退出码 2 + 结构化报错），裸 resume 逐字节
+  回放原 argv。
+- **W3：计费调用逐请求入账本**（`e7fa4be`）。run 持有一个
+  MeteredLedger（run_dir/metered.jsonl，带公共 run id），t_subs/t_icp 的
+  fofa 网关调用与 uncover 派发各记一行（每请求一行，绝不按结果行计）；
+  免费来源不入账；verdict 的 quota 判定读账本的 blocked_engines（不再只靠
+  stage 透传标志）；coverage.metered 与 `brief --run` 从落盘文件给出
+  totals/by_engine/blocked_engines。
+- **W4：entity 阶段接入主体门**（`cfaac5d`）。ENScan 正常返回但品牌命中
+  多个可信主体且无显式种子时，报 identity_ambiguous（含候选与
+  input-required next_steps）并在 discovery 之前停下（exit 5，自己的
+  summary/verdict，下游阶段不算缺口）；显式种子或唯一命中照常通过。
+- **W5：dnsx 与 DoH 共用一张 wildcard 证据表**（`8608489`）。DoH 路径不再
+  探测 `wild.<parent>` 也不再用去掉首标签的探测名当键；两条路径都走
+  doh.wildcard_probe_names（多次不可预测探测，无额外标签）+
+  record_wildcard_probe（普通 A/CNAME 计签名，fake/超时不证明任何事），
+  键统一为可注域名；候选地址全等于 wildcard 回声才过滤，带独立地址的
+  混合证据保留；报告行带 parent/ip/cname/probes/signature。
+- **W6：worker 状态写入全过围栏**（`f9a4bf2`）。worker_main 入场认领
+  launch token 后，running 写入、硬超时判定、终态发布全部改走
+  fenced_write；被替换的尝试中途不能覆盖新尝试的进度、不能盖上
+  task_timeout 判定、终稿被整体丢弃并记日志；无 token 的旧 spec 保持
+  原行为。
+
 ### 0.8.x 维护提交补录
 
 - 收敛提取域名的范围与通配符探测的可信度，资产带上时间戳（`947bfaa`）。
@@ -56,9 +95,10 @@
   quota/auth（传输失败可重试，凭据被拒不许盲试）；同输入同状态的重复追加不重复计费，
   状态变化才是新支出；失败请求也入账（花了钱没拿到数据，不能从支出汇总里消失）
   （T22–T27、T34）。
-- **G：阶段注册表与验收收口**（`b898a80` 修复项一并收口）。StageRegistry 在导入期
-  校验：缺 runner、重名、依赖环、幻影阶段全部报错；`_plan_stages` 只能返回注册过的
-  阶段名（T01）；文档与安装产物校验收口（T28）。
+- **G：阶段注册表与验收收口**（`7191ae7`，`b898a80` 修复项一并收口）。
+  StageRegistry 在导入期校验：缺 runner、重名、依赖环、幻影阶段全部报错；
+  `_plan_stages` 只能返回注册过的阶段名（T01）；文档与安装产物校验收口
+  （T28）。
 
 ## [0.8.0] - 2026-11-19
 

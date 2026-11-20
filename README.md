@@ -89,6 +89,19 @@ The skill assumes three things about the host: **local Python ≥3.10**, **the b
 
 Look at the `environment` block: `python_ok` (version), `tools_summary.not_executable` (non-empty when the sandbox blocks binaries), `net_egress.any_reachable` (egress). If any check fails, stop there and report what is missing; do not force a run.
 
+Two read-only variants never touch the network or a credential:
+
+    python findinfo.py doctor --offline   # python/platform/paths/file metadata only:
+                                          # egress, tool health and key state report
+                                          # not_checked (never healthy, never false)
+    python findinfo.py run --dry-run ...  # compile the plan: run_id is null, no
+                                          # database, no process, no job state; works
+                                          # read-only with --background/--resume
+
+`run --dry-run` answers "what would this invocation do" (planned stages, scope,
+limits, identity questions) before anything starts — and it is the plan the real
+run will execute, not a second handwritten copy.
+
 ## Quick start
 
     cd <this directory>

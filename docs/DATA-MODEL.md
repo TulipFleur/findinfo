@@ -76,7 +76,75 @@ python findinfo.py assets --export runs/assets.jsonl        # full export (JSONL
 To change the display cap: the environment variable `FINDINFO_ROW_LIMIT=2000`, or `limits.row_limit` in `config/config.json`.
 Subprocess output is **consumed line by line** (`core.run_stream`), so memory does not grow with the number of results: measured, 120k lines raise it by only ~0.5 MB.
 
-## 4. Reading conventions for old data
+## 4. Run membership and durable work (work tables, same SQLite)
+
+Since the reliability batches, four tables in the same database record per-RUN facts
+(the asset graph stays shared; these decide whose reflow reads it). Runs are keyed by
+their **public run-directory id** (the `run_id` every command prints), never the legacy
+integer `runs.id`. All tables are created by idempotent migrations (`lib/work.py`).
+
+```jsonc
+// run_assets: membership -- which assets belong to THIS run
+{ "run_id": "20261120-200000-mt-a.example.com",
+  "kind": "domain", "canonical": "api.mt-a.example.com",
+  "first_seen": "...", "last_seen": "..." }        // PK (run_id, kind, canonical)
+
+// observations: one row per observation, independent upstream preserved
+{ "run_id": "...", "producer": "certs", "upstream": "crt.sh",
+  "kind": "domain", "canonical": "api...", "observed_at": "..." }
+// re-observing through the SAME upstream is one witness, not two:
+// observed_upstreams() dedups, so confidence never inflates on replay.
+
+// work_items: durable, deduplicated downstream work (DNS/extract routes)
+{ "run_id": "...", "stage": "dns", "kind": "domain",
+  "canonical": "api...", "input_revision": 1,
+  "status": "pending|running|done|failed|blocked",   // failed = retryable backoff
+  "attempts": 1, "retry_at": null,
+  "lease_token": "ts|id|attempt", "lease_expiry": "..." }   // UNIQUE (run,stage,kind,canonical,revision)
+
+// stage_invocations: per-dispatch history (one row per (run,attempt,stage,unit))
+{ "invocation_id": "run|2|subs|root|1", "run_id": "...", "attempt": 2,
+  "stage": "subs", "unit_key": "root", "input_revision": 1,
+  "input_fingerprint": "sha1-16", "state": "running|succeeded|partial|failed",
+  "outcome": "ok|partial|timeout|...", "counts": "{...}",
+  "started_at": "...", "finished_at": "..." }
+```
+
+Reading rules:
+
+- **Round inputs come from `run_assets`**, not a fresh re-scope of the shared graph:
+  a sibling run of the same root cannot feed this run's resolver. The pipeline
+  adopts scoped graph rows into membership at seed time and after each stage, so a
+  resumed run re-enters with its earlier attempt's discoveries.
+- **A reused checkpoint records a `succeeded`/`reused` invocation** with its original
+  evidence; a repaired retry becomes the effective invocation for its attempt (T29).
+- **Outstanding work is not convergence**: `coverage.work_queue.outstanding`
+  (pending+running+failed) feeds the verdict reason `work_pending`; a stable domain
+  count with pending JS/endpoint work keeps the run `partial` (T16).
+- **The JS bridge**: bundles the run itself queued adopt into `work_items`
+  (stage `extract`) through `work.adopt_js_backlog`; the legacy global `js_queue`
+  rows attach only with provable ownership (`work.import_js_queue`), so one run
+  never drains another target's backlog (T33).
+
+## 5. Metered ledger (`<run_dir>/metered.jsonl`)
+
+Every **billed** provider request appends exactly one JSON line (one row per REQUEST,
+never per result row; free sources never touch it). Fields:
+`ts, run_id, engine ("fofa-gateway"|"uncover"|...), input_hash, status
+(ok|empty|truncated|quota|auth|failed), requested, returned, elapsed_sec,
+[rc], [error], [quota {remaining, max, source}]`.
+
+- `quota.remaining` is the best-known ceiling from the freshest provider answer;
+  **None means unknown, never infinite**.
+- `blocked_engines` lists engines whose LAST request was `quota` or `auth`
+  (transport failures stay retryable) — the verdict's `quota_exhausted` reads
+  this list, not just the stage payload.
+- The run's `coverage.metered` block carries `totals`/`by_engine`/
+  `blocked_engines`/`ledger_path`; `brief --run <id>` summarises the same block
+  from the persisted file, so a later session answers "what would another round
+  cost" without the process that spent it.
+
+## 6. Reading conventions for old data
 
 - **Task-name directories**: pure-ASCII task names keep their directories; old versions put every non-ASCII-named task into `tasks/default` (mixed in one store).
   After the fix, non-ASCII names map to their own `task-<hash>` directories. **The old default store is never touched**;
