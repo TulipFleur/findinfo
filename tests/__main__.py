@@ -62,6 +62,7 @@ MODULES = [
     "tests.test_batch_d_identity",
     "tests.test_batch_e_jobs",
     "tests.test_batch_f_metered",
+    "tests.test_batch_g_release",
     "tests.test_fake_ip_guard",
     "tests.test_js_property_chains",
     "tests.test_dns_wildcard_probe",

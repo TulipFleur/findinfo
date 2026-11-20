@@ -7,6 +7,59 @@
 
 ## [Unreleased]
 
+### 0.8.x 维护提交补录
+
+- 收敛提取域名的范围与通配符探测的可信度，资产带上时间戳（`947bfaa`）。
+- CHANGELOG 覆盖检查允许最新的两条提交暂时缺席（编辑本文件的提交不可能
+  包含自己的哈希）（`d0ecfe7`）。
+- 面向客户端的使用说明收窄为仅限本地代理场景（`b9967c5`）。
+
+### 批次实施（docs/RELIABILITY-PLAN.md，基线 `20dfca3`）
+
+- **A：阶段结果不再丢失，完成判定从义务推导**（`75059e9`）。`subs` 的阶段投影
+  丢弃了自己算出的 outcome，`_stage` 于是默认补成 `ok`，一个部分成功（某引擎超时、
+  其余正常）的 subs 被写成 succeeded + done 检查点，重跑永久跳过。现在投影带上
+  outcome 和 sources；最终判定新增两个分支：`partial_stages`（执行了但自报未完成）
+  和 `planned_stage_not_run`（计划内必需阶段没有产出）都判 `partial`/退出码 5，
+  并在 reason 里点名阶段。缺 key 仍是覆盖缺口，不触发退出码 5（T02–T05）。
+- **B：统一 RunSpec、`--dry-run` 与离线 doctor**（`904ebef`）。新增 `lib/spec.py`：
+  from_cli / to_worker_argv / dedupe_identity（身份与限制分离：同目标不同限制复用
+  同一作业，差异经 diff 报告而不悄悄生效）/ resume_patch（只允许 rounds 等限制字段的
+  更新，身份/范围/引擎变更直接拒绝）/ json 往返与 schema 版本拒绝。
+  `run --dry-run` 只做规划：run_id 为 null，不建库、不读凭据、不启动进程，与
+  `--background`/`--resume` 组合保持只读。`doctor --offline` 不执行任何工具、
+  不探测网络：出口/工具健康/凭据状态一律 `not_checked`（不是 false）。
+  登记 p2 遗留的 `test_dns_coverage`、`test_fake_ip` 模块（T20/T32）。
+- **C：运行成员、观测与持久工作队列**（`8a54c12`）。新增 `lib/work.py`：run_assets
+  （按运行记录成员，两个 run 互不串扰）、observations（逐来源逐上游证据行，重观测
+  加证人但不放大去重后的独立上游）、work_items（带租约 token/过期/重试的持久队列，
+  唯一键防重复入队）、stage_invocations（逐尝试历史，修复后的尝试成为有效结果）。
+  attach_asset 单事务原子提交资产+成员+观测+下游工作；claim 短事务发 token，过期
+  token 不能提交（崩溃围栏）；legacy JS 队列只在归属可证明时迁移（T08–T11、T16、
+  T29–T31、T33）。
+- **D：主体门、类型化目标与统一 wildcard 证据**（`2041ea2`）。品牌短名匹配出的多个
+  主体是候选而非自动归属：歧义时报 `identity_ambiguous` 并要求补输入，不自动选一个
+  就开始探测；显式种子绕过歧义。seeds 按主体引用查找，改名不断链。相关 SAN/同 IP
+  邻居只是证据，不扩大主动范围；裸 IP 与 ip:port 目标保端口到底。`lib/doh` 的
+  wildcard API 统一 dnsx 与 DoH 两条路径的证据与键（此前 DoH 的键含探测标签，同一
+  区域两份记录）；普通 A/CNAME 计入签名，fake/超时不证明任何事；带额外独立地址的
+  候选保留而非抹除（T06、T07、T12–T15）。
+- **E：带围栏的 resume 与经核实的等待游标**（`0c980e1`）。resume 全程持跨进程锁：
+  状态重读、存活检查、attempt 递增、launch token 发布、排队落盘、spawn、PID 发布
+  都在锁内完成，并发 resume 只产生一个新尝试和一个 worker；败者看到胜者的活作业并
+  报告复用。worker 入场即认领 token，被替换的尝试退出码 4 且不碰任何状态；
+  fenced_write 对每次状态变更重验 token（T17–T19、T21）。
+- **F：计费请求账本**（`21690fb`）。新增 `lib/metered.py`：按请求（而非按结果行）
+  追加的账本，类型化状态 ST_OK/EMPTY/TRUNCATED/QUOTA/AUTH/FAILED；status_of 一次性
+  归类，下游不再重复猜字符串；fofa 网关的 remaining/maxQueries 原样归一到配额字段；
+  quota_remaining 返回最新已知上限，None = 未知（不是无限）；blocked_engines 只列
+  quota/auth（传输失败可重试，凭据被拒不许盲试）；同输入同状态的重复追加不重复计费，
+  状态变化才是新支出；失败请求也入账（花了钱没拿到数据，不能从支出汇总里消失）
+  （T22–T27、T34）。
+- **G：阶段注册表与验收收口**（`b898a80` 修复项一并收口）。StageRegistry 在导入期
+  校验：缺 runner、重名、依赖环、幻影阶段全部报错；`_plan_stages` 只能返回注册过的
+  阶段名（T01）；文档与安装产物校验收口（T28）。
+
 ## [0.8.0] - 2026-11-19
 
 ### 破坏性变更
