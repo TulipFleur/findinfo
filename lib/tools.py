@@ -129,8 +129,191 @@ def expand_host_words(words: list[str], bases: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------- 1. entity (ENScan)
+# Per-entity harvest. The old `harvest_entity` flattened every company, ICP
+# number and domain into three global lists and then attached ALL domains to
+# the FIRST kept company: once two entities were in the answer, entity B's
+# assets became entity A's, which could widen the active scope to a company
+# the run was never authorised for (F06). The functions below keep every asset
+# with the subject that actually filed it.
+
+_SUBJECT_NAME_KEYS = ("company", "name", "enterprise", "legal_name",
+                      "company_name", "entname")
+_SUBJECT_ID_KEYS = ("id", "eid", "entity_id", "pid", "subject_id", "entid")
+
+
+def _entity_subject(node: dict) -> dict:
+    """Best-effort subject identity of one ENScan entity object."""
+    subject_id = ""
+    for k, v in node.items():
+        if str(k).lower() in _SUBJECT_ID_KEYS and isinstance(v, (str, int)):
+            if str(v).strip():
+                subject_id = str(v).strip()
+                break
+    name = ""
+    for k, v in node.items():
+        if str(k).lower() in _SUBJECT_NAME_KEYS and isinstance(v, str):
+            if v.strip():
+                name = v.strip()
+                break
+    return {"subject_id": subject_id, "legal_name": name}
+
+
+def _own_assets(node: dict, depth: int = 0) -> dict:
+    """Domains/ICP/apps that belong to THIS entity object (not to children).
+
+    Nested objects that carry their own subject identity are other companies
+    (investment/branch lists); their assets stay with them.
+    """
+    out = {"domains": [], "icp": [], "apps": []}
+    if depth > 6 or not isinstance(node, dict):
+        return out
+    for key, val in node.items():
+        k = str(key).lower()
+        if isinstance(val, str):
+            if "domain" in k:
+                d = core.canon_domain(val)
+                if d and _looks_public(d):
+                    out["domains"].append(d)
+            if "icp" in k:
+                out["icp"].extend(ICP_RE.findall(val))
+            if "app" in k and len(val) < 200:
+                out["apps"].append(val.strip())
+            for m in DOMAIN_RE.findall(val):
+                d = core.canon_domain(m)
+                if d and _looks_public(d):
+                    out["domains"].append(d)
+        elif isinstance(val, dict):
+            if _entity_subject(val)["legal_name"]:
+                continue        # a nested subject: its own assets, not ours
+            sub = _own_assets(val, depth + 1)
+            for kk in out:
+                out[kk].extend(sub[kk])
+        elif isinstance(val, list):
+            for it in val:
+                if isinstance(it, dict):
+                    if _entity_subject(it)["legal_name"]:
+                        continue
+                    sub = _own_assets(it, depth + 1)
+                    for kk in out:
+                        out[kk].extend(sub[kk])
+    for kk in out:
+        out[kk] = _uniq([x for x in out[kk] if x])
+    return out
+
+
+def harvest_entities(obj: Any, depth: int = 0) -> list:
+    """Every entity object that has a subject identity, with its own assets.
+
+    Each entry: {subject_ref, subject_id, legal_name, aliases, domains, icp,
+    apps, evidence_ref}. `subject_ref` prefers the source's own stable ID and
+    falls back to a marked name reference, so a display-name change cannot
+    orphan the assets (T07).
+
+    ENScan documents put the company records and the asset tables SIDE BY SIDE
+    (e.g. {"enterprise_info":[{name}], "icp":[{domain, icp}]}), so a document
+    with exactly ONE subject identity is attributed that document's assets.
+    With several subjects the assets stay with the container and are NOT
+    assigned to any of them -- guessing which company filed an unattached
+    domain is exactly the F06 failure.
+    """
+    found: list = []
+    if depth > 14:
+        return found
+    if isinstance(obj, dict):
+        subject = _entity_subject(obj)
+        if subject["legal_name"] or subject["subject_id"]:
+            own = _own_assets(obj)
+            aliases = []
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if lk in ("alias", "aliases", "short_name", "brand") \
+                        and isinstance(v, str) and v.strip():
+                    aliases.append(v.strip())
+            ref = (("id:" + subject["subject_id"])
+                   if subject["subject_id"] else
+                   ("name:" + subject["legal_name"]))
+            found.append({
+                "subject_ref": ref,
+                "subject_id": subject["subject_id"],
+                "legal_name": subject["legal_name"],
+                "aliases": _uniq(aliases),
+                "domains": own["domains"],
+                "icp": own["icp"],
+                "apps": own["apps"],
+                "evidence_ref": ("enscan:" + ref),
+            })
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    if isinstance(v, dict) and _entity_subject(v)["legal_name"]:
+                        continue
+                    found.extend(harvest_entities(v, depth + 1))
+            return _merge_by_ref(found)
+        # no subject at this level: collect child entities AND, when the
+        # document names exactly one subject anywhere, attribute this level's
+        # own asset tables to it
+        child_entities: list = []
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                child_entities.extend(harvest_entities(v, depth + 1))
+        child_entities = _merge_by_ref(child_entities)
+        if len(child_entities) == 1:
+            own = _own_assets(obj)
+            ent = child_entities[0]
+            if own["domains"] or own["icp"] or own["apps"]:
+                ent = dict(ent)
+                ent["domains"] = _uniq(ent["domains"] + own["domains"])
+                ent["icp"] = _uniq(ent["icp"] + own["icp"])
+                ent["apps"] = _uniq(ent["apps"] + own["apps"])
+                child_entities = [ent]
+        return child_entities
+    if isinstance(obj, list):
+        out: list = []
+        for it in obj:
+            out.extend(harvest_entities(it, depth + 1))
+        return _merge_by_ref(out)
+    return found
+
+
+def _merge_by_ref(entities: list) -> list:
+    """Collapse entities that are the SAME subject, unioning their assets.
+
+    The same company can appear twice in one document: once as
+    {id, name} and once as {name} alone (a child table repeats the name
+    without the id). Merging by subject_ref alone kept them apart. A stable
+    SOURCE ID wins: every name-ref of that legal name is folded into the
+    id-ref, so one subject has exactly one identity (T07).
+    """
+    # first pass: which legal names have a stable id?
+    id_for_name: dict = {}
+    for ent in entities:
+        if ent.get("subject_id") and ent.get("legal_name"):
+            id_for_name.setdefault(ent["legal_name"], ent["subject_ref"])
+    by_ref: dict = {}
+    order: list = []
+    for ent in entities:
+        key = ent["subject_ref"]
+        if not ent.get("subject_id") and ent.get("legal_name") in id_for_name:
+            key = id_for_name[ent["legal_name"]]
+        if key not in by_ref:
+            merged = dict(ent)
+            merged["subject_ref"] = key
+            by_ref[key] = merged
+            order.append(key)
+            continue
+        cur = by_ref[key]
+        for kk in ("domains", "icp", "apps", "aliases"):
+            cur[kk] = _uniq(cur[kk] + ent[kk])
+        if not cur.get("subject_id") and ent.get("subject_id"):
+            cur["subject_id"] = ent["subject_id"]
+    return [by_ref[k] for k in order]
+
+
 def harvest_entity(obj: Any, depth: int = 0) -> dict:
-    """Format-tolerant harvest: pull companies / ICP / domains out of any ENScan JSON."""
+    """Format-tolerant harvest: pull companies / ICP / domains out of any ENScan JSON.
+
+    Legacy flat view kept for counters and old callers. Asset decisions use
+    harvest_entities(), which keeps each asset with its subject.
+    """
     out = {"companies": [], "icp": [], "domains": [], "apps": []}
     if depth > 12:
         return out
@@ -389,6 +572,7 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
     if "cookie" in blob.lower() or "Cookie" in blob:
         core.log("enscan: no cookie configured; put the aiqicha Cookie into bin/config.yaml")
     merged = {"companies": [], "icp": [], "domains": [], "apps": []}
+    entities: list = []
     files = 0
     for p in sorted(outdir.rglob("*.json")):
         if p.resolve() in before:      # stale file from an earlier run
@@ -401,14 +585,32 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
         got = harvest_entity(data)
         for k in merged:
             merged[k].extend(got[k])
+        # per-entity view: each asset stays with the subject that filed it
+        for ent in harvest_entities(data):
+            ent = dict(ent)
+            ent["evidence_ref"] = "enscan:" + p.name + ":" + ent["subject_ref"]
+            entities.append(ent)
     for k in merged:
         merged[k] = _uniq(merged[k])
+    # merge the per-entity view across files by subject reference
+    by_ref: dict = {}
+    for ent in entities:
+        key = ent["subject_ref"]
+        if key not in by_ref:
+            by_ref[key] = dict(ent)
+        else:
+            cur = by_ref[key]
+            for kk in ("domains", "icp", "apps", "aliases"):
+                cur[kk] = _uniq(cur[kk] + ent[kk])
+    entities = list(by_ref.values())
     # ANCHORING GATE. Only entities that really are the requested one may
     # contribute assets. aiqicha answers a MISS with a popular lookalike, so
     # trusting the response wrote another company 42 domains and 27 ICP
     # numbers into the store under the user name at confidence 0.9 -- the
     # worst failure mode, because the report then looks authoritative.
-    kept, rejected = filter_entities(merged["companies"], name)
+    company_names = [e["legal_name"] for e in entities if e["legal_name"]] \
+        or merged["companies"]
+    kept, rejected = filter_entities(company_names, name)
     if not kept:
         core.log("enscan: no entity matched " + str(name) +
                  "; discarding " + str(len(rejected)) + " unrelated result(s)" +
@@ -417,33 +619,71 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
         return {"rc": rc, "json_files": files, "stderr": err[-800:],
                 "table_only": files == 0 and table,
                 "anchor_failed": True, "rejected": rejected[:20],
-                "companies": [], "icp": [], "domains": [], "apps": []}
+                "companies": [], "icp": [], "domains": [], "apps": [],
+                "subjects": [], "candidates": [
+                    {"name": e["legal_name"], "ref": e["subject_ref"],
+                     "domains": len(e["domains"])} for e in entities]}
+    # Approved subjects are the ONLY ones whose assets are granted. Every
+    # other returned entity is preserved as candidate evidence (subject list,
+    # asset counts) and never enters the seed/scope set (F06).
+    #
+    # Approval is decided per ENTITY: its legal name must be one filter_entities
+    # kept as THE requested name. A short brand like "fixture-subject" shares a
+    # prefix with both A and B -- name_matches alone would approve both, so the
+    # approved set is intersected with the exact kept names.
+    kept_set = set(kept)
+    approved = [e for e in entities if e["legal_name"] in kept_set]
+    if not approved and entities:
+        # no entity carried a kept legal name: treat the single-entity case
+        # conservatively -- the anchor gate above already proved the name
+        # matches, and with ONE subject there is nothing to confuse it with.
+        if len(entities) == 1:
+            approved = entities
+    candidates = [e for e in entities if e not in approved]
     merged["companies"] = kept
     for c in kept:
         store.upsert_asset("company", c, source="enscan",
                            confidence=0.9, passivity="passive")
-    for d in merged["domains"]:
-        store.upsert_asset("domain", d, source="enscan", confidence=0.9,
-                           passivity="passive", parent=kept[0])
-    # Keep ICP numbers as first-class assets: `icp --from-store` and later
-    # reverse-lookup rounds read them back, so a run must not be the only place
-    # they exist.
-    for code in merged["icp"]:
-        store.upsert_asset("icp", code, source="enscan", confidence=0.9,
-                           passivity="passive", parent=name)
+    approved_domains: list = []
+    approved_icp: list = []
+    for ent in approved:
+        ref = ent["subject_ref"]
+        # The subject reference (stable id, marked name fallback) is the
+        # parent, so a later display-name change cannot orphan the seed (T07).
+        store.upsert_asset("company", ent["legal_name"] or ref,
+                           source="enscan:" + ref, confidence=0.9,
+                           passivity="passive", parent=ref)
+        for d in ent["domains"]:
+            store.upsert_asset("domain", d, source="enscan",
+                               confidence=0.9, passivity="passive", parent=ref)
+            approved_domains.append(d)
+        for code in ent["icp"]:
+            store.upsert_asset("icp", code, source="enscan", confidence=0.9,
+                               passivity="passive", parent=ref)
+            approved_icp.append(code)
+    approved_domains = _uniq(approved_domains)
+    approved_icp = _uniq(approved_icp)
     if files == 0 and table:
         core.log("enscan: printed a report table but wrote no JSON to " +
                  str(outdir) + " — entity data could not be parsed; treat as a "
                  "coverage gap, not as 'this company has no assets'")
-    if kept and not merged["domains"]:
+    if kept and not approved_domains:
         core.log("enscan: anchored " + kept[0] +
                  " but this source filed no domain -- the company is real, its "
                  "domain set is simply empty here")
     return {"rc": rc, "json_files": files, "stderr": err[-800:],
             "table_only": files == 0 and table,
             "companies": merged["companies"][:200],
-            "icp": merged["icp"], "domains": merged["domains"],
-            "apps": merged["apps"][:100]}
+            "icp": approved_icp, "domains": approved_domains,
+            "apps": _uniq([a for e in approved for a in e["apps"]])[:100],
+            "subjects": [{"ref": e["subject_ref"],
+                          "legal_name": e["legal_name"],
+                          "approved": True,
+                          "domains": len(e["domains"])} for e in approved],
+            "candidates": [{"ref": e["subject_ref"],
+                            "legal_name": e["legal_name"],
+                            "approved": False,
+                            "domains": len(e["domains"])} for e in candidates]}
 
 
 # Entity-name anchoring: what makes an ENScan hit THIS target and not
@@ -483,8 +723,15 @@ def name_matches(wanted: str, got: str) -> bool:
     Deliberately strict: a substring hit on one shared word is how a college
     query got answered with a delivery company. Two rules pass: one name
     contains the other after normalisation (a parent company vs its branch),
-    or the two share a long common prefix covering most of both names.
-    Anything else is reported as unanchored, never silently used.
+    or the two differ only by a tiny suffix/typo (a shared brand plus one
+    trailing word is NOT enough).
+
+    The prefix rule used to accept anything sharing 6+ leading characters, so
+    "fixture-subject-A" and "fixture-subject-B" -- two DIFFERENT subjects
+    under one brand -- both anchored, and one company's assets could be
+    granted to the other (F06). The prefix now has to cover essentially the
+    whole shorter name (differing by at most one character), which keeps
+    typo/parent-company tolerance and rejects sibling brand members.
     """
     a, b = norm_entity_name(wanted), norm_entity_name(got)
     if not a or not b:
@@ -499,7 +746,26 @@ def name_matches(wanted: str, got: str) -> bool:
         if x != y:
             break
         n += 1
-    return n >= 6 and n >= min(len(a), len(b)) - 1
+    if n < 6:
+        return False
+    if n >= min(len(a), len(b)) - 1:
+        # A long shared prefix is identity only when the names then end, or
+        # the remaining tail is a BOUNDARY suffix ("公司长沙分公司"), not a
+        # different token ("-A" vs "-B"). Two sibling brand members share a
+        # prefix and differ in one character exactly like a typo does, so the
+        # tie-break is the shape of the tail.
+        ta, tb = a[n:], b[n:]
+        if not ta or not tb:
+            return True
+        sep = "-_.  "
+        if (ta.startswith(tuple(sep)) or tb.startswith(tuple(sep))):
+            return True
+        # a single differing alphanumeric tail on BOTH sides is a sibling
+        # marker (A/B, 1/2), not a shared identity
+        if len(ta) <= 2 and len(tb) <= 2 and ta[-1:].isalnum() and tb[-1:].isalnum():
+            return False
+        return True
+    return False
 
 
 def filter_entities(companies: list, wanted: str) -> tuple:
@@ -797,6 +1063,7 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
         _n = sum(1 for _ in core.parse_jsonl(out))
         _billed("uncover", input_hash=_metered.hash_input(
                     {"icp": code, "engines": usable}),
+                unit=_metered.UNIT_NATIVE_DISPATCH,
                 rc=rc, requested=1, returned=_n,
                 elapsed_sec=time.time() - _t1,
                 error=(err or "")[-200:] if rc not in (0, None) else "",
@@ -925,6 +1192,7 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
             # uncover is the billed dispatcher (its engines all cost quota);
             # free sources (subfinder, chaos) never reach the ledger.
             _billed("uncover", rc=rc, requested=1, returned=n,
+                    unit=_metered.UNIT_NATIVE_DISPATCH,
                     elapsed_sec=time.time() - _t0,
                     error=(err or "")[-200:] if rc not in (0, None) else "",
                     status=("failed" if rc == 124 else
@@ -2099,21 +2367,112 @@ def extract_from_text(text: str, root_domains: list[str]) -> dict:
 
 
 
+def _is_js_asset(url: str) -> bool:
+    """True when a URL is a JavaScript bundle worth fetching as JS work.
+
+    .js and .mjs are JS bundles; a source map (.map) is fetched with its
+    bundle only when something references it, so it is not JS work on its own.
+    JSON is NOT JS work either -- the old filter counted .json/.map as
+    candidates, so API responses (and HTML pages whose path merely ended in
+    .json) were queued as unprocessed JavaScript.
+    """
+    return bool(re.search(r"\.m?js(\?|#|$)", url or "", re.I))
+
+
+def _js_work_set(urls, scope) -> list:
+    """The URLs that are genuinely JS work for this run.
+
+    HTML pages are NOT JS work: a page is evidence that may REFERENCE JS, and
+    the caller's discovery step extracts the reference. Queuing every input
+    URL (including the crawl seeds and HTML pages) is what left a finished run
+    with phantom pending items forever.
+    """
+    out = []
+    scope_list = [s for s in (scope or []) if s]
+    for u in _uniq(urls or []):
+        u = str(u or "").strip()
+        if not u.startswith("http"):
+            continue
+        if not _is_js_asset(u):
+            continue
+        host = core.split_url(u)[0] or ""
+        if scope_list and not core.in_scope(host, scope_list):
+            continue
+        out.append(u)
+    return out
+
+
+def _seen_endpoints(api_hits, api_paths) -> set:
+    """Unique (host, template, verb) endpoint keys for the api_hosts count."""
+    seen: set = set()
+    for host, p, verb in api_hits or []:
+        seen.add((host, core.path_template(p), verb))
+    for p in api_paths or []:
+        seen.add(("leak", core.path_template(p), "GET"))
+    return seen
+
+
+def _finish_tail(store, got, api_paths, api_hits, scope) -> tuple:
+    """Post-fetch normalisation + storage shared by both backends.
+
+    Kept as one helper so pipeline mode (lease-protected) and standalone
+    mode (legacy queue) produce the same findings, scope split and endpoint
+    storage -- only the SCHEDULING differs between them. Returns
+    (in_scope_domains, related_domains).
+    """
+    got["domains"] = _uniq(d for d in got["domains"] if core.canon_domain(d))
+    got["ips"] = _uniq(got["ips"])
+    api_paths = _uniq(api_paths)[:500]
+    for p in api_paths:
+        store.upsert_endpoint("leak", "GET", core.path_template(p), [], source="jsleak")
+    seen_ep: set = set()
+    for host, p, verb in api_hits:
+        tpl = core.path_template(p)
+        key = (host, tpl, verb)
+        if key in seen_ep:
+            continue
+        seen_ep.add(key)
+        store.upsert_endpoint(host, verb, tpl, [], source="jsleak")
+    scope_list = [s for s in (scope or []) if s]
+    in_scope_domains: list = []
+    related_domains: list = []
+    for d in got["domains"]:
+        if not scope_list or core.in_scope(d, scope_list):
+            in_scope_domains.append(d)
+        else:
+            related_domains.append(d)
+    for d in in_scope_domains:
+        store.upsert_asset("domain", d, source="leak-extract", confidence=0.4,
+                           passivity="passive")
+    for ip in got["ips"]:
+        store.upsert_asset("ip", ip, source="leak-extract", confidence=0.4,
+                           passivity="passive")
+    return in_scope_domains, related_domains
+
+
 def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
               timeout: int = 0, fetch_limit: int = 40,
-              scope: list[str] | None = None) -> dict:
+              scope: list[str] | None = None,
+              run_id: str | None = None) -> dict:
     """Extract leaked domains/IPs/paths/secrets from crawl output and fetched JS.
 
     Inputs are complete work sets, not display samples: `urls` should come
     from a scoped store query (see run's extract stage), and crawl_rows from
     the crawler's full output. fetch_limit caps how many bundles are fetched
     (a work budget, reported as such), never how many are discovered.
+
+    Two scheduling backends, ONE claimable queue per invocation:
+
+    * `run_id` given (pipeline mode): work_items/stage='extract' is the only
+      source of JS scheduling and stats. Discovery inserts real JS work only;
+      the fetch set is claimed through the durable queue with a lease, and
+      each result commits membership + observation + ack atomically under
+      that lease. A finished item stays done across rounds/restarts.
+    * no run_id (standalone): the legacy Store.js_* queue, unchanged.
     """
     from . import jsleak
+    from . import work as _work
 
-    # Scan a bounded slice of the crawl output: json.dumps() of 100k rows would
-    # allocate hundreds of MB just to run a regex over it. Budget by bytes, not
-    # rows, so a few very long URLs cannot blow past it either.
     SCAN_BUDGET = 4 << 20
     parts: list[str] = []
     used = 0
@@ -2124,137 +2483,137 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
         parts.append(piece)
         used += len(piece)
     text = chr(10).join(parts)
-    # Scan with the ROOT DOMAINS, not []. jsleak.keep_domain() is the only
-    # filter that can tell a hostname from a property chain, because it knows
-    # what the target is: `i.find.id` and `li.eq` cannot be a name under
-    # hniu.cn, while every real hit is. Passing [] disabled it, so the whole
-    # minified-bundle vocabulary reached the scope split.
     roots = [d for d in (scope or []) if d]
     got = extract_from_text(text, roots)
     hit = jsleak.extract(text, roots)
     got["domains"].extend(hit["domains"])
     got["ips"].extend(hit["ips"])
-    # Unfiltered view for the related-domain report ONLY. These names are
-    # never stored; they exist so an operator can see what a bundle leaked
-    # (a vendor CDN, a third-party API) without trusting it as scope.
-    loose = jsleak.extract(text, [])
 
-    # fetch JS bundles and API-ish pages, extract paths / hosts / secrets
-    candidates = []
-    for u in _uniq(urls or []):
-        if re.search(r"(\.js|\.json|\.map)(\?|$)", u or "", re.I):
-            candidates.append(u)
-    discovered_js = len(candidates)
-    # Persist the candidate set as a work queue BEFORE truncating to the budget.
-    # The old code took candidates[:fetch_limit] from a freshly rebuilt list on
-    # every round, so items 41..N were never reached: the run looked converged
-    # because "nothing new" while 1+ bundles had simply never been attempted.
-    store.js_enqueue(candidates)
-    before = store.js_stats()
-    # Claim only from THIS work set: the queue is shared, and fetching another
-    # target's bundles would widen the active scope.
-    candidates = store.js_claim(fetch_limit, allow_urls=candidates)
-    api_paths: list[str] = []                 # host unknown (extracted from crawl text)
-    api_hits: list[tuple[str, str, str]] = []  # (host, path, method) from a bundle
+    js_set = _js_work_set(urls, scope)
+    discovered_js = len(js_set)
+    api_paths: list[str] = []
+    api_hits: list[tuple[str, str, str]] = []
     secrets: dict = {}
 
-    def fetch_and_scan(u: str) -> dict | None:
+    def scan_bundle(u: str) -> dict | None:
+        # Network work happens OUTSIDE any database transaction.
         rc, body, err = core.curl([u], timeout=timeout)
         if rc != 0 or not body:
             return None
-        hit = jsleak.extract(body, roots)
-        hit["_url"] = u
-        return hit
+        found = jsleak.extract(body, roots)
+        found["_url"] = u
+        return found
 
-    # parallel fetch: network dominates the cost (~95%), so concurrency is the
-    # single biggest win. workers are bounded to stay polite.
+    def absorb(url: str, found: dict) -> None:
+        got["domains"].extend(found["domains"])
+        got["ips"].extend(found["ips"])
+        api_paths.extend(found["api_paths"])
+        host = core.split_url(found.get("_url") or url)[0]
+        if not host:
+            return
+        meta = found.get("path_meta") or {}
+        for p in found["api_paths"]:
+            verb = ((meta.get(p) or {}).get("method") or "GET").upper()
+            api_hits.append((host, p, verb if verb in
+                             ("GET", "POST", "PUT", "DELETE", "PATCH") else "GET"))
+        for k, v in found["secrets"].items():
+            secrets.setdefault(k, []).extend(v)
+
+    if run_id:
+        # ---- pipeline mode: work_items is the ONLY source of truth --------
+        try:
+            _work.ensure_schema(store)
+        except Exception:
+            pass
+        queued = 0
+        for u in js_set:
+            try:
+                if _work.enqueue(store, run_id, _work.ROUTE_JS, "url", u):
+                    queued += 1
+            except Exception:
+                continue
+        before = _work.queue_stats(store, run_id)
+        claimed = _work.claim(store, run_id, _work.ROUTE_JS,
+                              limit=max(0, int(fetch_limit)))
+        candidates = [c["canonical"] for c in claimed]
+        results: list = []
+        if candidates:
+            with futures.ThreadPoolExecutor(
+                    max_workers=min(10, len(candidates))) as pool:
+                results = list(pool.map(scan_bundle, candidates))
+        for item, found in zip(claimed, results):
+            members: list = []
+            observations: list = []
+            if found is not None:
+                for d in _uniq([core.canon_domain(x) for x in
+                                (found.get("domains") or []) if core.canon_domain(x)]):
+                    members.append({"kind": "domain", "canonical": d})
+                    observations.append({"kind": "domain", "canonical": d,
+                                         "producer": "extract",
+                                         "upstream": "jsleak"})
+                for ip in _uniq(found.get("ips") or []):
+                    members.append({"kind": "ip", "canonical": ip})
+                    observations.append({"kind": "ip", "canonical": ip,
+                                         "producer": "extract",
+                                         "upstream": "jsleak"})
+            # Result + membership + ack under ONE valid lease.
+            settled = _work.commit_result(
+                store, run_id, item["id"], item["lease_token"],
+                members=members, observations=observations,
+                ok=found is not None,
+                reason="" if found is not None else "fetch failed or empty body",
+                retryable=found is None)
+            if not settled or found is None:
+                continue
+            absorb(item["canonical"], found)
+        after_q = _work.queue_stats(store, run_id)
+        attempted = len(candidates)
+        pending = int(after_q.get("outstanding") or 0)
+        budget_hit = pending > 0 or attempted >= fetch_limit
+        in_scope, related = _finish_tail(store, got, api_paths, api_hits, scope)
+        return {"count_domains": len(got["domains"]),
+                "count_ips": len(got["ips"]),
+                "fetched": max(0, int(after_q.get("done") or 0)
+                               - int(before.get("done") or 0)),
+                "attempted": attempted,
+                "js_discovered": discovered_js,
+                "js_succeeded": int(after_q.get("done") or 0),
+                "js_failed": int(after_q.get("failed") or 0)
+                             + int(after_q.get("blocked") or 0),
+                "js_pending": pending,
+                "js_queued": queued,
+                "js_fetch_limit": fetch_limit,
+                "js_budget_hit": budget_hit,
+                "outcome": (core.OUTCOME_PARTIAL if budget_hit and discovered_js
+                            else core.OUTCOME_OK),
+                "api_paths": api_paths[:300],
+                "api_hosts": len(_seen_endpoints(api_hits, api_paths)),
+                "secrets": _redact_secrets(secrets),
+                "in_scope_domains": in_scope[:1000],
+                "related_domains": related[:1000],
+                "count_related": len(related),
+                "domains": got["domains"][:1000], "ips": got["ips"][:1000]}
+
+    # ---- standalone: legacy Store.js_* queue (unchanged behaviour) --------
+    candidates = list(js_set)
+    store.js_enqueue(candidates)
+    before = store.js_stats()
+    candidates = store.js_claim(fetch_limit, allow_urls=candidates)
     if candidates:
         with futures.ThreadPoolExecutor(max_workers=min(10, len(candidates))) as pool:
-            results = list(pool.map(fetch_and_scan, candidates))
-        for u, h in zip(candidates, results):
-            store.js_finish(u, ok=h is not None,
-                            error="" if h is not None else "fetch failed or empty body")
-            if not h:
-                continue
-            # NOTE: this block used to sit INSIDE the "if not h" branch, after a
-            # continue -- unreachable. Every fetched bundle was discarded, so
-            # extract() only ever saw crawl-text, never the JS it downloaded.
-            got["domains"].extend(h["domains"])
-            got["ips"].extend(h["ips"])
-            api_paths.extend(h["api_paths"])
-            host = core.split_url(h.get("_url") or "")[0]
-            if host:
-                meta = h.get("path_meta") or {}
-                for p in h["api_paths"]:
-                    # keep the verb the AST reported (POST/PUT/DELETE matter far
-                    # more than GET when triaging); regex-only runs stay GET
-                    verb = ((meta.get(p) or {}).get("method") or "GET").upper()
-                    api_hits.append((host, p, verb if verb in
-                                     ("GET", "POST", "PUT", "DELETE", "PATCH") else "GET"))
-            for k, v in h["secrets"].items():
-                secrets.setdefault(k, []).extend(v)
-    # hostname validity gate: jsleak's regex accepts any alpha TLD shape, so
-    # "service.example.com.au" survives intact while "ajax.js"-style names die
-    got["domains"] = _uniq(d for d in got["domains"] if core.canon_domain(d))
-    got["ips"] = _uniq(got["ips"])
-    api_paths = _uniq(api_paths)[:500]
-    # paths scraped from crawl text have no owner yet; keep them under the
-    # explicit "leak" pseudo-asset so they are still queryable
-    for p in api_paths:
-        store.upsert_endpoint("leak", "GET", core.path_template(p), [], source="jsleak")
-    # paths found inside a fetched bundle belong to that bundle's host
-    seen_ep: set[tuple[str, str, str]] = set()
-    for host, p, verb in api_hits:
-        tpl = core.path_template(p)
-        key = (host, tpl, verb)
-        if key in seen_ep:
-            continue
-        seen_ep.add(key)
-        store.upsert_endpoint(host, verb, tpl, [], source="jsleak")
-    # Scope split: a crawl bundle yields the TARGET's own hosts plus whatever
-    # third parties the page happens to mention (cdn.jsdelivr.net, a chat
-    # widget, the vendor's telemetry host). Both are evidence, but they are not
-    # the same asset. Storing them at the same confidence made a live run
-    # report 181 "domains" of which 145 were JS noise and third-party CDNs.
-    # In-scope names are assets; out-of-scope names are recorded as related
-    # observations that never enter the active queue.
-    scope_list = [s for s in (scope or []) if s]
-    in_scope_domains: list[str] = []
-    related_domains: list[str] = []
-    for d in got["domains"]:
-        if not scope_list or core.in_scope(d, scope_list):
-            in_scope_domains.append(d)
-        else:
-            related_domains.append(d)
-    # Out-of-scope names came back filtered out of got["domains"] above; the
-    # unfiltered scan is what keeps the third-party detail visible. Only names
-    # that survive canon_domain are reported, so pure property chains (which
-    # the ambiguity rule in core rejects) do not pad the list.
-    for d in _uniq(loose.get("domains") or []):
-        if d in in_scope_domains or d in related_domains:
-            continue
-        if not core.canon_domain(d):
-            continue
-        if not scope_list or not core.in_scope(d, scope_list):
-            related_domains.append(d)
-    for d in in_scope_domains:
-        store.upsert_asset("domain", d, source="leak-extract", confidence=0.4,
-                           passivity="passive")
-    # Out-of-scope hits are NOT stored. They are reported (related_domains) so
-    # a human can see what a bundle leaked, but writing them made 711 of 747
-    # "domain assets" on a live run pure JS property chains -- every query,
-    # count and report then described JavaScript instead of the target.
-    for ip in got["ips"]:
-        store.upsert_asset("ip", ip, source="leak-extract", confidence=0.4,
-                           passivity="passive")
+            results = list(pool.map(scan_bundle, candidates))
+        for u, found in zip(candidates, results):
+            store.js_finish(u, ok=found is not None,
+                            error="" if found is not None
+                            else "fetch failed or empty body")
+            if found is not None:
+                absorb(u, found)
     after = store.js_stats()
     attempted = len(candidates)
     pending = after["pending"] + after["failed"]
     budget_hit = pending > 0 or attempted >= fetch_limit
+    in_scope, related = _finish_tail(store, got, api_paths, api_hits, scope)
     return {"count_domains": len(got["domains"]), "count_ips": len(got["ips"]),
-            # `fetched` used to be len(candidates) BEFORE the fetch ran, i.e. an
-            # attempt count mislabelled as a success count. Keep the name for
-            # compatibility but make it mean what it says, and expose the rest.
             "fetched": after["succeeded"] - before["succeeded"],
             "attempted": attempted,
             "js_discovered": after["discovered"],
@@ -2263,16 +2622,14 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
             "js_pending": pending,
             "js_fetch_limit": fetch_limit,
             "js_budget_hit": budget_hit,
-            # A non-empty pending queue is a coverage gap, not convergence.
             "outcome": (core.OUTCOME_PARTIAL if budget_hit and after["discovered"]
                         else core.OUTCOME_OK),
             "api_paths": api_paths[:300],
-            "api_paths": api_paths[:300],
-            "api_hosts": len(seen_ep),
+            "api_hosts": len(_seen_endpoints(api_hits, api_paths)),
             "secrets": _redact_secrets(secrets),
-            "in_scope_domains": in_scope_domains[:1000],
-            "related_domains": related_domains[:1000],
-            "count_related": len(related_domains),
+            "in_scope_domains": in_scope[:1000],
+            "related_domains": related[:1000],
+            "count_related": len(related),
             "domains": got["domains"][:1000], "ips": got["ips"][:1000]}
 
 

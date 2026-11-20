@@ -243,26 +243,42 @@ def test_t31_threaded_observations_no_cross_thread_sqlite_or_loss():
 def test_t33_legacy_js_import_requires_provable_ownership():
     s = _store()
     ts = core.now()
-    # legacy rows exist with no owner
+    # legacy rows exist with no owner; one pending, one already done
     with s._write():
         for url in ("https://a.mt-a.example.com/1.js",
-                    "https://unknown.example.org/2.js"):
+                    "https://unknown.example.org/2.js",
+                    "https://a.mt-a.example.com/done.js"):
             s.conn.execute(
                 "INSERT OR IGNORE INTO js_queue(url, state, attempts,"
                 " last_error, discovered_at, updated_at)"
                 " VALUES(?, 'pending', 0, '', ?, ?)", (url, ts, ts))
-    # run 1 observed only the first URL (provably its own)
+        s.conn.execute("UPDATE js_queue SET state='done' WHERE url=?",
+                       ("https://a.mt-a.example.com/done.js",))
+    # run 1 observed the first URL plus the completed one (provably its own)
     s.upsert_asset("url", "https://a.mt-a.example.com/1.js", source="crawl",
                    confidence=0.6)
     work.attach_asset(s, RUN, "url", "https://a.mt-a.example.com/1.js",
                       producer="crawl", upstream="katana", route=None)
-    attached = work.import_js_queue(s, RUN)
-    assert attached == 1, "only provable ownership attaches"
+    work.attach_asset(s, RUN, "url", "https://a.mt-a.example.com/done.js",
+                      producer="crawl", upstream="katana", route=None)
+    result = work.import_js_queue(s, RUN)
+    assert result["attached"] == 2, ("only provable ownership attaches", result)
+    assert result["skipped_done"] == 1, "a completed legacy row stays done"
+    assert "https://unknown.example.org/2.js" in result["unknown"], (
+        "unknown ownership must be reported, not claimed", result)
     members = work.run_assets(s, RUN, "url")
     assert "https://a.mt-a.example.com/1.js" in members
-    # the unknown row must NOT be claimed into this run
+    # the done row migrated as DONE, never re-opened as pending
+    done_row = s.conn.execute(
+        "SELECT status FROM work_items WHERE run_id=? AND canonical=?",
+        (RUN, "https://a.mt-a.example.com/done.js")).fetchone()
+    assert done_row["status"] == "done", done_row
+    # the unknown row must NOT be claimable by this run
     claimed = work.claim(s, RUN, "extract", limit=50)
     assert all("unknown.example.org" not in c["canonical"] for c in claimed)
+    # migration is idempotent: a second pass attaches nothing new
+    again = work.import_js_queue(s, RUN)
+    assert again["attached"] == 0, again
     # and it is still pending in the legacy table, unclaimed
     legacy = s.conn.execute(
         "SELECT state FROM js_queue WHERE url=?",

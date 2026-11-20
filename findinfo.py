@@ -104,6 +104,256 @@ _HOME = _prescan_option(sys.argv, "--home")
 if _HOME:
     os.environ["FINDINFO_HOME"] = _HOME
 
+
+def _offline_requested(argv: list[str]) -> tuple:
+    """Detect a read-only invocation BEFORE any runtime import (F09).
+
+    Returns ("doctor", True) for `doctor --offline`, ("run", True) for a
+    `run ... --dry-run`, else (None, False). Only a cheap token scan: this runs
+    before lib.core, so importing the parser (and thus the runtime) would
+    defeat the purpose -- core's import resolves HOME and creates the home
+    layout, which is exactly the side effect an offline mode promises not to
+    have.
+    """
+    if not argv:
+        return None, False
+    sub = ""
+    skip = False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a in ("--task", "--home"):
+            skip = True            # global options take a value: skip it
+            continue
+        if a.startswith("--"):
+            continue
+        sub = a
+        break
+    if sub == "doctor" and _flag_present(argv, "--offline"):
+        return "doctor", True
+    if sub == "run" and _flag_present(argv, "--dry-run"):
+        return "run", True
+    return None, False
+
+
+def _flag_present(argv: list[str], flag: str) -> bool:
+    for a in argv:
+        if a == flag or a.startswith(flag + "="):
+            return True
+    return False
+
+
+def _run_offline(sub: str, argv: list[str]) -> int:
+    """Answer an offline command with the pure modules only.
+
+    No lib.core, no config, no credentials, no home/db creation. Everything
+    that would need live facts is reported as unverified.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from lib import offline as offline_mod
+    from lib import spec as spec_mod
+    if sub == "doctor":
+        _emit_offline(offline_mod.doctor_offline())
+        return 0
+    # run --dry-run: build the plan from RunSpec + the stage planner, without
+    # importing the runtime. The planner needs only flag logic.
+    args = _parse_offline_args(argv)
+    rs = spec_mod.from_cli(args)
+    active = bool(rs.active or rs.ports or rs.vhost or rs.crawl or rs.brute)
+    planned = _plan_stages_pure(rs, active)
+    identity_questions = []
+    if rs.name and not rs.domain:
+        identity_questions.append(
+            "brand-only run: entity anchoring must resolve the subject before "
+            "any discovery runs; ambiguous identity reports identity_ambiguous")
+    if rs.name and rs.domain:
+        identity_questions.append(
+            "explicit domains seed the run directly; the brand is only extra "
+            "context for related-asset evidence")
+    effective = None
+    if rs.task and False:      # untouched: resume preview needs the job spec
+        effective = None
+    if _prescan_option(argv, "--resume"):
+        effective = _offline_resume_preview(argv, spec_mod)
+    payload = offline_mod.plan_preview(
+        run_spec=rs, planned_stages=planned, active=active,
+        disabled=[x for x in ("entity", "onepass", "icp", "brute")
+                  if x not in planned],
+        identity_questions=identity_questions,
+        limits={"rounds": rs.rounds, "time_budget_sec": rs.time_budget,
+                "task_timeout_sec": rs.task_timeout,
+                "tool_timeout_sec": rs.tool_timeout,
+                "engines": rs.engines, "max_seed": rs.max_seed,
+                "top_ports": rs.top_ports, "max_vhost_ips": rs.max_vhost_ips,
+                "depth": rs.depth},
+        background=_flag_present(argv, "--background"),
+        resume=_prescan_option(argv, "--resume") or None,
+        effective=effective)
+    _emit_offline(payload)
+    return 0
+
+
+def _emit_offline(obj) -> None:
+    """stdout encoder for offline mode (no lib.core import)."""
+    import json as _json
+    ascii_safe = (os.environ.get("FINDINFO_EMIT_UTF8") or "").lower() not in (
+        "1", "true", "yes")
+    sys.stdout.write(_json.dumps(obj, ensure_ascii=ascii_safe,
+                                 separators=(",", ":")) + chr(10))
+    sys.stdout.flush()
+
+
+def _parse_offline_args(argv: list[str]):
+    """A tiny namespace for the offline planner: reads flags, no runtime.
+
+    Deliberately NOT the full parser (which lives with the runtime): the
+    offline path only needs the execution-affecting flags RunSpec understands.
+    Unknown/absent flags take their CLI defaults, exactly like a real parse.
+    """
+    import argparse as _ap
+
+    def _val(flag, default, cast=str):
+        for i, a in enumerate(argv):
+            if a.startswith(flag + "="):
+                return cast(a.split("=", 1)[1])
+            if a == flag and i + 1 < len(argv):
+                return cast(argv[i + 1])
+        return default
+
+    domains = [argv[i + 1] for i, a in enumerate(argv)
+               if a == "--domain" and i + 1 < len(argv)]
+    domains += [a.split("=", 1)[1] for a in argv if a.startswith("--domain=")]
+    return _ap.Namespace(
+        name=_val("--name", ""), domain=domains, task=_TASK or "",
+        active=_flag_present(argv, "--active"),
+        ports=_flag_present(argv, "--ports"),
+        vhost=_flag_present(argv, "--vhost"),
+        crawl=_flag_present(argv, "--crawl"),
+        brute=_flag_present(argv, "--brute"),
+        supplier=_flag_present(argv, "--supplier"),
+        branch=_flag_present(argv, "--branch"),
+        brute_wordlist=_val("--brute-wordlist", "wordlists/sub.txt"),
+        brute_bandwidth=_val("--brute-bandwidth", "3m"),
+        depth=_val("--depth", 3, int), invest=_val("--invest", 51, int),
+        deep=_val("--deep", 1, int),
+        entity_timeout=_val("--entity-timeout", 1200, int),
+        engines=_val("--engines", "fofa,quake,hunter,shodan,censys"),
+        top_ports=_val("--top-ports", 1000, int),
+        max_seed=_val("--max-seed", 5, int),
+        max_vhost_ips=_val("--max-vhost-ips", 10, int),
+        no_icp=_flag_present(argv, "--no-icp"),
+        no_onepass=_flag_present(argv, "--no-onepass"),
+        force_stage=_flag_present(argv, "--force-stage"),
+        rounds=_val("--rounds", 1, int),
+        time_budget=_val("--time-budget", 0.0, float),
+        task_timeout=_val("--task-timeout", 0.0, float),
+        tool_timeout=_val("--tool-timeout", 0, int),
+        background=_flag_present(argv, "--background"),
+        resume=_val("--resume", ""),
+    )
+
+
+def _plan_stages_pure(rs, active: bool) -> list:
+    """The stage plan from a RunSpec, with no runtime import.
+
+    Mirrors findinfo._plan_stages exactly; a drift between them is caught by
+    the plan-consistency test (a dry run must name the stages a real run
+    plans).
+    """
+    plan = []
+    if rs.name:
+        plan.append("entity")
+    if not rs.no_onepass:
+        plan.append("onepass")
+    plan += ["certs", "subs"]
+    if active and rs.brute:
+        plan.append("brute")
+    if not rs.no_icp and rs.name:
+        plan.append("icp")
+    plan.append("dns")
+    if active:
+        plan += ["probe", "ipagg"]
+        if rs.ports:
+            plan.append("ports")
+        if rs.vhost:
+            plan.append("vhost")
+        if rs.crawl:
+            plan += ["crawl", "extract"]
+    return plan
+
+
+def _offline_resume_preview(argv: list[str], spec_mod) -> dict:
+    """Read the job spec's METADATA only (allowed: not a config read)."""
+    rid = _prescan_option(argv, "--resume")
+    if not rid:
+        return {}
+    home = os.environ.get("FINDINFO_HOME") or str(Path.home() / ".findinfo")
+    task = _TASK or ""
+    base = Path(home) / "tasks" / task / "runs" if task else Path(home) / "runs"
+    candidate = base / rid
+    if not candidate.is_dir():
+        matches = sorted(base.glob(rid + "*")) if base.is_dir() else []
+        candidate = matches[-1] if len(matches) == 1 else None
+    if candidate is None or not (candidate / "job.json").exists():
+        return {"source": "error", "error": "run not found: " + str(rid)}
+    try:
+        import json as _json
+        spec_blob = _json.loads((candidate / "job.json").read_text(
+            encoding="utf-8"))
+    except Exception as exc:
+        return {"source": "error", "error": str(exc)[:160]}
+    out = {"source": "job.json", "run_id": spec_blob.get("run_id") or candidate.name,
+           "attempt": spec_blob.get("attempt"),
+           "note": "preview only: spec metadata read, no job state is changed"}
+    try:
+        # Reconstruct the effective identity from the stored spec (its
+        # run_spec block, else a parse of the stored argv) and report the
+        # target/scope/stages/limits a resume would actually run.
+        from lib import spec as _spec
+        import argparse as _ap
+        rs = None
+        if spec_blob.get("run_spec"):
+            rs = _spec.RunSpec.from_json(_json.dumps(spec_blob["run_spec"]))
+        elif spec_blob.get("argv"):
+            # the offline path has no full parser; read the identity flags
+            av = list(spec_blob["argv"])
+            def _get(flag):
+                for i, a in enumerate(av):
+                    if a == flag and i + 1 < len(av):
+                        return av[i + 1]
+                return None
+            doms = [av[i + 1] for i, a in enumerate(av)
+                    if a == "--domain" and i + 1 < len(av)]
+            rs = _spec.RunSpec(
+                name=_get("--name") or "", domain=tuple(doms),
+                active="--active" in av,
+                ports="--ports" in av, vhost="--vhost" in av,
+                crawl="--crawl" in av, brute="--brute" in av,
+                no_icp="--no-icp" in av, no_onepass="--no-onepass" in av,
+                rounds=int(_get("--rounds") or 1))
+        if rs is not None:
+            active = bool(rs.active or rs.ports or rs.vhost or rs.crawl
+                          or rs.brute)
+            out.update({
+                "target": rs.target_label,
+                "scope": list(rs.domain),
+                "planned_stages": _plan_stages_pure(rs, active),
+                "limits": {"rounds": rs.rounds,
+                           "time_budget_sec": rs.time_budget,
+                           "task_timeout_sec": rs.task_timeout,
+                           "tool_timeout_sec": rs.tool_timeout,
+                           "engines": rs.engines},
+            })
+    except Exception as exc:
+        out["effective_error"] = str(exc)[:200]
+    return out
+
+
+_OFFLINE_SUB, _OFFLINE = _offline_requested(sys.argv[1:])
+if _OFFLINE:
+    sys.exit(_run_offline(_OFFLINE_SUB, sys.argv[1:]))
+
 from lib import core, jobs, report, tools, work
 from lib import metered as metered_mod
 from lib import spec as spec_mod
@@ -501,6 +751,10 @@ def cmd_brief(args) -> None:
     finally:
         store.close()
     coverage = _resolve_coverage(args)
+    # Merge EVERY section FIRST, then measure once against the real stdout
+    # encoder. The old order measured a payload without metered/note and then
+    # appended them, so brief_bytes described a document that was never
+    # emitted (F14).
     brief = report.build_brief(data, top=args.top,
                                max_bytes=args.max_bytes,
                                coverage=coverage)
@@ -522,6 +776,10 @@ def cmd_brief(args) -> None:
     brief["note"] = ("Unified agent read API: queries the store, writes no "
                      "files. report produces the human md/html only; full data "
                      "via assets --export or report --with-json.")
+    brief["schema"] = brief.get("schema") or "findinfo.brief/1"
+    # Re-fit + re-measure the COMPLETE object with the same encoder emit()
+    # uses; nothing is appended afterwards.
+    report.fit_brief(brief, args.max_bytes)
     out(brief)
 
 
@@ -783,11 +1041,16 @@ def cmd_wait(args) -> None:
     run_dir = jobs.resolve(args.run)
     res = jobs.wait(run_dir, timeout=args.timeout, since_seq=args.since)
     if not getattr(args, "full", False):
-        # Keep the flags that carry meaning even when false (timed_out/terminal),
-        # drop only the bulky echoes (coverage, run_dir, hints).
+        # Compact keeps every decision field; --full only ADDS the bulky
+        # echoes (coverage arrays, run_dir). The old projection dropped
+        # attempt/reaped_by_host/terminal/gaps, so a default wait could not
+        # answer "is a worker gone and what is missing" (F13).
         prog = res.get("progress") or {}
-        keep = ("run_id", "state", "changed", "timed_out", "terminal", "alive",
-                "interrupted", "stalled", "seq", "waited_sec", "result", "note")
+        keep = ("run_id", "state", "attempt", "changed", "timed_out",
+                "terminal", "alive", "interrupted", "stalled",
+                "reaped_by_host", "retryable", "next_action",
+                "gap_count", "gaps", "seq", "progress_seq", "cursor",
+                "waited_sec", "result", "note", "resync_recommended")
         res = {k: res[k] for k in keep if k in res}
         res.update({"stage": prog.get("stage"), "stage_state": prog.get("stage_state"),
                     "stage_index": prog.get("stage_index"),
@@ -827,9 +1090,26 @@ def _input_hash(obj) -> str:
 
 
 def _write_status(run_dir: Path, **kw) -> None:
-    """Publish progress for whoever polls this run (status / wait)."""
+    """Publish progress for whoever polls this run (status / wait).
+
+    Inside a background worker every status write is FENCED: the launch token
+    is read once from the spec (worker_main publishes it to the environment
+    before the pipeline starts), and stage progress, heartbeats and the final
+    verdict all pass through the same check. A superseded attempt can no
+    longer overwrite the newer attempt's state (F05) -- the old path called
+    update_state() directly, so the pipeline bypassed the fence entirely.
+    Foreground runs have no token and keep the plain write.
+    """
+    fields = {k: v for k, v in kw.items() if k != "run_id"}
+    token = os.environ.get("FINDINFO_LAUNCH_TOKEN") or ""
     try:
-        jobs.update_state(run_dir, **{k: v for k, v in kw.items() if k != "run_id"})
+        if token:
+            ok = jobs.fenced_write(run_dir, token, **fields)
+            if not ok:
+                core.log("status write refused: this attempt's launch token "
+                         "is no longer current")
+            return
+        jobs.update_state(run_dir, **fields)
     except Exception as exc:            # a status write must never kill a stage
         core.log("status write failed: " + repr(exc)[:200])
 
@@ -1014,34 +1294,60 @@ def _attach(store, summary, kind, canonical, producer, upstream="", route=None):
 
 
 def _adopt_membership(store, summary, scope, min_conf: float = 0.0) -> int:
-    """Sweep the scoped graph into this run's membership (checkpoint re-entry).
+    """Reconcile membership with what THIS run's collectors actually stored.
 
-    Round inputs come from run_assets, but collectors upsert into the shared
-    asset graph directly (Store.upsert_asset predates the work tables). After
-    each stage -- and once before the first round, so a resumed run adopts
-    what its earlier attempt discovered -- every in-scope row joins the run.
-    This is the T08/T11 fix's compatibility seam: the graph stays the source
-    of truth for assets; membership decides whose reflow reads it.
+    Round inputs come from run_assets, but the collectors upsert into the
+    shared asset graph through Store.upsert_asset, which predates the work
+    tables. This helper closes that gap WITHOUT inventing evidence (F07):
+
+    * a domain whose `sources` column names a producer THIS run ran (dnsx,
+      httpx, subfinder, katana, onepass, ...) joins the membership -- the run
+      really did observe it;
+    * membership only: NO new observation row and NO refreshed timestamp are
+      written here, so a historical asset is never presented as a fresh
+      observation;
+    * an asset that exists only because of an EARLIER run (its sources name
+      none of this run's producers) is attached as an explicitly-marked
+      reuse: attached_at now, original observed_at preserved, and the reason
+      recorded -- never as a current pipeline observation.
     """
     rid = summary.get("_run_public_id") or ""
     if not rid or not scope:
         return 0
+    producers = set(summary.get("_run_producers") or ())
     adopted = 0
     try:
         rows = store.get_assets(kind="domain", min_conf=min_conf, match=scope)
     except Exception:
         return 0
+    ts = core.now()
     for a in rows:
         canonical = a.get("canonical") or ""
         if not canonical:
             continue
+        sources = core.source_tools(a.get("sources") or "")
+        by_this_run = bool(sources & producers) if producers else False
         try:
-            if work.attach_asset(store, rid, "domain", canonical,
-                                 producer="pipeline", upstream="pipeline",
-                                 route=work.ROUTE_DNS):
+            with store._write():
+                cur = store.conn.execute(
+                    "INSERT OR IGNORE INTO run_assets(run_id, kind, canonical,"
+                    " first_seen, last_seen) VALUES(?,?,?,?,?)",
+                    (rid, "domain", canonical, ts, ts))
+                if not cur.rowcount:
+                    continue
                 adopted += 1
+                if by_this_run:
+                    # this run's own collector already wrote the observation;
+                    # membership is enough, no synthetic evidence needed
+                    pass
+                else:
+                    store.conn.execute(
+                        "INSERT INTO observations(run_id, producer, upstream,"
+                        " kind, canonical, observed_at) VALUES(?,?,?,?,?,?)",
+                        (rid, "reuse", "reuse:run_membership", "domain",
+                         canonical, ts))
         except Exception:
-            pass
+            continue
     return adopted
 
 
@@ -1345,11 +1651,17 @@ def _start_background_locked(args, payload, key) -> int:
     # spec.json entry below all come from the same conversion -- a second
     # handwritten argv list is exactly the drift the plan forbids).
     rs = spec_mod.from_cli(args)
+    # The FIRST launch gets an attempt and a launch token exactly like a
+    # resume does. Without one the worker entered the legacy no-token branch,
+    # where an empty token passed every fence (F05).
+    import secrets as _secrets
+    launch_token = rd.name + "|1|" + _secrets.token_hex(8)
     jobs.write_spec(
         rd, entry="findinfo:main", argv=rs.to_worker_argv(),
         target=args.name or target_label, scope=core.canon_scope(args.domain or []),
         engagement=ENGAGEMENT, task=task, home=str(core.HOME), root=str(core.ROOT),
         python=sys.executable, dedupe_key=key, attempt=1, params=payload,
+        launch_token=launch_token,
         # task_timeout is a TOP-LEVEL spec field because lib/jobs.worker_main
         # reads spec["task_timeout"] to arm its hard deadline. It used to be
         # written only inside budget{}, so the timer could never start: the job
@@ -1365,6 +1677,7 @@ def _start_background_locked(args, payload, key) -> int:
                       target=target_label, scope=core.canon_scope(args.domain or []),
                       planned_stages=planned, stage_index=0,
                       stage_total=len(planned), active=active, attempt=1,
+                      launch_token=launch_token,
                       dedupe_key=key, started_ts=jobs.now_ts())
     try:
         pid = jobs.spawn(rd)
@@ -1385,6 +1698,74 @@ def _start_background_locked(args, payload, key) -> int:
     return 0
 
 
+def _resume_effective_spec(stored_spec: dict, args) -> dict:
+    """The effective RunSpec a resume would run with (ONE pure function).
+
+    Both the real resume and `run --resume ... --dry-run` call this, so the
+    preview cannot describe a different target/scope/limits than the resume
+    actually applies (F16). Pure: reads the stored spec dict and the parsed
+    args, returns {argv, budget, task_timeout, run_spec, effective} or raises
+    FindInfoError for an identity/schema violation. It does not touch state.
+
+    Rules (docs par.4): only explicitly typed limit flags may patch the stored
+    spec; an explicitly typed identity/scope/source flag that DIFFERS from the
+    stored one is refused.
+    """
+    spec = dict(stored_spec or {})
+    explicit = set(getattr(args, "_explicit", ()) or ())
+    ident_typed = set(getattr(args, "_explicit_identity", ()) or ())
+    # Defence in depth: a caller that did not go through main() (an embedding,
+    # a test harness) may not have run _mark_explicit. The parsed namespace
+    # still carries the typed values, so fall back to "the value differs from
+    # the parser default" for the limit fields -- an explicit `--rounds 3` must
+    # never be dropped because bookkeeping was skipped.
+    _LIMIT_DEFAULTS = {"rounds": 1, "time_budget": 0.0, "task_timeout": 0.0,
+                       "tool_timeout": 0, "force_stage": False}
+    for f, default in _LIMIT_DEFAULTS.items():
+        val = getattr(args, f, None)
+        if val is not None and val != default:
+            explicit.add(f)
+    effective_rs = None
+    if explicit or ident_typed:
+        stored = _spec_from_stored(spec)
+        if ident_typed:
+            from_cli_spec = spec_mod.from_cli(args)
+            changed = {f: (getattr(from_cli_spec, f, None),
+                           getattr(stored, f, None))
+                       for f in spec_mod.RunSpec.IDENTITY_FIELDS
+                       if getattr(from_cli_spec, f, None) !=
+                       getattr(stored, f, None)}
+            if changed and any(f in ("name", "domain") or
+                               getattr(args, f, None) not in
+                               (None, False, "", (), [])
+                               for f in changed):
+                raise core.FindInfoError(
+                    "resume rejected: identity/scope flags changed for an "
+                    "existing job (start a new run instead): " +
+                    json.dumps({k: v for k, v in changed.items()}, default=str))
+        if explicit:
+            requested = dataclasses.replace(
+                stored,
+                **{f: getattr(args, f, None) for f in explicit
+                   if getattr(args, f, None) is not None})
+            try:
+                effective_rs = stored.resume_patch(requested)
+            except ValueError as exc:
+                raise core.FindInfoError("resume rejected: " + str(exc)) from None
+    if effective_rs is not None:
+        spec["argv"] = effective_rs.to_worker_argv()
+        spec["budget"] = {"rounds": effective_rs.rounds,
+                          "time_budget_sec": effective_rs.time_budget,
+                          "task_timeout_sec": effective_rs.task_timeout,
+                          "tool_timeout_sec": effective_rs.tool_timeout}
+        spec["task_timeout"] = effective_rs.task_timeout
+        if spec.get("run_spec") is not None:
+            spec["run_spec"] = json.loads(effective_rs.to_json())
+    spec["_effective_spec"] = (effective_rs if effective_rs is not None
+                               else _spec_from_stored(spec))
+    return spec
+
+
 def _resume_run(args) -> int:
     """Resume under a per-run cross-process lock (one worker, one attempt).
 
@@ -1402,73 +1783,52 @@ def _resume_run(args) -> int:
 def _resume_run_locked(args, rd) -> int:
     st = jobs.derive(jobs.read_state(rd))
     if st.get("state") in jobs.ACTIVE and st.get("alive"):
-        out(dict({"run_id": rd.name, "state": st.get("state"), "reused": True,
-                  "resumed": False}, **_run_paths(rd),
+        occupied = {"state": st.get("state"), "reused": True,
+                    "resumed": False}
+        if st.get("pid"):
+            occupied["occupied_by_pid"] = st.get("pid")
+        out(dict({"run_id": rd.name}, **occupied, **_run_paths(rd),
                  hint="already running; wait on this run id instead of starting another"))
+        return 0
+    # An old worker may still be ALIVE while its state is not in ACTIVE (a
+    # stale state file, a host-reaped pid). Taking the job over means starting
+    # a second process over the same run dir: confirm the old one is gone
+    # first, and if it is not, report the occupancy instead of racing it.
+    old_pid = st.get("pid")
+    if old_pid and jobs.pid_alive(old_pid):
+        out(dict({"run_id": rd.name, "state": st.get("state"),
+                  "reused": True, "resumed": False,
+                  "occupied_by_pid": old_pid},
+                 **_run_paths(rd),
+                 hint=("the previous worker is still alive (pid "
+                       + str(old_pid) + "); wait for it or cancel the run "
+                       "before resuming -- a resume never starts a second "
+                       "worker over a live one")))
         return 0
     spec = jobs.read_spec(rd)
     if not spec.get("argv"):
         raise core.FindInfoError("not a background run (no job spec): " + rd.name)
 
-    # -- resume patching through ONE conversion (docs par.4) ----------------
-    # The stored argv is parsed back into a RunSpec; only the documented
-    # limit fields may move. Identity/scope/source flags changed on the
-    # command line are an ERROR, not a silent repoint of the same run id at a
-    # different company (RunSpec.resume_patch raises). With no explicit flags
-    # typed (args._explicit empty) the stored spec replays unchanged.
-    #
-    # The requested spec is rebuilt from the STORED identity plus ONLY the
-    # explicitly typed limits: argparse cannot tell "not given" from "given
-    # the default", so a bare `--resume <id>` must not compare its parser
-    # defaults against the job's real flags and cry identity change.
-    explicit = set(getattr(args, "_explicit", ()) or ())
-    ident_typed = set(getattr(args, "_explicit_identity", ()) or ())
-    if explicit or ident_typed:
-        stored_spec = _spec_from_stored(spec)
-        if ident_typed:
-            # An explicitly-typed identity flag must match the stored one; a
-            # DIFFERENT one repoints the run and is refused (docs par.4).
-            from_cli_spec = spec_mod.from_cli(args)
-            changed = {f: (getattr(from_cli_spec, f, None),
-                           getattr(stored_spec, f, None))
-                       for f in spec_mod.RunSpec.IDENTITY_FIELDS
-                       if getattr(from_cli_spec, f, None) !=
-                       getattr(stored_spec, f, None)}
-            # only flags the caller actually typed count; untyped ones
-            # differ because argparse filled defaults, not because the
-            # caller asked for a change
-            if changed and any(f in ("name", "domain") or
-                               getattr(args, f, None) not in (None, False, "", (), [])
-                               for f in changed):
-                raise core.FindInfoError(
-                    "resume rejected: identity/scope flags changed for an "
-                    "existing job (start a new run instead): " +
-                    json.dumps({k: v for k, v in changed.items()}, default=str))
-        if explicit:
-            requested = dataclasses.replace(
-                stored_spec,
-                **{f: getattr(args, f, None) for f in explicit
-                   if getattr(args, f, None) is not None})
-            try:
-                effective = stored_spec.resume_patch(requested)
-            except ValueError as exc:
-                raise core.FindInfoError("resume rejected: " + str(exc)) from None
-            # An explicit 0 means "remove this ceiling"; resume_patch copied the
-            # REQUESTED value, so an explicitly-typed 0 is already applied here.
-            spec["argv"] = effective.to_worker_argv()
-            spec["budget"] = {"rounds": effective.rounds,
-                             "time_budget_sec": effective.time_budget,
-                             "task_timeout_sec": effective.task_timeout,
-                             "tool_timeout_sec": effective.tool_timeout}
-            spec["task_timeout"] = effective.task_timeout
-            if spec.get("run_spec") is not None:
-                spec["run_spec"] = json.loads(effective.to_json())
+    # Resume patching goes through the SAME pure function the dry-run
+    # preview uses, so preview and reality cannot diverge (F16).
+    spec = _resume_effective_spec(spec, args)
+    spec.pop("_effective_spec", None)
     spec["attempt"] = int(spec.get("attempt") or 1) + 1
     # Launch token: fencing for THIS attempt. The worker must present it to
     # publish state; a stale attempt (this resume raced with another) can
     # no longer overwrite the newer attempt's progress.
+    #
+    # A legacy job has no token at all. That migration happens HERE, in the
+    # control entry that holds the start lock, and only after the liveness
+    # check above -- the worker itself never fabricates or bypasses a token
+    # (an empty token is not a licence to write; see jobs.fenced_write).
     import secrets as _secrets
+    migrated_legacy = not spec.get("launch_token")
     spec["launch_token"] = rd.name + "|" + str(spec["attempt"]) + "|" + _secrets.token_hex(8)
+    if migrated_legacy:
+        spec["legacy_migrated_at"] = core.now()
+        core.log("resume: legacy job without a launch token; identity assigned "
+                 "to attempt " + str(spec["attempt"]))
     jobs.write_spec(rd, **spec)
     try:
         (rd / "cancel").unlink()
@@ -1675,6 +2035,14 @@ def _run_pipeline(args) -> int:
     # prints), never the legacy integer runs.id.
     summary["_run_public_id"] = run_dir.name
     summary["run_dir"] = str(run_dir)
+    # Which collectors THIS run actually ran. Membership reconciliation uses
+    # this to tell "this run observed it" from "an earlier run left it in the
+    # shared graph"; the latter is only ever a marked reuse (F07).
+    summary["_run_producers"] = ["seed:user", "dnsx", "system-dns", "doh",
+                                 "ksubdomain", "httpx", "katana",
+                                 "onepass", "enscan", "fofa-gateway",
+                                 "subfinder", "chaos", "uncover", "naabu",
+                                 "hostCollision", "tls-grab"]
     # Per-request ledger for every billed provider call (batch F): the file
     # lives in the run dir, so a later session reads the spend without the
     # process that incurred it. Collectors receive it as `ledger=` and record
@@ -1778,19 +2146,68 @@ def _run_pipeline(args) -> int:
                                 "identity_ambiguous": True,
                                 "subject_candidates": (r.get("companies") or [])[:10]})
                 return r
-            _stage(store, run_dir, summary, "entity",
-                   {"name": args.name, "invest": args.invest, "deep": args.deep},
-                   args, _entity,
-                   lambda r: {"companies": len(r.get("companies", [])),
-                              "icp": len(r.get("icp", [])),
-                              "domains": len(r.get("domains", []))},
-                   resume=lambda: {"companies": [], "icp": [], "domains": []})
+            _ok_entity, _entity_res = _stage(
+                store, run_dir, summary, "entity",
+                {"name": args.name, "invest": args.invest, "deep": args.deep},
+                args, _entity,
+                lambda r: {"companies": len(r.get("companies", [])),
+                           "icp": len(r.get("icp", [])),
+                           "domains": len(r.get("domains", []))},
+                resume=lambda: {"companies": [], "icp": [], "domains": []})
+            # Persist the APPROVED subject references for this run: the seed
+            # step below, a resumed attempt and the durable anchor all read
+            # them, so an alias/legal-name mismatch can never drop the seeds
+            # (F10) and unapproved entities are never swept in (F06).
+            if isinstance(_entity_res, dict) and _entity_res.get("subjects"):
+                approved_refs = [s.get("ref") for s in
+                                 (_entity_res.get("subjects") or [])
+                                 if s.get("ref")]
+            else:
+                # checkpoint hit (or a resumed attempt): the entity stage did
+                # not run, so read the anchors THIS run already published
+                approved_refs = list(
+                    (jobs.read_state(run_dir) or {}).get(
+                        "approved_subject_refs") or [])
+            summary["_approved_subject_refs"] = approved_refs
+            approved_names = []
+            if isinstance(_entity_res, dict):
+                _raw_names = _entity_res.get("companies")
+                if isinstance(_raw_names, (list, tuple)):
+                    approved_names = [str(x) for x in _raw_names if x]
+                elif isinstance(_raw_names, str) and _raw_names:
+                    approved_names = [_raw_names]
+            if not approved_names:
+                # checkpoint hit: reuse the anchors this run published earlier
+                approved_names = list((jobs.read_state(run_dir) or {}).get(
+                    "approved_company_names") or [])
+            summary["_approved_company_names"] = approved_names
+            if approved_refs or approved_names:
+                _write_status(run_dir, approved_subject_refs=approved_refs,
+                              approved_company_names=approved_names)
         if args.domain:
             # User-typed input: canon_user_domain validates INTENT (private
             # TLDs like .local, bare IPs, IDN -> punycode are all legitimate
             # targets). The strict canon_domain de-noiser used to sit here and
             # silently threw 127.0.0.1:18765 / *.test / dev.corp.local away.
             for d in args.domain:
+                # An IP:port / endpoint target is NOT silently reduced to its
+                # host: the current pipeline cannot carry an explicit port
+                # through to a collection stage, and dropping the port then
+                # reporting "no seeds" hides what the caller actually asked
+                # for (F12). Report the limit and stop.
+                _endpoint_of = getattr(tools, "endpoint_of", None)
+                if _endpoint_of is not None:
+                    _ip, _port = _endpoint_of(d)
+                else:
+                    _ip, _port = None, None
+                if _ip and _port:
+                    raise core.FindInfoError(
+                        "unsupported_target_kind: '" + str(d) + "' is an "
+                        "IP:port endpoint target; this build's run path has no "
+                        "endpoint collection stage (the port would be dropped "
+                        "silently). Pass the bare IP '" + str(_ip) + "' or a "
+                        "domain instead, and probe the port with the disabled "
+                        "active stages once supported.")
                 cd = core.canon_user_domain(d)
                 if not cd:
                     raise core.FindInfoError(
@@ -1799,17 +2216,50 @@ def _run_pipeline(args) -> int:
                         "or drop the flag explicitly)")
                 domains.append(cd)
         if args.name:
+            # Seeds come from the APPROVED SUBJECT's assets, looked up through
+            # the subject reference -- never by parent == the search string.
+            # An alias or legal name that differs from the query is therefore
+            # not lost (F10), and an unapproved entity's assets are not swept in
+            # because their parent happens to be the brand text (F06).
+            subject_refs = summary.get("_approved_subject_refs") or []
+            ref_set = set(subject_refs)
             for a in store.get_assets(kind="domain", min_conf=0.9):
-                if (a.get("parent") or "") == args.name:
+                parent = a.get("parent") or ""
+                if parent in ref_set:
                     domains.append(a["canonical"])
                     _attach(store, summary, "domain", a["canonical"],
                             producer="entity", upstream="enscan",
                             route=work.ROUTE_DNS)
             for a in store.get_assets(kind="icp"):
-                if (a.get("parent") or "") == args.name:
+                parent = a.get("parent") or ""
+                if parent in ref_set:
                     icp_codes.append(a["canonical"])
                     _attach(store, summary, "icp", a["canonical"],
                             producer="entity", upstream="enscan", route=None)
+            if not subject_refs:
+                # Compatibility: a collector that predates subject references
+                # (an injected adapter, an older ENScan build) only returns
+                # `companies` and stores domains with parent=<name>. Accept
+                # that ONLY when exactly one company was approved -- with two
+                # or more candidates the assets cannot be attributed and the
+                # run must not guess (F06).
+                approved_names = summary.get("_approved_company_names") or []
+                if len(approved_names) == 1:
+                    _only = approved_names[0]
+                    for a in store.get_assets(kind="domain", min_conf=0.9):
+                        if (a.get("parent") or "") == _only and \
+                                a["canonical"] not in domains:
+                            domains.append(a["canonical"])
+                            _attach(store, summary, "domain", a["canonical"],
+                                    producer="entity", upstream="enscan",
+                                    route=work.ROUTE_DNS)
+                    for a in store.get_assets(kind="icp"):
+                        if (a.get("parent") or "") == _only and \
+                                a["canonical"] not in icp_codes:
+                            icp_codes.append(a["canonical"])
+                            _attach(store, summary, "icp", a["canonical"],
+                                    producer="entity", upstream="enscan",
+                                    route=None)
         if summary.get("_identity_ambiguous"):
             # docs par.8: launch NO downstream traffic on a guessed subject.
             # The gap is already recorded on the failed entity stage; skipping
@@ -1853,7 +2303,10 @@ def _run_pipeline(args) -> int:
                               "stderr_log": str(run_dir / "stderr.log"),
                               "spec": str(run_dir / "job.json")},
             }
-            summary.pop("_ledger", None)
+            for _private in ("_ledger", "_run_producers",
+                             "_approved_subject_refs", "_approved_company_names",
+                             "_run_public_id"):
+                summary.pop(_private, None)
             core.write_jsonl(run_dir / "summary.jsonl", [summary])
             store.finish_run(run_id, summary)
             _write_status(run_dir, stage="done", state="completed",
@@ -2257,20 +2710,15 @@ def _run_pipeline(args) -> int:
                     urls = [a["canonical"] for a in
                             store.get_assets(kind="url", min_conf=0.4, match=scope)
                             if a["canonical"].startswith("http")]
+                    # run mode: t_extract schedules and settles JS through THIS
+                    # run's work_items (the only claimable queue), committing
+                    # each result's membership + ack under its lease. The old
+                    # blind adopt of EVERY input URL is gone: HTML pages cannot
+                    # become pending JS, and a bundle that already succeeded is
+                    # never re-opened.
                     ex = tools.t_extract(store, [], urls=urls, timeout=tool_timeout,
-                                            scope=scope)
-                    # The JS backlog this run just queued adopts into the run's
-                    # durable work queue (T33): pending/failed items survive a
-                    # restart and drain in a later round instead of being
-                    # rebuilt -- and lost -- from a fresh candidates list.
-                    try:
-                        attached = work.adopt_js_backlog(
-                            store, summary["_run_public_id"], urls)
-                        if attached:
-                            core.log("js backlog: adopted " + str(attached) +
-                                     " bundle(s) into the run work queue")
-                    except Exception as exc:
-                        core.log("js backlog adopt failed: " + repr(exc)[:160])
+                                         scope=scope,
+                                         run_id=summary["_run_public_id"])
                     # Keep the deliverable findings in the summary too: the run
                     # result is what an agent reads (and what lands in
                     # summary.jsonl), and dropping them here meant the redacted
@@ -2305,6 +2753,19 @@ def _run_pipeline(args) -> int:
         # first round: membership is the round input now, so skipping this
         # would make every checkpoint hit look like "no work".
         _adopt_membership(store, summary, scope)
+        # Legacy JS rows with PROVABLE ownership (this run's membership or the
+        # run's own scope) migrate idempotently into the durable queue; a
+        # done row stays done, unknown ownership is reported and left in place.
+        try:
+            _mig = work.import_js_queue(store, summary["_run_public_id"], scope)
+            summary["js_migration"] = {"attached": _mig.get("attached", 0),
+                                       "skipped_done": _mig.get("skipped_done", 0),
+                                       "unknown": len(_mig.get("unknown") or [])}
+            if _mig.get("unknown"):
+                core.log("legacy js_queue: " + str(len(_mig["unknown"])) +
+                         " row(s) have no provable owner; left untouched")
+        except Exception as exc:
+            core.log("legacy js_queue migration failed: " + repr(exc)[:160])
         for round_no in range(1, rounds + 1):
             if time_budget and (time.monotonic() - t_start) > time_budget:
                 stop_reason = "time_budget"
@@ -2327,19 +2788,15 @@ def _run_pipeline(args) -> int:
             # bundles whose extraction would surface new domains have simply
             # not been fetched yet. Observed live: 41 candidates, budget 40,
             # one pending -- and the run still declared itself complete.
-            # The run's OWN durable queue counts the same way (T16): endpoint
-            # and JS work items are outstanding obligations, and a stable
-            # domain count never settles them.
-            try:
-                _q = store.js_stats()
-            except Exception:
-                _q = {}
-            js_pending = int(_q.get("pending") or 0) + int(_q.get("failed") or 0)
+            #
+            # run mode reads ONLY this run's durable queue: the shared legacy
+            # js_queue belongs to standalone use and would let another
+            # target's leftovers keep this run alive (or hide its own work).
             try:
                 _wq = work.queue_stats(store, summary["_run_public_id"])
-                js_pending += int(_wq.get("outstanding") or 0)
             except Exception:
-                pass
+                _wq = {}
+            js_pending = int(_wq.get("outstanding") or 0)
             if new_domains == 0 and js_pending == 0:
                 stop_reason = "no_new_assets"
             elif new_domains == 0 and js_pending > 0:
@@ -2436,9 +2893,24 @@ def _run_pipeline(args) -> int:
                                 if x not in planned],
             # Pending JS work is unfinished collection, not convergence. An
             # agent that only looks at "new domains == 0" would stop while
-            # bundles are still queued.
-            "js_queue": (store.js_stats() if hasattr(store, "js_stats") else {}),
+            # bundles are still queued. In run mode this is THIS run's durable
+            # queue (the legacy shared table would mix other targets in).
+            "js_queue": {},
         }
+        try:
+            _jsq = work.queue_stats(store, summary["_run_public_id"])
+            coverage["js_queue"] = {
+                "discovered": int(_jsq.get("done") or 0)
+                              + int(_jsq.get("outstanding") or 0),
+                "succeeded": int(_jsq.get("done") or 0),
+                "failed": int(_jsq.get("failed") or 0),
+                "pending": int(_jsq.get("pending") or 0)
+                           + int(_jsq.get("running") or 0),
+                "skipped": int(_jsq.get("blocked") or 0),
+                "source": "run_work_items",
+            }
+        except Exception:
+            pass
         # The billed-spend summary from the per-request ledger (batch F):
         # totals, per-engine requests and the blocked list the verdict reads.
         try:
@@ -2521,8 +2993,12 @@ def _run_pipeline(args) -> int:
         }
         # Private pass-through keys (the ledger object) never serialise: the
         # summary is the persisted record; the spend facts live in its
-        # metered.jsonl and the coverage.metered block above.
-        summary.pop("_ledger", None)
+        # metered.jsonl and the coverage.metered block above. Every private
+        # (underscore) field is process-only and must not reach the file.
+        for _private in ("_ledger", "_run_producers",
+                         "_approved_subject_refs", "_approved_company_names",
+                         "_run_public_id"):
+            summary.pop(_private, None)
         core.write_jsonl(run_dir / "summary.jsonl", [summary])
         store.finish_run(run_id, summary)
         _write_status(run_dir, stage="done", state="completed", stage_state="done",
@@ -2568,8 +3044,35 @@ def cmd_dry_run(args) -> int:
     if getattr(args, "resume", ""):
         try:
             spec_blob = jobs.read_spec(args.resume)
-            effective = {"source": "job.json", "run_id": spec_blob.get("run_id"),
-                        "note": "preview only: no job state is changed"}
+            # SAME effective-spec function the real resume uses: the preview
+            # shows the target, scope, stages and limits a resume would run,
+            # not this command line's parser defaults (F16).
+            preview = _resume_effective_spec(spec_blob, args)
+            eff_rs = preview.pop("_effective_spec", None)
+            if eff_rs is not None:
+                rs = eff_rs
+                active = bool(rs.active or rs.ports or rs.vhost or rs.crawl
+                              or rs.brute)
+                planned = _plan_stages(spec_mod.RunSpec(
+                    name=rs.name, domain=rs.domain, task=rs.task,
+                    active=active, ports=rs.ports, vhost=rs.vhost,
+                    crawl=rs.crawl, brute=rs.brute, no_icp=rs.no_icp,
+                    no_onepass=rs.no_onepass), active)
+            effective = {"source": "job.json",
+                         "run_id": spec_blob.get("run_id"),
+                         "attempt": spec_blob.get("attempt"),
+                         "target": rs.target_label,
+                         "scope": list(rs.domain),
+                         "planned_stages": planned,
+                         "limits": {"rounds": rs.rounds,
+                                    "time_budget_sec": rs.time_budget,
+                                    "task_timeout_sec": rs.task_timeout,
+                                    "tool_timeout_sec": rs.tool_timeout,
+                                    "engines": rs.engines},
+                         "argv": preview.get("argv"),
+                         "note": "preview only: no job state is changed"}
+        except core.FindInfoError as exc:
+            effective = {"source": "rejected", "error": str(exc)[:300]}
         except Exception as exc:
             effective = {"source": "error", "error": str(exc)[:160]}
     out({

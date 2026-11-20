@@ -254,7 +254,8 @@ def test_completed_run_then_crawl_executes():
         return {"count": len(urls), "rows": [], "truncated": False, "ok": True,
                 "rc": 0, "dropped_out_of_scope": 0, "scope": scope_domains or []}
 
-    def fake_extract(store_, rows, urls=None, timeout=0, fetch_limit=40, scope=None):
+    def fake_extract(store_, rows, urls=None, timeout=0, fetch_limit=40,
+                     scope=None, **kw):
         return {"count_domains": 0, "count_ips": 0, "fetched": 0,
                 "js_discovered": 0, "api_paths": [], "api_hosts": 0,
                 "secrets": {}, "domains": [], "ips": []}

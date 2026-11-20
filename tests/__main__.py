@@ -73,6 +73,11 @@ MODULES = [
     "tests.test_w4_identity_gate",
     "tests.test_w5_wildcard_unified",
     "tests.test_w6_worker_fencing",
+    "tests.test_batch_a_js_lease",
+    "tests.test_batch_b_jobs_wait",
+    "tests.test_batch_c_ownership",
+    "tests.test_batch_d_output_offline",
+    "tests.test_batch_e_audit_docs",
 ]
 
 

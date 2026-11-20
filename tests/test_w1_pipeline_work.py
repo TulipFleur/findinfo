@@ -163,7 +163,12 @@ def test_dns_work_items_created_and_settled_by_the_stage():
 
 # ---------------------------------------------------------------- T16
 def test_outstanding_work_keeps_run_partial():
-    """Adopted-but-undrained JS work blocks the complete verdict (T16)."""
+    """Undrained queue work blocks the complete verdict (T16).
+
+    The queue must not be blanked to force completion: a real bundle is
+    discovered, its fetch FAILS (retryable), and the run is correctly partial
+    with the item still outstanding.
+    """
     core = fresh_core()
     fresh_tools(core)
     fi = import_findinfo()
@@ -179,33 +184,27 @@ def test_outstanding_work_keeps_run_partial():
     finally:
         store.close()
 
-    def fake_extract(store, rows, urls=None, timeout=0, fetch_limit=40,
-                     scope=None):
-        # enqueue the bundle into the shared legacy queue (the write path
-        # inside t_extract); the run then adopts it into its durable queue
-        store.js_enqueue([u for u in (urls or []) if u.endswith(".js")])
-        return {"count_domains": 0, "count_ips": 0, "fetched": 0,
-                "js_discovered": 1, "js_pending": 1, "api_paths": [],
-                "api_hosts": 0, "secrets": {}, "domains": [], "ips": [],
-                "outcome": core.OUTCOME_PARTIAL}
-
     fakes = _quiet()
     fakes["t_crawl"] = lambda s, urls, depth=3, scope_domains=None, timeout=0: {
         "count": len(urls or []), "rows": [], "truncated": False, "ok": True,
         "rc": 0, "dropped_out_of_scope": 0, "scope": scope_domains or []}
-    fakes["t_extract"] = fake_extract
     fakes["t_httpx"] = lambda s, hosts, timeout=0, **kw: {
         "count": 0, "ok": True, "rc": 0, "truncated": False}
     fakes["t_ipagg"] = lambda s, **kw: {"candidates": [],
                                         "count_candidates": 0}
-    rc = _run(fi, _args(active=True, crawl=True, rounds=1), fakes)
+    # the fetch fails at the transport layer: a retryable, still-outstanding
+    # work item (never silently dropped from the obligation set)
+    with mock.patch.object(fi.tools.core, "curl",
+                           return_value=(28, "", "timeout")):
+        rc = _run(fi, _args(active=True, crawl=True, rounds=1), fakes)
     rd = _latest_run_dir(core)
     store = core.Store()
     from lib import work
     try:
         work.ensure_schema(store)
         stats = work.queue_stats(store, rd.name)
-        assert stats["pending"] >= 1, "the adopted bundle must be durable work"
+        assert stats["outstanding"] >= 1, (
+            "a failed bundle must stay outstanding (retryable)", stats)
     finally:
         store.close()
     summary = json.loads((rd / "summary.jsonl").read_text(
@@ -216,43 +215,37 @@ def test_outstanding_work_keeps_run_partial():
 
 
 # ---------------------------------------------------------------- T33 bridge
-def test_js_backlog_adopts_into_run_queue():
-    """URL assets this run queues become durable run work (T33)."""
+def test_html_is_not_queued_as_js_work():
+    """Only real JS bundles become work; HTML pages never do."""
     core = fresh_core()
     fresh_tools(core)
     fi = import_findinfo()
+    page = "https://mt-a.example.com/"
     bundle = "https://mt-a.example.com/bundle.js"
-    # a previous round left the crawl URL in the scoped graph: attrs.url is
-    # what feeds the crawl stage, and the url row feeds extract's work set
     store = core.Store()
     try:
         store.upsert_asset("domain", "mt-a.example.com", source="seed:user",
                            confidence=0.5, passivity="passive",
-                           attrs={"url": "https://mt-a.example.com/"})
-        store.upsert_asset("url", bundle, source="katana",
-                           confidence=0.7, parent="mt-a.example.com",
-                           attrs={"url": bundle})
+                           attrs={"url": page})
+        store.upsert_asset("url", page, source="katana", confidence=0.7,
+                           parent="mt-a.example.com", attrs={"url": page})
+        store.upsert_asset("url", bundle, source="katana", confidence=0.7,
+                           parent="mt-a.example.com", attrs={"url": bundle})
     finally:
         store.close()
-
-    def fake_extract(store, rows, urls=None, timeout=0, fetch_limit=40,
-                     scope=None):
-        store.js_enqueue([u for u in (urls or []) if u.endswith(".js")])
-        return {"count_domains": 0, "count_ips": 0, "fetched": 0,
-                "js_discovered": 1, "js_pending": 1, "api_paths": [],
-                "api_hosts": 0, "secrets": {}, "domains": [], "ips": [],
-                "outcome": core.OUTCOME_OK}
 
     fakes = _quiet()
     fakes["t_crawl"] = lambda s, urls, depth=3, scope_domains=None, timeout=0: {
         "count": len(urls or []), "rows": [], "truncated": False, "ok": True,
         "rc": 0, "dropped_out_of_scope": 0, "scope": scope_domains or []}
-    fakes["t_extract"] = fake_extract
     fakes["t_httpx"] = lambda s, hosts, timeout=0, **kw: {
         "count": 0, "ok": True, "rc": 0, "truncated": False}
     fakes["t_ipagg"] = lambda s, **kw: {"candidates": [],
                                         "count_candidates": 0}
-    rc = _run(fi, _args(active=True, crawl=True, rounds=1), fakes)
+    # the HTTP fetch is an injected adapter too: no real socket, deterministic
+    with mock.patch.object(fi.tools.core, "curl",
+                           return_value=(0, "var a=1;fetch('/api/v1/x')", "")):
+        rc = _run(fi, _args(active=True, crawl=True, rounds=1), fakes)
     rd = _latest_run_dir(core)
     store = core.Store()
     from lib import work
@@ -263,5 +256,11 @@ def test_js_backlog_adopts_into_run_queue():
             " AND stage=?", (rd.name, work.ROUTE_JS)).fetchall()
     finally:
         store.close()
-    assert [r["canonical"] for r in items] == [bundle], (
-        "the run's JS bundle must adopt into the durable queue", [dict(r) for r in items])
+    queued = [r["canonical"] for r in items]
+    assert queued == [bundle], (
+        "the HTML page must NOT be JS work; only the bundle may be", queued)
+    # the fetched bundle succeeded, so the queue drains to zero
+    assert rc == 0, "a successfully drained run is complete"
+    summary = json.loads((rd / "summary.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert summary["coverage"]["work_queue"]["outstanding"] == 0, summary["coverage"]
