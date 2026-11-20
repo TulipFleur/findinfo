@@ -217,6 +217,114 @@ class _FileLock:
         return False
 
 
+
+# ------------------------------------------------------- subject and scope
+def resolve_entity_identity(raw: str, candidates: list,
+                            explicit_domains: list) -> dict:
+    """Decide whether a brand resolves to ONE subject before any traffic.
+
+    A short brand match can produce CANDIDATE subjects, not automatic
+    ownership (docs/RELIABILITY-PLAN.md par.8). When more than one plausible
+    subject exists and no explicit seed disambiguates, the caller must stop
+    with identity_ambiguous + input-required next steps: launching discovery
+    on a guessed target would probe the wrong company. An explicit seed
+    (user-typed domain) anchors the run without the brand at all.
+    """
+    seed = [d for d in (explicit_domains or []) if d]
+    if seed:
+        return {"status": "ok", "subject_id": None, "basis": "explicit seed",
+                "retryable": False, "next_steps": []}
+    names = [c.get("name") or "" for c in (candidates or [])]
+    exact = [c for c in (candidates or []) if c.get("name") == raw]
+    if len(exact) == 1:
+        return {"status": "ok", "subject_id": exact[0].get("id"),
+                "basis": "unique exact match", "retryable": False,
+                "next_steps": []}
+    if len(set(names)) > 1 or len(exact) > 1:
+        return {"status": "identity_ambiguous", "subject_id": None,
+                "basis": "%d plausible subject(s)" % len(set(names)),
+                "retryable": False,
+                "next_steps": ["input required: provide an explicit "
+                               "--domain or the exact registered company "
+                               "name, then start a new run"]}
+    if not candidates:
+        return {"status": "no_match", "subject_id": None,
+                "basis": "no subject answered for the brand",
+                "retryable": False,
+                "next_steps": ["check the brand name, or seed with --domain"]}
+    return {"status": "ok", "subject_id": candidates[0].get("id"),
+            "basis": "single candidate", "retryable": False,
+            "next_steps": []}
+
+
+def seeds_for_subject(store, subject_id: str) -> list:
+    """Domain seeds anchored to one subject, by reference not by alias.
+
+    The store keys ENScan rows by parent=<subject id>; a later display-name
+    change (or the brand never matching the legal name, T07) must not
+    orphan the seeds, so the lookup goes through the subject reference.
+    """
+    return [a["canonical"] for a in store.get_assets(kind="domain")
+            if (a.get("parent") or "") == subject_id]
+
+
+def evidence_grants_scope(store, canonical: str, scope: list) -> bool:
+    """Whether an asset may ENTER the active stages for this scope.
+
+    Only explicit user scope does (T12): suffix membership. Evidence links
+    (a related SAN, a same-IP neighbour, a co-issued certificate) are kept
+    as evidence rows -- they never widen the active scope on their own.
+    """
+    return core.in_scope(canonical, scope)
+
+
+def endpoint_of(value: str):
+    """(ip, port|None) of a bare IP or ip:port target (T13).
+
+    The port is preserved exactly: 203.0.113.10:8443 is an endpoint target,
+    and normalising it to a hostname would drop the only property the user
+    actually gave.
+    """
+    text = str(value or "").strip().strip("[]")
+    if ":" in text:
+        host, _, port = text.rpartition(":")
+        host = host.strip("[]")
+        if host and port.isdigit() and 0 < int(port) < 65536:
+            ip = core.canon_ip(host)
+            if ip:
+                return ip, int(port)
+        return None, None
+    ip = core.canon_ip(text)
+    return (ip, None) if ip else (None, None)
+
+
+def classify_negative(answer: dict) -> str:
+    """Distinguish every non-answer from an authoritative NXDOMAIN (T15).
+
+    fake_ip      -- a synthetic resolver address (198.18.0.0/15): proof of
+                    a lying resolver, never a verdict about the name;
+    transient    -- no answer at all (timeout/NODATA with nothing else): an
+                    open question a later round may answer;
+    cname_only   -- a CNAME chain that must be resolved further, not judged;
+    resolved     -- an ordinary address exists.
+    Only an explicit NXDOMAIN rcode settles a name as absent (see
+    classify_nxdomain); none of these states may.
+    """
+    ans = answer or {}
+    ips = [x for x in (ans.get("a") or []) if x]
+    if any(doh.is_fake_ip(x) for x in ips):
+        return "fake_ip"
+    if ips:
+        return "resolved"
+    if ans.get("cname"):
+        return "cname_only"
+    return "transient"
+
+
+def classify_nxdomain(answer: dict) -> bool:
+    """True only for an authoritative NXDOMAIN rcode (T15)."""
+    return bool((answer or {}).get("rcode") == 3)
+
 def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
              outdir: Path | None = None, timeout: int = 0,
              field: str = "icp,app,wx_app,wechat,copyright,invest,enterprise_info",

@@ -66,6 +66,101 @@ def filter_fake_ips(values) -> tuple[list[str], list[str]]:
     return kept, dropped
 
 
+
+# ---------------------------------------------------------------- wildcard
+# One representation for "this parent answers any label", shared by dnsx,
+# the system resolver and DoH. The two resolver paths used to keep TWO shapes:
+# the dnsx path keyed by registrable_domain("example.com") while the DoH path
+# keyed by a split of the probe name ("wild.example.com" -- the probe label
+# was part of the key), so the same zone was two unrelated entries and a name
+# seen by one path was never filtered by the other's evidence.
+PROBE_LABEL = "findinfo-wildcard-probe"
+
+
+def wildcard_parent(name: str, probe_prefix: str = "") -> str | None:
+    """Registrable parent of a wildcard probe answer, as ONE stable key.
+
+    findinfo-wildcard-probe-9f3a.wild.example.com and the plain probe both
+    reduce to example.com: the key is what the zone answers FOR, never the
+    probe label itself.
+    """
+    import re as _re
+    host = (name or "").strip().lower().rstrip(".")
+    if probe_prefix and host.startswith(probe_prefix):
+        host = host[len(probe_prefix):]
+    if host.count(".") >= 2:
+        host = _re.sub(r"^[a-z0-9-]+\.", "", host, count=1)
+    from . import core as _core
+    return _core.registrable_domain(host) or None
+
+
+def wildcard_probe_names(parents, count_per_parent: int = 2) -> list:
+    """Unpredictable probe names under each parent (more than one, per plan).
+
+    Multiple probes distinguish "answers any label" from "happens to answer
+    this one random name"; one lucky hit is not a signature.
+    """
+    import secrets
+    out = []
+    for p in parents:
+        for _ in range(max(1, count_per_parent)):
+            out.append("%s-%s.%s" % (PROBE_LABEL, secrets.token_hex(6), p))
+    return out
+
+
+def new_wildcard_evidence() -> dict:
+    """dict keyed by registrable parent -> {ip, cname, count, fake, probes}.
+
+    A timeout or a fake-IP answer cannot establish a valid signature
+    (docs par.9): a fake address is recorded under fake for the report, but
+    it does not make the parent a wildcard for filtering purposes.
+    """
+    return {}
+
+
+def record_wildcard_probe(evidence: dict, parent: str, answer: dict) -> None:
+    """Fold ONE probe answer into the shared evidence dict.
+
+    answer is a resolver row {a: [...], cname: [...]}: ordinary A/AAAA/CNAME
+    answers count toward the signature; a fake IP is evidence of a synthetic
+    resolver, not of the zone.
+    """
+    ips = [x for x in (answer.get("a") or []) if x and not is_fake_ip(x)]
+    fake = [x for x in (answer.get("a") or []) if x and is_fake_ip(x)]
+    cnames = [x for x in (answer.get("cname") or []) if x]
+    row = evidence.setdefault(parent, {"ip": "", "cname": "", "count": 0,
+                                       "fake": "", "probes": 0})
+    row["probes"] += 1
+    if ips:
+        row["ip"] = ips[0]
+        row["count"] += 1
+    if cnames:
+        row["cname"] = cnames[0]
+    if fake and not row["fake"]:
+        row["fake"] = fake[0]
+
+
+def wildcard_signature_complete(evidence: dict, parent: str,
+                                needed: int = 2) -> bool:
+    """True when the parent answered >=needed distinct ordinary probes.
+
+    One shared address from one probe is a hint, not a signature (par.9:
+    matching one wildcard address is insufficient when the candidate carries
+    additional independent evidence).
+    """
+    row = evidence.get(parent) or {}
+    return int(row.get("count") or 0) >= max(1, needed)
+
+
+def wildcard_answer_matches(evidence: dict, parent: str, ips) -> bool:
+    """Whether a candidate's addresses are ONLY the wildcard's own answer."""
+    row = evidence.get(parent) or {}
+    wc = row.get("ip") or ""
+    if not wc:
+        return False
+    return bool(ips) and all(str(ip).strip() == wc for ip in (ips or []))
+
+
 def fake_ip_in(answers) -> str:
     """First fake address found in `answers`, or "" when none.
 
