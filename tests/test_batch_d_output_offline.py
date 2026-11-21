@@ -315,3 +315,59 @@ def test_offline_plan_matches_the_runtime_planner():
         rs = spec_mod.from_cli(ns)
         assert fi._plan_stages_pure(rs, active) == fi._plan_stages(ns, active), (
             "pure planner drifted", flags)
+
+
+def test_brief_carries_the_run_verdict_not_just_findings():
+    """A partial run must say so in the brief, not only in status.
+
+    Real CLI exposed this: `brief --run` showed counts and unavailable
+    sources but no complete/partial_stages/result_status, so an agent reading
+    only the brief could not tell a partial run from a clean one.
+    """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import json as _json
+    home = tempfile.mkdtemp(prefix="fi-brief-verdict-")
+    try:
+        # fabricate a finished run whose coverage says partial
+        runs = os.path.join(home, "runs")
+        rid = "20261121-120000-mt-a.example.com"
+        run_dir = os.path.join(runs, rid)
+        os.makedirs(run_dir, exist_ok=True)
+        status = {"run_id": rid, "state": "completed", "seq": 9,
+                  "attempt": 1,
+                  "result": {"status": "partial",
+                             "reason": "partial_stages:onepass"},
+                  "coverage": {"complete": False, "source": rid, "known": True,
+                               "failed_stages": [], "not_run_stages": [],
+                               "skipped_stages": [],
+                               "partial_stages": [{"stage": "onepass",
+                                                   "outcome": "partial"}],
+                               "unavailable": {}, "stop_reason": "no_new_assets"}}
+        with open(os.path.join(run_dir, "status.json"), "w",
+                  encoding="utf-8") as fh:
+            _json.dump(status, fh)
+        env = dict(os.environ, FINDINFO_HOME=home, FINDINFO_TASK="")
+        env.pop("FINDINFO_RUN_DIR", None)
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "findinfo.py"), "--home", home,
+             "brief", "--run", rid],
+            capture_output=True, text=True, encoding="utf-8", env=env,
+            timeout=120)
+        lines = [l for l in (proc.stdout or "").splitlines()
+                 if l.strip().startswith("{")]
+        assert lines, proc.stdout + proc.stderr
+        payload = _json.loads(lines[0])
+        cov = payload.get("coverage") or {}
+        assert cov.get("complete") is False, cov
+        assert cov.get("partial_stages") == [{"stage": "onepass",
+                                              "outcome": "partial"}], cov
+        assert cov.get("result_status") == "partial", cov
+        assert "onepass" in str(cov.get("result_reason")), cov
+        # the private carriers used to move the verdict never leak
+        assert not [k for k in cov if k.startswith("_")], cov
+    finally:
+        import shutil
+        shutil.rmtree(home, ignore_errors=True)

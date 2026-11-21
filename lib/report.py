@@ -1525,6 +1525,28 @@ def _brief_coverage(data=None, coverage=None):
         "unavailable": unavailable[:BRIEF_MAX_COVERAGE],
         "unavailable_total": len(unavailable),
     }
+    # A brief that lists findings but omits the run's own verdict reads as a
+    # clean result. These fields are what tell an agent "partial, because
+    # these stages under-collected" -- the most action-relevant fact after
+    # the counts. Carried verbatim when the run's coverage block has them.
+    for key in ("complete", "requested_complete", "stop_reason", "reason",
+                "partial_stages", "stage_states", "work_queue", "js_queue"):
+        if key in cov and cov.get(key) is not None:
+            out[key] = cov[key]
+    res = (data or {}).get("result") if isinstance(data, dict) else None
+    if isinstance(res, dict) and res.get("status"):
+        out["result_status"] = res.get("status")
+        if res.get("reason"):
+            out["result_reason"] = res.get("reason")
+    # _run_coverage attaches the run's verdict to the coverage block it read
+    # (the digest has no result of its own -- it describes the library, not a
+    # run). Promote those, then never leak the private carriers.
+    if out.get("result_status") is None and cov.get("_result_status"):
+        out["result_status"] = cov.get("_result_status")
+        if cov.get("_result_reason"):
+            out["result_reason"] = cov.get("_result_reason")
+    for _priv in ("_result_status", "_result_reason", "_result_attempt"):
+        out.pop(_priv, None)
     if blocking:
         # A blocking gap is what explains a partial run, so it gets its own
         # top-level entry instead of hiding in unavailable as reason=True.

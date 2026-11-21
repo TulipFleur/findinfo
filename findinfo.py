@@ -641,7 +641,19 @@ def _run_coverage(run_id: str) -> dict:
     except Exception:
         return {}
     cov = st.get("coverage") or (st.get("result") or {}).get("coverage") or {}
-    return dict(cov) if isinstance(cov, dict) else {}
+    out = dict(cov) if isinstance(cov, dict) else {}
+    # The run's OWN verdict belongs with its gaps: a brief that shows the
+    # findings but not "partial, because these stages under-collected" reads
+    # as a clean result. Kept under distinct keys so select_coverage/report
+    # keep their existing shape.
+    res = st.get("result") if isinstance(st.get("result"), dict) else {}
+    if res.get("status"):
+        out["_result_status"] = res.get("status")
+    if res.get("reason"):
+        out["_result_reason"] = res.get("reason")
+    if res.get("attempt"):
+        out["_result_attempt"] = res.get("attempt")
+    return out
 
 
 def _latest_run_for_match(match: list[str], task: str) -> str:
