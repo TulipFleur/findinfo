@@ -1584,6 +1584,134 @@ def t_dns(store, domains: list[str], timeout: int = 0,
 
 
 # ---------------------------------------------------------------- 6. httpx probe
+_CHARSET_RE = re.compile(rb"""charset\s*=\s*["']?\s*([\w.:-]+)""", re.I)
+_TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def decode_page_text(raw: bytes) -> str:
+    """Decode response bytes using the page's OWN charset, then sensible fallbacks.
+
+    httpx decodes bodies as UTF-8 unless the response declares something else,
+    so a Chinese site with a GBK page and NO charset meta came back with U+FFFD
+    in `title` ('������Ϣְҵ����ѧԺ' instead of 湖南信息职业技术学院 -- observed
+    on mail.mail.hniu.cn / xs.hniu.cn / mail.xs.hniu.cn). Replacement
+    characters are lossy: the original bytes are gone, so the repair has to
+    happen where the bytes still exist -- the raw body.
+    """
+    if not raw:
+        return ""
+    order: list = []
+    m = _CHARSET_RE.search(raw[:4096])
+    if m:
+        try:
+            order.append(m.group(1).decode("ascii").strip().lower())
+        except Exception:
+            pass
+    order += ["utf-8", "gb18030", "cp936", "big5"]
+    seen = set()
+    for enc in order:
+        key = enc.replace("-", "").replace("_", "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if key in ("gb2312", "gbk"):
+            enc = "gb18030"          # superset; GBK bytes decode identically
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def title_from_body(b64_body: str | None) -> str:
+    """The page's <title>, decoded with the page's own charset ("" if absent)."""
+    if not b64_body:
+        return ""
+    try:
+        import base64
+        raw = base64.b64decode(b64_body)
+    except Exception:
+        return ""
+    m = _TITLE_RE.search(raw or b"")
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", decode_page_text(m.group(1)).strip())[:200]
+
+
+def _usable_title(title: str) -> bool:
+    """A title httpx produced is usable only when it carries no U+FFFD."""
+    t = (title or "").strip()
+    return bool(t) and "\ufffd" not in t
+
+
+def repair_broken_titles(store, hosts=None, scope=None, timeout: int = 0,
+                         limit: int = 200) -> dict:
+    """Re-fetch titles that an earlier decode destroyed (U+FFFD in the store).
+
+    A U+FFFD title cannot be repaired from the store -- the original bytes are
+    gone. The only honest fix is another fetch, decoded with the page's own
+    charset, so this is a CLI-reachable maintenance entry
+    (`probe --repair-titles`) rather than something an operator must do by
+    hand with the raw binary.
+
+    Hosts left unreachable are REPORTED, not silently dropped: their titles
+    stay broken and the caller has to know why.
+    """
+    scope_list = core.canon_scope(scope or [])
+    candidates: list = []
+    for a in store.get_assets(kind="domain", match=scope_list or None):
+        attrs = a.get("attrs") or {}
+        title = attrs.get("title") or ""
+        if "\ufffd" in title:
+            candidates.append(a["canonical"])
+    if hosts:
+        want = {h for h in hosts if h}
+        candidates = [h for h in candidates if h in want]
+    candidates = _uniq(candidates)[:max(1, int(limit))]
+    if not candidates:
+        return {"checked": 0, "repaired": 0, "unreachable": [],
+                "note": "no stored title contains U+FFFD"}
+    repaired: dict = {}
+    unreachable: list = []
+    for host in candidates:
+        got = ""
+        try:
+            _rc, out_s, _err = core.run([
+                core.tool("httpx"), "-u", host, "-silent", "-json",
+                "-sc", "-title", "-irrb", "-timeout", "15"],
+                timeout=(timeout or 60))
+        except Exception:
+            out_s = ""
+        for ln in (out_s or "").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            t = title_from_body(r.get("body"))
+            if _usable_title(t):
+                got = t
+                break
+        if not got:
+            unreachable.append(host)
+            continue
+        repaired[host] = got
+        try:
+            store.upsert_asset("domain", host, source="httpx-title-repair",
+                               confidence=0.8, passivity="active",
+                               attrs={"title": got})
+        except Exception:
+            unreachable.append(host)
+            repaired.pop(host, None)
+    core.log("title repair: " + str(len(repaired)) + " fixed, " +
+             str(len(unreachable)) + " unreachable")
+    return {"checked": len(candidates), "repaired": len(repaired),
+            "repaired_hosts": repaired, "unreachable": unreachable,
+            "note": ("unreachable hosts keep their broken title: the page "
+                     "could not be re-read, so nothing was invented")}
+
 def t_httpx(store, hosts: list[str], timeout: int = 0,
             scope: list[str] | None = None) -> dict:
     """Probe hosts and read the certificate each one serves.
@@ -1677,6 +1805,50 @@ def t_httpx(store, hosts: list[str], timeout: int = 0,
                                   title=title)
 
     rc, lines, err = core.run_stream(cmd, handle, timeout=timeout)
+    # ---- repair undecodable titles ---------------------------------------
+    # httpx decodes a body as UTF-8 unless it declares a charset, so a GBK page
+    # with no meta yields U+FFFD in `title` and the real characters are lost.
+    # Re-fetch ONLY the affected hosts with -irrb (raw body), decode the
+    # <title> with the page's own charset, and patch both the display row and
+    # the staged store write. UTF-8/ASCII pages never take this path.
+    _bad = [h for (h, _ip, _u, _a, _s, t) in staged if not _usable_title(t)]
+    if _bad:
+        core.log("httpx: " + str(len(_bad)) +
+                 " host(s) returned an undecodable title; re-reading raw body")
+        fixed: dict = {}
+        for _h in _bad[:200]:
+            try:
+                rc2, lines2, err2 = core.run([
+                    core.tool("httpx"), "-u", _h, "-silent", "-json",
+                    "-sc", "-title", "-irrb", "-timeout", "10"],
+                    timeout=timeout or 60)
+            except Exception as exc:
+                core.log("httpx title repair failed for " + _h + ": " +
+                         repr(exc)[:120])
+                continue
+            for _ln in (lines2 or "").splitlines():
+                _ln = _ln.strip()
+                if not _ln:
+                    continue
+                try:
+                    _r = json.loads(_ln)
+                except Exception:
+                    continue
+                _t = title_from_body(_r.get("body"))
+                if _usable_title(_t):
+                    fixed[_h] = _t
+                    break
+        if fixed:
+            for _i, _item in enumerate(staged):
+                if _item[0] in fixed:
+                    _attrs = dict(_item[3])
+                    _attrs["title"] = fixed[_item[0]]
+                    staged[_i] = (_item[0], _item[1], _item[2], _attrs,
+                                  _item[4], fixed[_item[0]])
+            for _rec in rows:
+                if _rec.get("host") in fixed:
+                    _rec["title"] = fixed[_rec["host"]]
+            core.log("httpx: repaired " + str(len(fixed)) + " title(s)")
     for item in staged:
         live(item)
     # ---- certificate names -> dns queue / related assets ------------------

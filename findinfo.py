@@ -510,7 +510,16 @@ def cmd_probe(args) -> None:
         hosts = args.host or []
         if args.from_store or not hosts:
             hosts = _domains_from_store(store, args.min_conf, args.scope)
-        out(tools.t_httpx(store, hosts, timeout=args.tool_timeout))
+        res = tools.t_httpx(store, hosts, timeout=args.tool_timeout)
+        if getattr(args, "repair_titles", False):
+            # Re-read titles the OLD decode pipeline destroyed. Those rows
+            # hold U+FFFD, which is lossy: the only way back is another fetch
+            # of the page body, decoded with the page's own charset. Without
+            # this entry an operator had to reach for the raw binary.
+            res["title_repair"] = tools.repair_broken_titles(
+                store, hosts if args.host else None,
+                scope=args.scope, timeout=args.tool_timeout)
+        out(res)
     finally:
         store.close()
 
@@ -937,6 +946,27 @@ def _seen_span(rows: list[dict]) -> dict:
 def cmd_assets(args) -> None:
     store = core.Store()
     try:
+        if getattr(args, "export_xlsx", ""):
+            # Spreadsheet export for humans reviewing an engagement in Excel.
+            # Scope comes from --match (the same suffix filter as `assets`),
+            # and the notes sheet states the filter so a scoped workbook is
+            # never read as "everything the library holds".
+            from lib import xlsx_export
+            scope = core.canon_scope(getattr(args, "match", None) or [])
+            kinds = None
+            if args.kind != "all":
+                kinds = [args.kind]
+            try:
+                res = xlsx_export.write_workbook(
+                    args.export_xlsx, store, scope=scope,
+                    min_conf=args.min_conf, kinds=kinds,
+                    notes=[("计数口径",
+                            "范围过滤后仍可能是共享库的一部分；"
+                            "全库计数见 assets（不带 --match）")])
+            except RuntimeError as exc:
+                raise core.FindInfoError(str(exc)) from None
+            out(dict(res, counts=store.count_assets()))
+            return
         if args.export:
             kind = None if args.kind == "all" else args.kind
             rows = store.get_assets(kind=kind, min_conf=args.min_conf)
@@ -3295,6 +3325,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--from-store", action="store_true")
     pr.add_argument("--min-conf", type=float, default=0.7)
     pr.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    pr.add_argument("--repair-titles", action="store_true",
+                    help="also re-read stored titles that contain U+FFFD (a "
+                         "page decoded with the wrong charset under an older "
+                         "build) and rewrite them from the raw page bytes; "
+                         "unreachable hosts are reported, never guessed")
     _add_tool_timeout(pr)
     pr.set_defaults(func=cmd_probe)
 
@@ -3353,7 +3388,14 @@ def build_parser() -> argparse.ArgumentParser:
                      choices=["all", "company", "icp", "domain", "ip", "url", "endpoint"])
     as_.add_argument("--min-conf", type=float, default=0.0)
     as_.add_argument("--limit", type=int, default=500)
+    as_.add_argument("--match", action="append",
+                     help="limit to these domain suffixes (repeatable); used by "
+                          "--export-xlsx so a workbook stays inside one target")
     as_.add_argument("--export", default="")
+    as_.add_argument("--export-xlsx", default="", metavar="PATH",
+                     help="write an .xlsx workbook (one sheet per asset kind) "
+                          "instead of JSONL; combine with --match to scope it "
+                          "and --kind to pick a single sheet")
     as_.set_defaults(func=cmd_assets)
 
     rp = sub.add_parser("report", help="human deliverables: report.md + report.html (agent reads use `brief`)")

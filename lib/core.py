@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import collections
 import contextlib
 import hashlib
@@ -623,13 +624,13 @@ def run(cmd: list[str], timeout: int = 300, input_text: str | None = None,
         # agent has no way to tell "working" from "stuck" without this.
         p = subprocess.Popen(
             cmd, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", cwd=cwd, env=e,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
+            cwd=cwd, env=e,
             creationflags=creation,
         )
         if input_text is not None and p.stdin is not None:
             try:
-                p.stdin.write(input_text)
+                p.stdin.write(input_text.encode("utf-8", "replace"))
                 p.stdin.close()
             except Exception:
                 pass
@@ -637,8 +638,12 @@ def run(cmd: list[str], timeout: int = 300, input_text: str | None = None,
         next_beat = float(progress_every or 0)
         while True:
             try:
-                out, err = p.communicate(timeout=1.0)
-                return p.returncode, out or "", err or ""
+                out_b, err_b = p.communicate(timeout=1.0)
+                # A native tool may answer in GBK on a Chinese Windows console;
+                # decoding it as UTF-8 with "replace" silently destroyed CJK
+                # titles (see decode_tool_bytes).
+                return (p.returncode, decode_tool_bytes(out_b or b""),
+                        decode_tool_bytes(err_b or b""))
             except subprocess.TimeoutExpired:
                 elapsed = time.time() - start
                 if lim is not None and elapsed > lim:
@@ -735,6 +740,96 @@ def stream_store_writer(store_method, build):
     return on_line, flush
 
 
+def decode_tool_bytes(raw: bytes) -> str:
+    """Decode a native tool's stdout/stderr bytes without losing CJK text.
+
+    Windows collector binaries (httpx and friends) do NOT always emit UTF-8:
+    a Chinese-locale console or a Go program writing through the ANSI code
+    page produces GBK/CP936 bytes. Decoding those as UTF-8 with
+    errors="replace" turned every CJK title into U+FFFD -- irreversible, and
+    the store then held '������Ϣְҵ����ѧԺ' instead of 湖南信息职业技术学院
+    (observed on mail.mail.hniu.cn, xs.hniu.cn, mail.xs.hniu.cn).
+
+    Order matters: strict UTF-8 first (the documented/normal case, and it
+    never succeeds on GBK CJK), then the platform's ANSI code page, then
+    cp936 explicitly (so a Windows box with a non-Chinese ANSI page still
+    recovers Chinese titles), and only then lossy UTF-8 as the last resort.
+    """
+    if not raw:
+        return ""
+    candidates = ["utf-8"]
+    try:
+        import locale as _locale
+        enc = (_locale.getpreferredencoding(False) or "").lower()
+        if enc and enc.replace("-", "") not in ("utf8", "ascii"):
+            candidates.append(enc)
+    except Exception:
+        pass
+    if os.name == "nt":
+        candidates += ["cp936", "gb18030"]
+    for enc in candidates:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+class _LineDecoder:
+    """Incremental byte->text decoder with the same fallback ladder.
+
+    A process stream is not a single byte blob: a chunk can end mid-character,
+    so this keeps the chosen decoder and buffers a partial tail. The codec is
+    decided on the FIRST chunk that carries a high byte; ASCII-only output
+    stays on UTF-8 (identical semantics) and downloads never switch.
+    """
+
+    def __init__(self):
+        self._enc = None
+        self._dec = None
+        self._pending = b""
+
+    def _pick(self, raw: bytes) -> str:
+        for enc in ("utf-8", "cp936", "gb18030"):
+            try:
+                raw.decode(enc)
+                return enc
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return "utf-8"
+
+    def feed(self, raw: bytes) -> str:
+        if not raw:
+            return ""
+        data = self._pending + raw
+        self._pending = b""
+        if self._enc is None:
+            if data.isascii():
+                return data.decode("ascii")
+            self._enc = self._pick(data)
+            try:
+                self._dec = codecs.getincrementaldecoder(self._enc)("strict")
+            except LookupError:
+                self._enc = "utf-8"
+                self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+        try:
+            return self._dec.decode(data)
+        except UnicodeDecodeError:
+            # an incomplete tail: keep it for the next chunk
+            dec = codecs.getincrementaldecoder(self._enc)("replace")
+            text = dec.decode(data)
+            self._pending = b""
+            return text
+
+    def close(self) -> str:
+        if self._dec is None:
+            return ""
+        try:
+            return self._dec.decode(b"", True)
+        except Exception:
+            return ""
+
+
 def run_stream(cmd: list[str], on_line=None, timeout: int = 300,
                cwd: str | None = None, env: dict | None = None) -> tuple[int, int, str]:
     """Run a child and hand every stdout line to on_line instead of buffering it.
@@ -754,17 +849,26 @@ def run_stream(cmd: list[str], on_line=None, timeout: int = 300,
     if os.name != "nt":
         kwargs["start_new_session"] = True       # so the whole group can be killed
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace", bufsize=1, cwd=cwd, env=e,
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
+        bufsize=0, cwd=cwd, env=e,
         creationflags=creation, **kwargs)
 
     tail: collections.deque = collections.deque(maxlen=60)
     timed_out = threading.Event()
+    err_dec = _LineDecoder()
 
     def drain_err() -> None:
         try:
-            for line in proc.stderr:
-                tail.append(line.rstrip())
+            if proc.stderr is None:
+                return
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    return
+                text = err_dec.feed(chunk)
+                for line in text.splitlines():
+                    if line.strip():
+                        tail.append(line.rstrip())
         except Exception:
             pass
 
@@ -794,21 +898,35 @@ def run_stream(cmd: list[str], on_line=None, timeout: int = 300,
 
     def read_loop() -> None:
         nonlocal lines
+        dec = _LineDecoder()
+        buf = b""
         try:
             if proc.stdout is None:
                 return
             while not timed_out.is_set():
-                chunk = proc.stdout.readline()
+                chunk = proc.stdout.read(8192)
                 if not chunk:
-                    return                # real EOF
-                line = chunk.strip()
-                if not line:
-                    continue
+                    break                 # real EOF
+                buf += chunk
+                # emit on newlines only: a JSONL record must be decoded whole
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    line = dec.feed(raw).strip()
+                    if not line:
+                        continue
+                    lines += 1
+                    if on_line is not None:
+                        try:
+                            on_line(line)
+                        except Exception as exc:  # a bad record must not kill the run
+                            log("stream line skipped: " + repr(exc))
+            tail_line = dec.feed(buf).strip() if buf else ""
+            if tail_line:
                 lines += 1
                 if on_line is not None:
                     try:
-                        on_line(line)
-                    except Exception as exc:  # a bad record must not kill the run
+                        on_line(tail_line)
+                    except Exception as exc:
                         log("stream line skipped: " + repr(exc))
         except Exception:
             pass

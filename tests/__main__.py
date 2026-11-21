@@ -78,6 +78,7 @@ MODULES = [
     "tests.test_batch_c_ownership",
     "tests.test_batch_d_output_offline",
     "tests.test_batch_e_audit_docs",
+    "tests.test_title_encoding",
 ]
 
 
