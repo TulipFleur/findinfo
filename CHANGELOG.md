@@ -29,7 +29,8 @@
   dispatch_seq 排序；审计区分真实重复派发与日志重放、provider_http/native_dispatch
   单位、未结算状态；IP:port 目标明确报 unsupported_target_kind；同步 SKILL/AGENT/
   TOOLS/DATA-MODEL。
-- **真实测试修正**（`b770666`；前序 docs 同步见 `8ad6493`；状态锁被慢速存活持有者误抢的修复见 `0853ce4`，changelog 补引见 `3e980b2`、`a2030be`、`2d60688`；方案与审查文档入库见 `9951c97`；brief 补带 run 自身判定（complete/partial_stages/result_status）见 `6fd7ab2`）。对湖南信息职业技术学院
+- **真实测试修正**（`b770666`；前序 docs 同步见 `8ad6493`；状态锁被慢速存活持有者误抢的修复见 `0853ce4`，changelog 补引见 `3e980b2`、`a2030be`、`2d60688`；方案与审查文档入库见 `9951c97`；brief 补带 run 自身判定（complete/partial_stages/result_status）见 `6fd7ab2`；changelog 补引见 `cbb209f`、`376473b`）。
+- **页面标题按页面自身编码解码；新增 xlsx 导出**（`f6e48d6`、`0350465`）。hniu.cn 的 mail.mail.hniu.cn / xs.hniu.cn / mail.xs.hniu.cn 标题曾被存成 `������Ϣְҵ����ѧԺ`：页面是 GBK 且未声明 charset，httpx 按 UTF-8 解码产生 U+FFFD，属不可逆损坏。现按「页面声明 charset → utf-8 → gb18030 → cp936 → big5」解码；标题含 U+FFFD 的主机才额外取 `-irrb` 原始 body 重解；同时修掉 run/run_stream 固定 utf-8 读取原生工具输出（Windows 控制台 cp936）的同类问题；新增 `probe --repair-titles` 修复库内已损坏标题，不可达主机如实报告不猜。另新增 `assets --export-xlsx`：按资产类型分 sheet（域名/IP/URL/公司/备案/端点）并写说明页记录范围与计数；openpyxl 缺失时给结构化报错。对湖南信息职业技术学院
   实测发现并修复：旧任务 checkpoint 命中时因缺少 subject ref 丢种子；缺可选密钥时
   icp 被误判为阶段失败并导致 exit 5；resume 后 percent 超过 100；无 crawl/extract
   阶段时迁移的 108 条 open JS 变成无人消费的永久缺口。
