@@ -25,3 +25,10 @@ bin/*.gob
 # per-session agent collaboration logs: local development record, not
 # part of the shipped skill
 agent-records/
+
+# local release output (scripts/build-release*.py) and scratch dirs: these
+# are produced artefacts, not sources -- rebuilding is the rule
+_rel/
+.tmprun/
+.playwright-mcp/
+.pytest_cache/
