@@ -6,6 +6,7 @@
 //!   exit 0 ok / 2 bad usage / 3 nothing usable (all sources failed or skipped)
 
 mod http;
+mod paging;
 mod sources;
 mod util;
 
@@ -41,6 +42,10 @@ struct Args {
     timeout: u64,
     retries: u32,
     min_reliability: f32,
+    /// page budget for the free cursor APIs (VirusTotal, urlscan). Default 4
+    /// fits VirusTotal's free tier (4 requests/minute). Billed engines are
+    /// never paged; their cap is reported instead.
+    max_pages: u32,
 }
 
 fn parse_query_args(argv: &[String]) -> Result<Args, String> {
@@ -50,6 +55,7 @@ fn parse_query_args(argv: &[String]) -> Result<Args, String> {
     let mut timeout = 20u64;
     let mut retries = 1u32;
     let mut min_reliability = 0.0f32;
+    let mut max_pages = 4u32;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -90,6 +96,10 @@ fn parse_query_args(argv: &[String]) -> Result<Args, String> {
                     .map_err(|_| "bad min-reliability".to_string())?;
                 i += 1;
             }
+            "--max-pages" => {
+                max_pages = value(i)?.parse().map_err(|_| "bad max-pages".to_string())?;
+                i += 1;
+            }
             other => return Err(format!("unknown flag: {}", other)),
         }
         i += 1;
@@ -105,7 +115,31 @@ fn parse_query_args(argv: &[String]) -> Result<Args, String> {
         timeout: timeout.clamp(3, 120),
         retries: retries.min(3),
         min_reliability,
+        max_pages: max_pages.clamp(1, 20),
     })
+}
+
+/// The report entry of a source that answered.
+fn ok_report(id: &str, pages: &paging::Pages, found: usize, ms: u64) -> Value {
+    let mut r = json!({
+        "id": id, "status": "ok", "found": found, "ms": ms, "http": pages.status,
+        "pages": pages.pages, "truncated": pages.truncated, "total": pages.total,
+    });
+    if let Some(e) = &pages.page_error {
+        r["page_error"] = json!(e);
+    }
+    r
+}
+
+/// Sources whose upstream holds rows that were not fetched.
+fn truncated_ids(rep: &[Value]) -> Vec<String> {
+    let mut ids: Vec<String> = rep
+        .iter()
+        .filter(|v| v["truncated"] == json!(true))
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    ids
 }
 
 fn cmd_sources() {
@@ -125,6 +159,7 @@ fn cmd_sources() {
             "ready": ready,
             "reliability": s.reliability,
             "note": s.note,
+            "paging": paging::label(s.paging),
         }));
     }
     let ready_count = arr.iter().filter(|v| v["ready"] == json!(true)).count();
@@ -247,6 +282,7 @@ fn cmd_query(args: Args) -> i32 {
         let root = root.clone();
         let timeout = args.timeout;
         let retries = args.retries;
+        let max_pages = args.max_pages;
         handles.push(std::thread::spawn(move || loop {
             let i = {
                 let mut g = idx.lock().unwrap();
@@ -297,17 +333,27 @@ fn cmd_query(args: Args) -> i32 {
                 }));
                 continue;
             }
-            match http::fetch(&url, &headers, timeout, retries) {
-                Ok(resp) => {
+            let fetched = paging::collect(
+                src.paging, &url, max_pages,
+                |u: &str| http::fetch(u, &headers, timeout, retries).map(|r| (r.body, r.status)),
+                |e: &http::FetchError| http::err_code(e).to_string(),
+            );
+            match fetched {
+                Ok(pages) => {
                     let ms = t0.elapsed().as_millis() as u64;
-                    if resp.body.trim().is_empty() {
+                    if pages.bodies.iter().all(|b| b.trim().is_empty()) {
                         report.lock().unwrap().push(json!({
                             "id": src.id, "status": "empty", "found": 0, "ms": ms,
-                            "http": resp.status,
+                            "http": pages.status, "pages": pages.pages,
+                            "truncated": false, "total": pages.total,
                         }));
                         continue;
                     }
-                    let hosts = util::extract_hosts(&resp.body, &root);
+                    let mut all: Vec<String> = Vec::new();
+                    for body in &pages.bodies {
+                        all.extend(util::extract_hosts(body, &root));
+                    }
+                    let hosts = util::dedupe(all);
                     let n = hosts.len();
                     {
                         let mut a = acc.lock().unwrap();
@@ -321,10 +367,7 @@ fn cmd_query(args: Args) -> i32 {
                             }
                         }
                     }
-                    report.lock().unwrap().push(json!({
-                        "id": src.id, "status": "ok", "found": n, "ms": ms,
-                        "http": resp.status,
-                    }));
+                    report.lock().unwrap().push(ok_report(src.id, &pages, n, ms));
                 }
                 Err(e) => {
                     let ms = t0.elapsed().as_millis() as u64;
@@ -381,10 +424,45 @@ fn cmd_query(args: Args) -> i32 {
         "sources_error": err_count,
         "found": records.len(),
         "records": records,
+        // the upstream holds rows these sources did not return (page budget
+        // spent, billed engine capped, or a later page failed)
+        "truncated_sources": truncated_ids(&rep),
         "sources": rep,
         "hint": "confidence derives from how many independent sources confirmed the host",
     }));
     ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn max_pages_defaults_to_four_and_is_clamped() {
+        assert_eq!(parse_query_args(&argv(&["--domain", "x.com"])).unwrap().max_pages, 4);
+        assert_eq!(parse_query_args(&argv(&["--domain", "x.com", "--max-pages", "99"]))
+                       .unwrap().max_pages, 20);
+        assert_eq!(parse_query_args(&argv(&["--domain", "x.com", "--max-pages", "0"]))
+                       .unwrap().max_pages, 1);
+    }
+
+    #[test]
+    fn a_source_report_says_whether_its_answer_was_cut() {
+        let pages = paging::Pages { pages: 2, truncated: true, total: Some(900),
+                                    status: 200, ..paging::Pages::default() };
+        let r = ok_report("virustotal", &pages, 80, 12);
+        assert_eq!(r["status"], json!("ok"));
+        assert_eq!(r["found"], json!(80));
+        assert_eq!(r["pages"], json!(2));
+        assert_eq!(r["truncated"], json!(true));
+        assert_eq!(r["total"], json!(900));
+        let rep = vec![r, json!({"id": "crtsh", "status": "ok", "truncated": false})];
+        assert_eq!(truncated_ids(&rep), vec!["virustotal".to_string()]);
+    }
 }
 
 fn main() {
