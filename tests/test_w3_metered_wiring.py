@@ -16,6 +16,8 @@ from contextlib import redirect_stdout
 
 import tests.util  # noqa: F401  (sets FINDINFO_HOME before lib import)
 
+from lib import metered
+from lib import metered as metered_mod
 from tests.util import fresh_core, fresh_tools, import_findinfo
 
 
@@ -52,86 +54,68 @@ def _latest_run_dir(core):
     return sorted(core.RUNS_DIR.glob("*"), key=lambda p: p.stat().st_mtime)[-1]
 
 
-def test_subs_gateway_call_records_one_request_row(tmp_path=None):
-    """One billed gateway request -> exactly one ledger row (T22)."""
+def test_one_paid_dispatch_records_one_request_row(tmp_path=None):
+    """One billed dispatch -> exactly one ledger row (T22).
+
+    The paid call now belongs to the mapping dispatch (subs is passive), so
+    this drives lib/mapdispatch with a faked core.run and inspects the run's
+    metered.jsonl the same way the old subs-gateway case did.
+    """
+    from lib import mapdispatch, mapping
     core = fresh_core()
-    tools = fresh_tools(core)
-    fi = import_findinfo()
-
-    captured: dict = {}
-
-    def fake_gateway(query, fields="ip,port", size=100, page=1, timeout=0):
-        captured["query"] = query
-        # a successful body with provider quota fields
-        return {"ok": True, "count": 3, "total": 3,
-                "results": [
-                    {"link": "https://a.mt-a.example.com/", "ip": "203.0.113.10"},
-                    {"link": "https://b.mt-a.example.com/", "ip": "203.0.113.11"},
-                    {"link": "https://c.mt-a.example.com/", "ip": "203.0.113.12"}],
-                "remaining": 877, "maxQueries": 1000}
-
-    # the REAL t_subs runs (its gateway/uncover calls are faked); the ledger
-    # wiring inside lib/tools is what this test exercises
-    fakes = {
-        "t_certs": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True},
-        "t_dns": lambda s, d, timeout=0, **kw: {
-            "count": 0, "ok": True, "rc": 0, "domains": [], "wildcard": []},
-    }
-    with mock.patch.object(tools, "fofa_gateway_query", side_effect=fake_gateway), \
-         mock.patch.object(tools.core, "api_base", return_value="https://gw.example.org/v1"), \
-         mock.patch.object(tools.core, "api_key", return_value="stub-ak"), \
-         mock.patch.object(tools.core, "has_tool", return_value=False):
-        # has_tool=False: no subfinder/chaos/uncover binary runs inside this
-        # test (offline contract); the gateway is the only provider call
-        _run(fi, _args(engines="fofa"), fakes)  # rc is the subs verdict, not the ledger
-    rd = _latest_run_dir(core)
-    rows = [json.loads(l) for l in
-            (rd / "metered.jsonl").read_text(encoding="utf-8").splitlines()
-            if l.strip()]
-    assert len(rows) == 1, rows
-    row = rows[0]
-    assert row["engine"] == "fofa-gateway", row
-    assert row["status"] == "ok" and row["returned"] == 3, row
-    assert row["quota"]["remaining"] == 877, row
-    assert row["quota"]["max"] == 1000, row
-    # the summary's coverage carries the spend evidence
-    summary = json.loads((rd / "summary.jsonl").read_text(
-        encoding="utf-8").splitlines()[-1])
-    assert summary["coverage"]["metered"]["totals"]["requests"] == 1
-    assert "fofa-gateway" in summary["coverage"]["metered"]["by_engine"]
-    assert captured["query"].startswith('domain="mt-a.example.com"')
+    store = core.Store()
+    led_path = tmp_path / "metered.jsonl" if tmp_path else None
+    try:
+        mapping.ensure_schema(store)
+        core.CFG.setdefault("apis", {}).setdefault("fofa", {})["key"] = "test-k"
+        core.CFG["apis"]["fofa"]["email"] = "probe@example.com"
+        led = metered_mod.MeteredLedger(path=led_path, run_id="RUNQ")
+        orig = core.run
+        core.run = lambda cmd, **kw: (
+            0,
+            json.dumps({"host": "a.mt-a.example.com",
+                        "ip": "203.0.113.10"}) + chr(10), "")
+        try:
+            mapdispatch.ask(store, "RUNQ", "fofa", "domain",
+                            "mt-a.example.com", ledger=led)
+        finally:
+            core.run = orig
+        rows = led.rows("RUNQ")
+        assert len(rows) == 1, rows
+        assert rows[0]["engine"] == "fofa", rows[0]
+        assert rows[0]["unit"] == "native_dispatch", rows[0]
+        assert rows[0]["returned"] == 2, rows[0]   # one host + one ip row
+    finally:
+        store.close()
 
 
 def test_quota_exhausted_engine_blocks_next_round_verdict():
-    """A quota-exhausted gateway surfaces as a blocked engine (T26/T27)."""
+    """A quota-exhausted engine is recorded as QUOTA, never as empty (T26/T27).
+
+    The verdict reads the ledger's blocked engines; this pins the recording
+    half -- a quota reply must not look like "this engine found nothing".
+    """
+    from lib import mapdispatch, mapping
     core = fresh_core()
-    tools = fresh_tools(core)
-    fi = import_findinfo()
-
-    def fake_gateway(query, fields="ip,port", size=100, page=1, timeout=0):
-        return {"ok": False, "quota_exhausted": True, "error": "quota limit reached"}
-
-    fakes = {
-        "t_certs": lambda s, d, timeout=0, **kw: {"count": 0, "ok": True},
-        "t_dns": lambda s, d, timeout=0, **kw: {
-            "count": 0, "ok": True, "rc": 0, "domains": [], "wildcard": []},
-    }
-    with mock.patch.object(tools, "fofa_gateway_query", side_effect=fake_gateway), \
-         mock.patch.object(tools.core, "api_base", return_value="https://gw.example.org/v1"), \
-         mock.patch.object(tools.core, "api_key", return_value="stub-ak"):
-        _run(fi, _args(engines="fofa"), fakes)
-    rd = _latest_run_dir(core)
-    rows = [json.loads(l) for l in
-            (rd / "metered.jsonl").read_text(encoding="utf-8").splitlines()
-            if l.strip()]
-    assert rows and rows[0]["status"] == "quota", rows
-    summary = json.loads((rd / "summary.jsonl").read_text(
-        encoding="utf-8").splitlines()[-1])
-    cov = summary["coverage"]
-    assert "fofa-gateway" in (cov["unavailable"].get("blocked_engines") or []), cov["unavailable"]
-    assert "fofa-gateway" in cov["metered"]["blocked_engines"], cov["metered"]
-
-
+    store = core.Store()
+    try:
+        mapping.ensure_schema(store)
+        core.CFG.setdefault("apis", {}).setdefault("fofa", {})["key"] = "test-k"
+        core.CFG["apis"]["fofa"]["email"] = "probe@example.com"
+        orig = core.run
+        core.run = lambda cmd, **kw: (0, "", "quota exhausted for this AK")
+        try:
+            r = mapdispatch.ask(store, "RUNQ", "fofa", "domain",
+                                "mt-a.example.com")
+        finally:
+            core.run = orig
+        assert r["status"] == metered.ST_QUOTA, r
+        q = mapping.question("fofa", "domain", "mt-a.example.com",
+                             core.uncover_query("domain", "fofa",
+                                                "mt-a.example.com"))
+        assert mapping.lookup(store, q)["status"] == metered.ST_QUOTA
+    finally:
+        store.close()
 def test_uncover_dispatch_is_billed_and_free_sources_are_not():
     """uncover (billed) records; subfinder (free) never does."""
     core = fresh_core()

@@ -8,6 +8,8 @@
 | Symptom | Cause | Fix |
 |---|---|---|
 | `{"error":"tool_missing"}` | Tool missing from `bin/<platform>/` (no PATH fallback) | `doctor` shows which one: Linux runs `scripts/setup-linux.sh`, Windows adds `bin/windows/*.exe`. Do not install tools yourself |
+| `{"error":"scope_required"}` (exit 2) | A single-stage command would take its targets from the whole shared store: no `--scope`/`--domain`, or a scope with no valid name in it | Add `--scope <domain>` (passive/subs/icp/dns/probe/ipagg/ports) or `--domain <domain>` (vhost/crawl/extract), or give explicit targets; `--whole-store` only when every asset in the store is really meant |
+| `ports` reports `skipped_private` | Store-derived IPs in private/reserved ranges are never scanned | Intended. Pass such an address with `--ip` to scan it deliberately |
 | `entity` returns empty | `bin/config.yaml` has no Cookie, or it expired | `cp bin/config.example.yaml bin/config.yaml` and re-paste the aiqicha Cookie; or pass the seed domain directly with `--domain` |
 | `subs` returns only a few results | No mapping-platform key configured (subfinder is the only route) | See `docs/API-KEYS.md`, or accept it (crt.sh still works). This is a coverage gap — `subs` **never records failed** for it, and do not `--resume` |
 | `passive` returns only a few results | Only key-free sources available | Report the `per_source` statuses honestly |
@@ -63,6 +65,9 @@ python findinfo.py --task myproj status --run <run_id>
 | A source failed transiently | Still `ok: false` after `limits.source_retries` retries | The stage is marked failed and writes no checkpoint (a re-run retries); other sources' results are kept |
 | Key missing / quota exhausted | `coverage.unavailable`, `doctor.api_keys`, `fofa_gateway.remaining` | Record a coverage gap, **deliver as usual**, naming which routes are missing. **Do not `--resume`** — retries cannot conjure a key; a missing key never counts into `failed_stages` either |
 | Wildcard pollution | `dns` returns `wildcard` | Already filtered, not stored; mention it under "data quality" |
+| An engine returned nothing | `coverage.unavailable.unconfirmed_empty` | Report it as unconfirmed (uncover reports upstream errors the same way); not "no assets" and not a failure, do not `--resume` |
+| An engine was not asked | `coverage.unavailable.unsupported_engines` | No query is known for it here; list it as a gap |
+| An upstream answer was capped | `coverage.unavailable.truncated_sources` | More rows exist than were fetched (page budget / billed first page); list it as a gap |
 | New in-scope domains | `rounds[i].new_domains > 0` | `--rounds` already feeds them into the next round; no manual steering needed |
 | Related assets out of scope | `dropped_out_of_scope` / the brief's `leaks.domains` | Record as candidates only; never widen scope automatically |
 | A tool failed | `stages[].failed` + `error` | Keep rc/error/existing artifacts; the stage does not count as completed |

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _SUBCOMMANDS = frozenset((
     "doctor", "entity", "certs", "passive", "brute", "icp", "subs", "dns",
     "probe", "ipagg", "ports", "vhost", "crawl", "extract", "report", "clean",
-    "assets", "status", "wait", "cancel", "runs", "run", "brief", "__worker",
+    "assets", "status", "wait", "cancel", "runs", "run", "map", "brief", "__worker",
 ))
 
 
@@ -269,8 +269,8 @@ def _plan_stages_pure(rs, active: bool) -> list:
     plan += ["certs", "subs"]
     if active and rs.brute:
         plan.append("brute")
-    if not rs.no_icp and rs.name:
-        plan.append("icp")
+    if not getattr(rs, "no_mapping", False):
+        plan.append("mapping")
     plan.append("dns")
     if active:
         plan += ["probe", "ipagg"]
@@ -356,6 +356,8 @@ if _OFFLINE:
 
 from lib import core, jobs, report, tools, work
 from lib import metered as metered_mod
+from lib import mapping as mapping_mod
+from lib import mapdispatch
 from lib import spec as spec_mod
 
 
@@ -397,7 +399,8 @@ def cmd_passive(args) -> None:
     try:
         domains = args.domain or []
         if args.from_store or not domains:
-            domains = _domains_from_store(store, 0.7, args.scope)
+            domains = _domains_from_store(
+                store, 0.7, _store_scope(args, args.scope, "--scope", "passive"))
         srcs = [s.strip() for s in args.sources.split(",") if s.strip()] if args.sources else None
         merged = []
         for d in domains:
@@ -425,14 +428,80 @@ def cmd_icp(args) -> None:
         codes = args.code or []
         if args.from_store:
             # The ICP table is shared across engagements, so an unscoped
-            # --from-store reverse-lookups another project's filings. Scope it
-            # exactly like every other --from-store command does.
-            scope = [core.canon_user_domain(d) for d in (args.scope or [])]
-            scope = [d for d in scope if d]
+            # --from-store reverse-lookups another project's filings (and
+            # spends quota on them). Scope it like every other store read.
+            scope = _store_scope(args, args.scope, "--scope", "icp")
             codes = [a["canonical"] for a in
-                     store.get_assets(kind="icp", match=scope or None)]
+                     store.get_assets(kind="icp", match=scope)]
         out(tools.t_icp(store, codes, engines=args.engines,
                         timeout=args.tool_timeout))
+    finally:
+        store.close()
+
+
+def cmd_map(args) -> None:
+    """The ONLY command that spends mapping quota (batch 1).
+
+    Same ledger as the run pipeline's `mapping` stage: a question this task
+    already paid for is reused, not re-asked. `--remap` is the explicit opt-in
+    for asking again. Passive collection lives in `passive`/`subs`, which are
+    keyless by construction.
+    """
+    import lib.mapdispatch as mapdispatch
+    import lib.mapping as mapping_mod
+    store = core.Store()
+    try:
+        try:
+            mapping_mod.ensure_schema(store)
+        except Exception as exc:
+            core.log("mapping schema init failed: " + repr(exc)[:160])
+        domains: list = []
+        codes: list = []
+        if args.domain:
+            domains = [core.canon_user_domain(d) for d in args.domain]
+            domains = [d for d in domains if d]
+            if not domains:
+                raise core.FindInfoError("invalid domain: " + ",".join(args.domain))
+        if args.icp:
+            codes = list(args.icp)
+        if args.from_store or not (domains or codes):
+            scope = _store_scope(args, args.scope, "--scope", "map")
+            if not domains:
+                domains = [a["canonical"] for a in
+                           store.get_assets(kind="domain", match=scope)]
+            if not codes:
+                codes = [a["canonical"] for a in
+                         store.get_assets(kind="icp", match=scope)]
+        # a CLI invocation owns no worker run: use a stable pseudo run id so
+        # the ledger row is attributable without pretending a job exists
+        run_key = "cli"
+        remap = bool(getattr(args, "remap", False))
+        dom = mapdispatch.ask_all(store, run_key, "domain", domains,
+                                  engines=args.engines, remap=remap,
+                                  timeout=args.tool_timeout)
+        icp = mapdispatch.ask_all(store, run_key, "icp", codes,
+                                  engines=args.engines, remap=remap,
+                                  timeout=args.tool_timeout) if codes else {
+            "dispatched": 0, "reused": 0, "failures": [],
+            "truncated_sources": [], "skipped_engines": [], "results": []}
+        stored = mapdispatch.store_results(
+            store, list(dom.get("results") or []) + list(icp.get("results") or []))
+        out({"stored": stored,
+             "domains": {"dispatched": dom.get("dispatched", 0),
+                         "reused": dom.get("reused", 0),
+                         "failures": dom.get("failures", []),
+                         "skipped_engines": dom.get("skipped_engines", [])},
+             "icp": {"dispatched": icp.get("dispatched", 0),
+                     "reused": icp.get("reused", 0),
+                     "failures": icp.get("failures", []),
+                     "skipped_engines": icp.get("skipped_engines", [])},
+             "truncated_sources": sorted(set(
+                 list(dom.get("truncated_sources") or []) +
+                 list(icp.get("truncated_sources") or []))),
+             "coverage": mapping_mod.coverage(store),
+             "note": ("each engine+question is asked once per task; an "
+                      "answered question is reused, --remap is the explicit "
+                      "opt-in for asking again")})
     finally:
         store.close()
 
@@ -442,7 +511,8 @@ def cmd_subs(args) -> None:
     try:
         domains = args.domain or []
         if args.from_store:
-            domains = _domains_from_store(store, 0.7, args.scope)
+            domains = _domains_from_store(
+                store, 0.7, _store_scope(args, args.scope, "--scope", "subs"))
         merged = []
         for d in domains:
             r = tools.t_subs(store, d, engines=args.engines,
@@ -471,20 +541,49 @@ def _domains_from_store(store, min_conf: float, match: list[str] | None = None) 
             store.get_assets(kind="domain", min_conf=min_conf, match=scope or None)]
 
 
-def _vhost_bases(store) -> list[str]:
-    """Base domains used to qualify bare vhost wordlist labels."""
-    bases: list[str] = []
-    for a in store.get_assets(kind="domain", min_conf=0.4):
-        parent = core.canon_domain(a.get("parent") or "")
-        if parent:
-            bases.append(parent)
-        elif a.get("canonical"):
-            bases.append(a["canonical"])
+def _store_scope(args, values, flag: str, command: str) -> list[str] | None:
+    """Scope of a single-stage command that takes its targets from the store.
+
+    Returns the canonical scope, or None when --whole-store was given on
+    purpose. Otherwise raises ScopeRequired: the store is shared across
+    engagements (and across tasks without --task), so an unscoped read hands
+    one target's assets to another target's stage -- `ports` with no --ip
+    used to scan every IP ever stored. A scope with no valid name in it is
+    refused too, instead of quietly becoming "no scope".
+    """
+    if values:
+        accepted, rejected = core.canon_user_scope(values)
+        if not accepted:
+            raise core.ScopeRequired(
+                command + " " + flag + " " + ", ".join(str(v) for v in values) +
+                ": no valid domain in it; refusing to widen to the whole store",
+                hint="pass a domain, e.g. " + flag + " example.com")
+        if rejected:
+            core.log(command + ": ignored invalid " + flag + " value(s): " +
+                     ", ".join(rejected))
+        return accepted
+    if getattr(args, "whole_store", False):
+        return None
+    raise core.ScopeRequired(
+        command + " would take its targets from the whole asset store, which "
+        "is shared across engagements",
+        hint="pass " + flag + " <domain> (repeatable), give explicit targets, "
+             "or --whole-store to read every asset in this store on purpose")
+
+
+def _host_bases(hosts: list[str]) -> list[str]:
+    """Base domains for bare vhost labels, taken from the hosts being collided.
+
+    The old fallback used the parent of EVERY domain in the shared store, so
+    `vhost --wordlist` without --domain sent Host headers built on other
+    engagements' domains.
+    """
     out: list[str] = []
-    for b in bases:
-        cd = core.canon_domain(b)
-        if cd and cd not in out:
-            out.append(cd)
+    for h in hosts:
+        cd = core.canon_user_domain(h)
+        base = (core.registrable_domain(cd) or cd) if cd else None
+        if base and base not in out:
+            out.append(base)
     return out
 
 
@@ -498,7 +597,8 @@ def cmd_dns(args) -> None:
     try:
         domains = args.domain or []
         if args.from_store or not domains:
-            domains = _domains_from_store(store, args.min_conf, args.scope)
+            domains = _domains_from_store(
+                store, args.min_conf, _store_scope(args, args.scope, "--scope", "dns"))
         out(tools.t_dns(store, domains, timeout=args.tool_timeout))
     finally:
         store.close()
@@ -509,7 +609,8 @@ def cmd_probe(args) -> None:
     try:
         hosts = args.host or []
         if args.from_store or not hosts:
-            hosts = _domains_from_store(store, args.min_conf, args.scope)
+            hosts = _domains_from_store(
+                store, args.min_conf, _store_scope(args, args.scope, "--scope", "probe"))
         res = tools.t_httpx(store, hosts, timeout=args.tool_timeout)
         if getattr(args, "repair_titles", False):
             # Re-read titles the OLD decode pipeline destroyed. Those rows
@@ -527,7 +628,11 @@ def cmd_probe(args) -> None:
 def cmd_ipagg(args) -> None:
     store = core.Store()
     try:
-        out(tools.t_ipagg(store, args.ip, timeout=args.tool_timeout))
+        if args.ip:
+            out(tools.t_ipagg(store, args.ip, timeout=args.tool_timeout))
+        else:
+            out(tools.t_ipagg(store, None, timeout=args.tool_timeout,
+                              scope=_store_scope(args, args.scope, "--scope", "ipagg")))
     finally:
         store.close()
 
@@ -535,9 +640,27 @@ def cmd_ipagg(args) -> None:
 def cmd_ports(args) -> None:
     store = core.Store()
     try:
-        ips = args.ip or [a["canonical"] for a in store.get_assets(kind="ip")]
-        out(tools.t_ports(store, ips, top_ports=args.top_ports,
-                          timeout=args.tool_timeout))
+        if args.ip:
+            # explicit addresses are the operator's own decision: used as given
+            out(tools.t_ports(store, args.ip, top_ports=args.top_ports,
+                              timeout=args.tool_timeout))
+            return
+        # From the store, only addresses OWNED by an in-scope domain (their
+        # parent): an IP scraped out of a page/JS has no owner, an ICP-lookup
+        # IP is owned by a filing number, and neither is a scan target. A
+        # private/reserved address is skipped even when owned -- from here it
+        # reaches the operator's own network, not the target.
+        scope = _store_scope(args, args.scope, "--scope", "ports")
+        owned = [a["canonical"] for a in store.get_assets(kind="ip", match=scope)]
+        ips = [ip for ip in owned if core.is_public_ip(ip)]
+        skipped = [ip for ip in owned if not core.is_public_ip(ip)]
+        if skipped:
+            core.log("ports: skipped " + str(len(skipped)) + " private/reserved "
+                     "address(es) from the store; pass them with --ip to scan them")
+        res = tools.t_ports(store, ips, top_ports=args.top_ports,
+                            timeout=args.tool_timeout)
+        res["skipped_private"] = skipped
+        out(res)
     finally:
         store.close()
 
@@ -547,14 +670,15 @@ def cmd_vhost(args) -> None:
     try:
         hosts = args.host or []
         if args.from_store or not hosts:
-            hosts = _domains_from_store(store, 0.4, args.domain)
+            hosts = _domains_from_store(
+                store, 0.4, _store_scope(args, args.domain, "--domain", "vhost"))
         if args.wordlist:
             # Accept the same bare names as `brute --wordlist` ("vhost" ->
             # wordlists/vhost.txt); a plain Path() read breaks that contract.
             raw = [w.strip() for w in
                    tools.resolve_wordlist(args.wordlist).read_text(encoding="utf-8").splitlines()
                    if w.strip()]
-            bases = args.domain or _vhost_bases(store)
+            bases = args.domain or _host_bases(hosts)
             extra = tools.expand_host_words(raw, bases)
             core.log("vhost wordlist: " + str(len(raw)) + " words -> " +
                      str(len(extra)) + " hosts from " + str(len(bases)) + " base domain(s)")
@@ -571,13 +695,12 @@ def cmd_crawl(args) -> None:
     store = core.Store()
     try:
         urls = args.url or []
-        scope = core.canon_scope(args.domain or [])
-        scope_warning = ""
+        scope = core.canon_user_scope(args.domain or [])[0]
         if args.from_store or not urls:
-            if not scope:
-                scope_warning = ("crawl --from-store without --domain reads the shared "
-                                 "graph unscoped; other engagements' URLs will be crawled")
-            for a in store.get_assets(kind="domain", min_conf=0.7, match=scope or None):
+            # an unscoped read used to crawl other engagements' URLs with only
+            # a warning in the output; it is refused now (see _store_scope)
+            read = _store_scope(args, args.domain, "--domain", "crawl")
+            for a in store.get_assets(kind="domain", min_conf=0.7, match=read):
                 attrs = a.get("attrs") or {}
                 if attrs.get("url"):
                     urls.append(attrs["url"])
@@ -588,7 +711,7 @@ def cmd_crawl(args) -> None:
             scope = [s for s in scope if s]
         out(tools.t_crawl(store, urls, depth=args.depth, timeout=args.tool_timeout,
                           scope_domains=scope)
-            | {"scope": scope, "scope_warning": scope_warning})
+            | {"scope": scope})
     finally:
         store.close()
 
@@ -613,8 +736,8 @@ def cmd_extract(args) -> None:
             # crawl stage) instead of making the agent guess run-dir paths.
             # --domain scopes them to the given domains: the store usually
             # mixes other engagements' history, and without it the JS of
-            # unrelated sites would be fetched too.
-            only, _rej = core.canon_user_scope(args.domain or [])
+            # unrelated sites would be fetched too -- so it is required.
+            only = _store_scope(args, args.domain, "--domain", "extract")
             for a in store.get_assets(kind="url", min_conf=0.4):
                 u = a["canonical"]
                 if not u.startswith("http"):
@@ -1439,11 +1562,12 @@ def _plan_stages(args, active) -> list:
     plan += ["certs", "subs"]
     if active and getattr(args, "brute", False):
         plan.append("brute")
-    # icp needs codes harvested from --name/ENScan. With a bare --domain there
-    # is nothing to reverse-look-up, so planning it guarantees a phantom gap in
-    # every domain-only run ("icp not run") that no retry can ever close.
-    if not getattr(args, "no_icp", False) and getattr(args, "name", ""):
-        plan.append("icp")
+    # The mapping stage owns EVERY paid question: one per seed domain and one
+    # per filing number. A run always has at least one seed (a domain is
+    # required), so the stage is always planned unless explicitly disabled --
+    # `--no-mapping` is the opt-out, not "no brand given".
+    if not getattr(args, "no_mapping", False):
+        plan.append("mapping")
     return plan + _round_plan(args, active)
 
 
@@ -1494,6 +1618,56 @@ def _coverage_unavailable(args, active) -> dict:
     }
 
 
+def _subs_stage_inputs(seeds: list, engines: str) -> dict:
+    """Checkpoint identity of the subs stage.
+
+    The usable-engine set is part of it on purpose: adding a mapping key must
+    re-run this stage instead of hitting a checkpoint written when the engine
+    had no key (which recorded "unavailable"). The question each usable engine
+    is asked is part of it too, so a corrected query re-runs a stage that asked
+    the old one. It is added only when an engine will be asked, so a keyless
+    checkpoint keeps its old identity and nothing re-runs for nothing.
+    """
+    usable, _ = core.split_engines(engines)
+    inputs = {"seeds": seeds, "engines": engines, "usable_engines": usable}
+    queries = core.uncover_query_identity("domain", usable)
+    if queries:
+        inputs["queries"] = queries
+    return inputs
+
+
+def _icp_stage_inputs(codes: list, engines: str) -> dict:
+    """Checkpoint identity of the icp stage (same rule as _subs_stage_inputs)."""
+    usable, _ = core.split_engines(engines)
+    inputs: dict = {"codes": codes}
+    queries = core.uncover_query_identity("icp", usable)
+    if queries:
+        inputs["usable_engines"] = usable
+        inputs["queries"] = queries
+    return inputs
+
+
+def _subs_stage_entry(r: dict) -> dict:
+    """The summary entry of a finished subs stage.
+
+    Project the OUTCOME, not just the count: _subs merged the per-source
+    outcomes through core.combine_outcome, and the stage entry defaulted it to
+    OUTCOME_OK. A partial run (one engine timed out, the rest answered) was
+    then written as "succeeded" and checkpointed "done", so a later run skipped
+    the stage forever while half the sources never answered. The engine gaps
+    travel along for _fold_runtime_unavailable.
+    """
+    entry = {"found": r["found"],
+             "outcome": r.get("outcome") or core.OUTCOME_OK,
+             "sources": len(r.get("per_source") or [])}
+    if r.get("quota_exhausted"):
+        entry["quota_exhausted"] = True
+    for key in ("unconfirmed_empty", "unsupported_engines"):
+        if r.get(key):
+            entry[key] = list(r[key])
+    return entry
+
+
 def _fold_runtime_unavailable(unavailable: dict, stages: list,
                                blocked_engines: list | None = None) -> dict:
     """Add gaps that only become known while the run is executing.
@@ -1510,7 +1684,21 @@ def _fold_runtime_unavailable(unavailable: dict, stages: list,
     hits = [st.get("stage") or "subs" for st in stages
             if isinstance(st, dict) and st.get("quota_exhausted")]
     blocked = sorted(set(blocked_engines or []))
-    if not hits and not blocked:
+
+    def _listed(key: str) -> list:
+        return sorted({str(x) for st in stages if isinstance(st, dict)
+                       for x in (st.get(key) or [])})
+
+    # An engine that answered nothing through uncover cannot be told apart
+    # from one whose upstream errored (uncover reports both as rc=0, no rows),
+    # and an engine with no known query was never asked at all. Both are
+    # gaps the stage outcome alone hides.
+    unconfirmed = _listed("unconfirmed_empty")
+    unsupported = _listed("unsupported_engines")
+    # An upstream that holds more rows than one page budget returned
+    # (onepass reports it per source): the rest exists, it was not fetched.
+    capped = _listed("truncated_sources")
+    if not hits and not blocked and not unconfirmed and not unsupported and not capped:
         return unavailable
     out = dict(unavailable)
     if hits:
@@ -1518,11 +1706,25 @@ def _fold_runtime_unavailable(unavailable: dict, stages: list,
         out["quota_exhausted"] = names
     if blocked:
         out["blocked_engines"] = blocked
+    if unconfirmed:
+        out["unconfirmed_empty"] = unconfirmed
+    if unsupported:
+        out["unsupported_engines"] = unsupported
+    if capped:
+        out["truncated_sources"] = capped
     parts: list = []
     if hits:
         parts.append("quota exhausted during run: " + ",".join(sorted(set(hits))))
     if blocked:
         parts.append("engines blocked (quota/auth): " + ",".join(blocked))
+    if unconfirmed:
+        parts.append("no rows from " + ",".join(unconfirmed) + " (unconfirmed: "
+                     "uncover reports an upstream error the same way)")
+    if unsupported:
+        parts.append("engines not asked, no known query: " + ",".join(unsupported))
+    if capped:
+        parts.append("upstream answers capped, more rows exist than were fetched: "
+                     + ",".join(capped))
     note = out.get("note") or ""
     out["note"] = (note + "; " if note else "") + "; ".join(parts)
     return out
@@ -1976,6 +2178,10 @@ def _build_default_registry():
     reg.register("certs", runner=lambda *a, **k: None, needs=())
     reg.register("subs", runner=lambda *a, **k: None, needs=("certs",))
     reg.register("brute", runner=lambda *a, **k: None, needs=("dns",))
+    # "mapping" is the ONLY stage allowed to spend mapping quota (batch 1).
+    # "icp" stays registered as a presentation alias so old plans and
+    # checkpoints that name it keep resolving; dispatch happens in mapping.
+    reg.register("mapping", runner=lambda *a, **k: None, needs=())
     reg.register("icp", runner=lambda *a, **k: None, needs=())
     reg.register("dns", runner=lambda *a, **k: None, needs=("certs",))
     reg.register("probe", runner=lambda *a, **k: None, needs=("dns",))
@@ -2067,6 +2273,10 @@ def _run_pipeline(args) -> int:
         work.ensure_schema(store)
     except Exception as exc:
         core.log("work schema init failed: " + repr(exc)[:200])
+    try:
+        mapping_mod.ensure_schema(store)
+    except Exception as exc:
+        core.log("mapping schema init failed: " + repr(exc)[:200])
     active = _active_enabled(args)
     attempt = _current_attempt()
     summary: dict = {"engagement": ENGAGEMENT, "active": active, "stages": [],
@@ -2437,13 +2647,19 @@ def _run_pipeline(args) -> int:
                 total = 0
                 src_errors = 0
                 outcomes = []
+                capped: set = set()
                 for d in seeds:
                     r = tools.t_onepass(store, d)
                     total += r["count"]
                     src_errors += r.get("sources_error") or 0
                     outcomes.append(r.get("outcome") or core.OUTCOME_OK)
+                    capped.update(r.get("truncated_sources") or [])
                 oc = core.combine_outcome(*outcomes)
                 res = {"found": total, "sources_error": src_errors, "outcome": oc}
+                if capped:
+                    # surfaced through coverage.unavailable: an upstream that
+                    # holds more rows than came back is not "all there is"
+                    res["truncated_sources"] = sorted(capped)
                 # A run where every upstream failed must not be checkpointed as
                 # "done": the same inputs would then be skipped forever and the
                 # agent would keep seeing an empty asset graph with no reason.
@@ -2453,7 +2669,9 @@ def _run_pipeline(args) -> int:
                 return res
             _stage(store, run_dir, summary, "onepass", {"seeds": seeds}, args, _onepass,
                    lambda r: {"found": r["found"], "sources_error": r["sources_error"],
-                              "outcome": r.get("outcome")})
+                              "outcome": r.get("outcome")} |
+                   ({"truncated_sources": r["truncated_sources"]}
+                    if r.get("truncated_sources") else {}))
 
         # 2. certificate transparency
         def _certs():
@@ -2478,6 +2696,8 @@ def _run_pipeline(args) -> int:
             quota = False
             outcomes = []
             per_source: list = []
+            unconfirmed: set = set()
+            unsupported: set = set()
             for d in seeds:
                 r = tools.t_subs(store, d, engines=args.engines,
                                  timeout=tool_timeout, ledger=summary.get("_ledger"))
@@ -2485,11 +2705,17 @@ def _run_pipeline(args) -> int:
                 quota = quota or bool(r.get("quota_exhausted"))
                 outcomes.append(r.get("outcome") or core.OUTCOME_OK)
                 per_source.extend(r.get("per_source") or [])
+                unconfirmed.update(r.get("unconfirmed_empty") or [])
+                unsupported.update(r.get("unsupported_engines") or [])
             oc = core.combine_outcome(*outcomes)
             res = {"found": total, "outcome": oc, "per_source": per_source}
             if quota:
                 # surfaced through coverage.unavailable, never as "no assets"
                 res["quota_exhausted"] = True
+            if unconfirmed:
+                res["unconfirmed_empty"] = sorted(unconfirmed)
+            if unsupported:
+                res["unsupported_engines"] = sorted(unsupported)
             # subfinder + uncover both dead used to return a clean count=0 and
             # checkpoint "done". That is the difference between "this domain has
             # no subdomains" and "we never actually asked".
@@ -2504,24 +2730,11 @@ def _run_pipeline(args) -> int:
                                                              core.OUTCOME_TIMEOUT)})) + ")",
                     result=res)
             return res
-        # The usable-engine set is part of the input hash on purpose: adding a
-        # mapping key must re-run this stage instead of hitting a checkpoint
-        # written when the engine had no key (which recorded "unavailable").
-        _usable_engines, _ = core.split_engines(args.engines)
+        # usable engines and the query each is asked are both part of the
+        # checkpoint identity (see _subs_stage_inputs)
         _stage(store, run_dir, summary, "subs",
-               {"seeds": seeds, "engines": args.engines,
-                "usable_engines": _usable_engines},
-               args, _subs,
-               # Project the OUTCOME, not just the count: _subs merged the
-               # per-source outcomes through core.combine_outcome, and the
-               # stage entry defaulted it to OUTCOME_OK. A partial run (one
-               # engine timed out, the rest answered) was then written as
-               # "succeeded" and checkpointed "done", so a later run skipped
-               # the stage forever while half the sources never answered.
-               lambda r: ({"found": r["found"],
-                          "outcome": r.get("outcome") or core.OUTCOME_OK,
-                          "sources": len(r.get("per_source") or [])} |
-                          ({"quota_exhausted": True} if r.get("quota_exhausted") else {})))
+               _subs_stage_inputs(seeds, args.engines),
+               args, _subs, _subs_stage_entry)
 
         # 3.5 brute force (active, raw socket)
         if active and args.brute:
@@ -2544,33 +2757,105 @@ def _run_pipeline(args) -> int:
                     "bandwidth": args.brute_bandwidth}, args, _brute,
                    lambda r: {"found": r["found"], "failed_seeds": r.get("failed_seeds", [])})
 
-        # 4. icp reverse
-        if icp_codes and not args.no_icp:
-            def _icp():
-                r = tools.t_icp(store, icp_codes, engines=args.engines,
-                                timeout=tool_timeout, ledger=summary.get("_ledger"))
-                errs = r.get("errors") or []
-                res = {"domains": len(r.get("domains", [])),
-                       "errors": len(errs)}
-                # An engine without a key (or a relay that is down) is a
-                # CAPABILITY GAP, not a stage failure: the documented keyless
-                # contract says a missing OPTIONAL credential must not become
-                # exit code 5. Only a real tool/transport failure with no
-                # capability excuse fails the stage.
-                _unavailable = [e for e in errs if e.get("unavailable")]
-                _real = [e for e in errs if not e.get("unavailable")]
-                if _unavailable and not _real:
-                    res["unavailable_sources"] = sorted({
-                        str(e.get("stderr") or "unavailable")[:80]
-                        for e in _unavailable})[:5]
+        # 4. mapping -- the ONLY stage that may spend mapping quota (batch 1).
+        # One question per (engine, domain seed) and per (engine, filing main
+        # number); the task ledger decides whether it was already paid for, so
+        # a second run, a later seed or a standalone `map` never asks twice.
+        # Every other stage (certs/subs/dns/probe/...) is keyless: their
+        # children get no credential at all (core.run strips them).
+        # The stage runs only when the PLAN contains it: a domain-only run
+        # (no seed subject, no filings) has nothing to map, and planning it
+        # would manufacture a phantom gap no retry could close.
+        if "mapping" in planned and not getattr(args, "no_mapping", False):
+            _map_engines = args.engines
+            _remap = bool(getattr(args, "remap", False))
+
+            def _mapping():
+                _seed_values = list(dict.fromkeys(list(named) + list(scope)))
+                dom = mapdispatch.ask_all(
+                    store, summary["_run_public_id"], "domain", _seed_values,
+                    engines=_map_engines, remap=_remap, timeout=tool_timeout,
+                    ledger=summary.get("_ledger"))
+                icp = {"dispatched": 0, "reused": 0, "failures": [],
+                       "truncated_sources": [], "skipped_engines": [],
+                       "results": []}
+                if icp_codes:
+                    icp = mapdispatch.ask_all(
+                        store, summary["_run_public_id"], "icp", icp_codes,
+                        engines=_map_engines, remap=_remap, timeout=tool_timeout,
+                        ledger=summary.get("_ledger"))
+                all_results = list(dom.get("results") or []) + \
+                    list(icp.get("results") or [])
+                stored = mapdispatch.store_results(store, all_results)
+                # Attach what the mapping learned to THIS run's membership --
+                # including rows that were REUSED from an earlier run (original
+                # observation time preserved by the ledger).
+                for kind, val in all_results:
+                    _attach(store, summary, kind, val, producer="mapping",
+                            upstream="mapping", route=None)
+                failures = list(dom.get("failures") or []) + \
+                    list(icp.get("failures") or [])
+                truncated = sorted(set(list(dom.get("truncated_sources") or []) +
+                                       list(icp.get("truncated_sources") or [])))
+                skipped = list(dom.get("skipped_engines") or []) + \
+                    list(icp.get("skipped_engines") or [])
+                res = {
+                    "domains": stored.get("domain", 0),
+                    "ips": stored.get("ip", 0),
+                    "dispatched": int(dom.get("dispatched") or 0) +
+                                  int(icp.get("dispatched") or 0),
+                    "reused": int(dom.get("reused") or 0) +
+                              int(icp.get("reused") or 0),
+                    "failures": len(failures),
+                    "truncated_sources": truncated,
+                    "unsupported_engines": sorted({s["engine"] for s in skipped
+                                                   if "syntax" in
+                                                   str(s.get("reason") or "")}),
+                }
+                # An engine that answered nothing cannot be told apart from one
+                # whose upstream errored (uncover reports both as rc=0 + no
+                # rows). Surface it as a coverage gap, exactly as the engine
+                # tables intend -- silence here would read as "no assets".
+                _unconfirmed = sorted({
+                    "uncover:" + str(f.get("engine"))
+                    for f in failures
+                    if str(f.get("status") or "") in (metered_mod.ST_EMPTY,
+                                                     metered_mod.ST_OK)})
+                if _unconfirmed:
+                    res["unconfirmed_empty"] = _unconfirmed
+                # A missing key / unknown syntax is a CAPABILITY GAP (docs: an
+                # absent optional credential must not become exit 5).
+                _usable_engines, _ = mapdispatch.engines_for("domain",
+                                                           _map_engines)
+                if not _usable_engines:
                     res["outcome"] = core.OUTCOME_UNAVAILABLE
+                    res["unavailable_sources"] = sorted(
+                        {str(x.get("reason") or "")[:60] for x in skipped})[:5]
                     return res
-                if not r.get("domains") and _real:
-                    raise core.StageError("icp lookup failed for all codes",
-                                          result=res)
+                # An EMPTY answer is a VALID answer ("this engine knows
+                # nothing about the seed"), not a failure: only a transport or
+                # auth fault on every available engine fails the stage.
+                _hard = [f for f in failures
+                         if str(f.get("status") or "") not in
+                         (metered_mod.ST_EMPTY, metered_mod.ST_OK,
+                          metered_mod.ST_TRUNCATED)]
+                if _hard and not all_results and len(_hard) >= len(_usable_engines or []):
+                    raise core.StageError(
+                        "mapping failed on every available engine",
+                        result=res)
                 return res
-            _stage(store, run_dir, summary, "icp", {"codes": icp_codes}, args, _icp,
-                   lambda r: {"domains": r["domains"], "errors": r.get("errors", 0)})
+
+            _stage(store, run_dir, summary, "mapping",
+                   {"seeds": list(named) + list(scope), "codes": list(icp_codes),
+                    "engines": args.engines, "remap": _remap},
+                   args, _mapping,
+                   lambda r: {k: r[k] for k in
+                              ("domains", "ips", "dispatched", "reused",
+                               "failures", "truncated_sources",
+                               "unsupported_engines",
+                               "unconfirmed_empty") if k in r} |
+                   ({"unavailable_sources": r["unavailable_sources"]}
+                    if r.get("unavailable_sources") else {}))
 
         # ---- discovery -> verify / reflow rounds -------------------------
         def dns_resumed() -> dict:
@@ -3239,6 +3524,14 @@ def _add_tool_timeout(parser) -> None:
         help="per-tool timeout in seconds (0 = the tool's own default)")
 
 
+def _add_whole_store(parser: argparse.ArgumentParser) -> None:
+    """The explicit opt-in for a store read with no scope (see _store_scope)."""
+    parser.add_argument(
+        "--whole-store", action="store_true",
+        help="take targets from EVERY asset in this store (all engagements in "
+             "it) on purpose; without it a store read needs a scope flag")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="findinfo",
                                 description="asset reconnaissance skill for AI agents")
@@ -3283,7 +3576,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--from-store", action="store_true")
     i.add_argument("--engines", default="fofa,quake,hunter")
     i.add_argument("--scope", action="append",
-                    help="limit --from-store to these domain suffixes (repeatable); the ICP table is shared, so without it every project's filings match")
+                    help="limit --from-store to these domain suffixes (repeatable); the ICP table is shared, so --from-store requires it (or --whole-store)")
+    _add_whole_store(i)
     _add_tool_timeout(i)
     i.set_defaults(func=cmd_icp)
 
@@ -3292,7 +3586,8 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--from-store", action="store_true")
     pa.add_argument("--sources", default="", help="comma separated source ids (see: onepass sources)")
     pa.add_argument("--min-conf", type=float, default=0.0)
-    pa.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    pa.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so a store read requires it (or --whole-store).")
+    _add_whole_store(pa)
     _add_tool_timeout(pa)
     pa.set_defaults(func=cmd_passive)
 
@@ -3304,11 +3599,30 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tool_timeout(br)
     br.set_defaults(func=cmd_brute)
 
+    mp = sub.add_parser("map", help="paid mapping (the ONLY quota-spending "
+                                    "command; one question per task)")
+    mp.add_argument("--domain", action="append",
+                    help="seed domain to map (repeatable)")
+    mp.add_argument("--icp", action="append",
+                    help="filing number to reverse-look-up (repeatable)")
+    mp.add_argument("--from-store", action="store_true",
+                    help="take targets from the store (needs --scope)")
+    mp.add_argument("--scope", action="append",
+                    help="limit --from-store reads to these domain suffixes")
+    mp.add_argument("--engines", default="fofa,quake,hunter,shodan",
+                    help="engines to ask (each must have a key)")
+    mp.add_argument("--remap", action="store_true",
+                    help="ask again even when this task already paid for the "
+                         "question (default: reuse the recorded answer)")
+    _add_tool_timeout(mp)
+    mp.set_defaults(func=cmd_map)
+
     sb = sub.add_parser("subs", help="passive subdomain enumeration")
     sb.add_argument("--domain", action="append")
     sb.add_argument("--from-store", action="store_true")
     sb.add_argument("--engines", default="fofa,quake,hunter,shodan,censys")
-    sb.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    sb.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so a store read requires it (or --whole-store).")
+    _add_whole_store(sb)
     _add_tool_timeout(sb)
     sb.set_defaults(func=cmd_subs)
 
@@ -3316,7 +3630,8 @@ def build_parser() -> argparse.ArgumentParser:
     dn.add_argument("--domain", action="append")
     dn.add_argument("--from-store", action="store_true")
     dn.add_argument("--min-conf", type=float, default=0.4)
-    dn.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    dn.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so a store read requires it (or --whole-store).")
+    _add_whole_store(dn)
     _add_tool_timeout(dn)
     dn.set_defaults(func=cmd_dns)
 
@@ -3324,7 +3639,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--host", action="append")
     pr.add_argument("--from-store", action="store_true")
     pr.add_argument("--min-conf", type=float, default=0.7)
-    pr.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so omit this and you inherit other engagements' targets.")
+    pr.add_argument("--scope", action="append", help="scope --from-store reads to these domains (repeatable). The asset graph is shared, so a store read requires it (or --whole-store).")
+    _add_whole_store(pr)
     pr.add_argument("--repair-titles", action="store_true",
                     help="also re-read stored titles that contain U+FFFD (a "
                          "page decoded with the wrong charset under an older "
@@ -3335,12 +3651,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     ia = sub.add_parser("ipagg", help="group domains by ip, drop CDN")
     ia.add_argument("--ip", action="append")
+    ia.add_argument("--scope", action="append",
+                    help="aggregate only IPs owned by these domains (repeatable); "
+                         "required without --ip (or --whole-store)")
+    _add_whole_store(ia)
     _add_tool_timeout(ia)
     ia.set_defaults(func=cmd_ipagg)
 
     po = sub.add_parser("ports", help="naabu port scan (ACTIVE)")
-    po.add_argument("--ip", action="append")
+    po.add_argument("--ip", action="append",
+                    help="explicit targets, used as given (repeatable)")
+    po.add_argument("--scope", "--domain", dest="scope", action="append",
+                    help="without --ip: scan the public IPs owned by these "
+                         "domains (repeatable); private/reserved ones are skipped")
     po.add_argument("--top-ports", type=int, default=1000)
+    _add_whole_store(po)
     _add_tool_timeout(po)
     po.set_defaults(func=cmd_ports)
 
@@ -3357,6 +3682,7 @@ def build_parser() -> argparse.ArgumentParser:
     vh.add_argument("--threads", type=int, default=20)
     vh.add_argument("--no-skip-live", action="store_true",
                     help="collide even hosts already confirmed live (default: skip them)")
+    _add_whole_store(vh)
     _add_tool_timeout(vh)
     vh.set_defaults(func=cmd_vhost)
 
@@ -3368,7 +3694,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="scope the crawl to these domains (repeatable); with "
                          "--from-store it also limits which URLs are picked up. "
                          "Without it the scope is derived from the seed URLs' "
-                         "registrable domains.")
+                         "registrable domains; a store read requires it.")
+    _add_whole_store(cr)
     _add_tool_timeout(cr)
     cr.set_defaults(func=cmd_crawl)
 
@@ -3378,8 +3705,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="use URL assets already in the store (reflow loop)")
     ex.add_argument("--domain", action="append",
                     help="restrict --from-store URLs to these domains (repeatable); "
-                         "avoids re-fetching another engagement's historical assets")
+                         "required with --from-store (or --whole-store), so another "
+                         "engagement's historical assets are never re-fetched")
     ex.add_argument("--url", action="append")
+    _add_whole_store(ex)
     _add_tool_timeout(ex)
     ex.set_defaults(func=cmd_extract)
 
@@ -3519,6 +3848,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "on timeout the stage fails and is retried later")
     rn.add_argument("--engines", default="fofa,quake,hunter,shodan,censys")
     rn.add_argument("--no-icp", action="store_true")
+    rn.add_argument("--no-mapping", action="store_true",
+                    help="skip the paid mapping stage entirely (passive/keyless only)")
+    rn.add_argument("--remap", action="store_true",
+                    help="re-ask mapping questions this task already paid for "
+                         "(default: an answered question is reused, never re-billed)")
     rn.add_argument("--no-onepass", action="store_true", help="skip the onepass stage")
     rn.add_argument("--top-ports", type=int, default=1000)
     rn.add_argument("--max-seed", type=int, default=5)
@@ -3586,7 +3920,10 @@ def main(argv: list[str]) -> int:
         out({"error": "tool_missing", "message": str(exc)})
         return 4
     except core.FindInfoError as exc:
-        out({"error": "error", "message": str(exc)})
+        payload = {"error": getattr(exc, "code", "") or "error", "message": str(exc)}
+        if getattr(exc, "hint", ""):
+            payload["hint"] = exc.hint
+        out(payload)
         return 2
     except KeyboardInterrupt:
         return 130

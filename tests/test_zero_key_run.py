@@ -54,31 +54,19 @@ def test_split_engines_keeps_configured_ones():
 
 
 def test_uncover_is_not_run_without_any_key():
-    """A keyless uncover can only fail; running it turns a gap into a failure."""
+    """No key: the passive stage asks nothing, and mapping says why.
+
+    subs is keyless now, so it never produces an `uncover` source entry; the
+    "no api key" reason belongs to the mapping dispatch's skipped-engine list.
+    """
+    from lib import mapdispatch
     core = fresh_core()
-    tools = fresh_tools(core)
-    calls = []
-
-    def fake_run(cmd, *a, **kw):
-        calls.append(cmd)
-        return (0, "", "")
-
-    with _keyless(core, [
-        mock.patch.object(core, "has_tool",
-                          lambda n: n in ("subfinder", "uncover")),
-        mock.patch.object(core, "run", fake_run),
-    ]):
-        out = tools.t_subs(core.Store(), "example.com")
-
-    ran = [c for c in calls if "uncover" in " ".join(str(x) for x in c)]
-    assert not ran, "uncover ran with no engine key: " + repr(ran)
-    by_id = {p["id"]: p for p in out["per_source"]}
-    assert by_id["uncover"]["outcome"] == core.OUTCOME_UNAVAILABLE, by_id
-    assert "no api key" in by_id["uncover"]["error"], by_id["uncover"]
-    assert out["outcome"] != core.OUTCOME_FAILED, out
-    assert out["ok"] is True, out
-
-
+    core.CFG.setdefault("apis", {}).setdefault("fofa", {})["key"] = ""
+    core.CFG["apis"]["fofa"]["base"] = ""
+    core.CFG.setdefault("apis", {}).setdefault("quake", {})["key"] = ""
+    usable, skipped = mapdispatch.engines_for("domain", "fofa,quake")
+    assert usable == [], usable
+    assert all(x["reason"] == "no api key" for x in skipped), skipped
 def test_subs_with_no_key_reports_empty_not_failed():
     """subfinder succeeded with nothing; uncover was never asked -> not failed."""
     core = fresh_core()

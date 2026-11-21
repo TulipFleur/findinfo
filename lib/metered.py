@@ -66,10 +66,13 @@ def status_of(outcome: str, rc=None, count: int | None = None,
         return ST_AUTH
     if rc == 124 or "timeout" in err or "timed out" in err:
         return ST_FAILED
-    if count == 0:
-        return ST_EMPTY
+    # A non-zero exit is a FAILURE even with zero rows: checking "count == 0"
+    # first recorded a crashed dispatch as a valid empty answer, which the
+    # ledger then reused forever (the query would never be retried).
     if rc not in (None, 0):
         return ST_FAILED
+    if count == 0:
+        return ST_EMPTY
     return ST_OK
 
 

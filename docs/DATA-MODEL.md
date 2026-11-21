@@ -63,6 +63,13 @@ no run was read at all, **which does not mean there are no gaps**), `top_hosts` 
 `next_steps`. Truncated arrays state their `kept` and `total` in `truncated` —
 **seeing truncated does not mean the data is complete; conclusions must be phrased around the gaps it reports**.
 
+**Source gaps in `coverage.unavailable`** (non-blocking; each lists ids, flattened into the brief's `unavailable` rows):
+`unconfirmed_empty` — `uncover:<engine>` dispatches that returned no rows (uncover reports an upstream syntax/auth
+error as rc=0 with no rows, so this is not proof that nothing exists); `unsupported_engines` — keyed engines that were
+not asked because no query is known for them (e.g. censys for subdomains, shodan for ICP); `truncated_sources` —
+`onepass:<id>` sources whose upstream holds more rows than were fetched (page budget spent, or a billed engine's first
+page). None of them fails a stage or changes the exit code; all of them belong in the delivery's gap list.
+
 **Display cap ≠ processing cap**: `assets` shows only 500 rows by default; the full set is in the store.
 Lists in tool stdout are display samples only; the full set actually processed by each stage goes into the store, and downstream stages
 (probe/ports/crawl/extract) pull the complete set from it. Coverage gaps caused by deliberate budgets (`--max-seed`/`--limit`/`--max-vhost-ips` etc.)

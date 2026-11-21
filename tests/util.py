@@ -44,7 +44,26 @@ def fresh_core(task: str | None = None):
         os.environ.pop("FINDINFO_TASK", None)
     import lib.core as core
     importlib.reload(core)
+    # The task database is isolated by FINDINFO_HOME, but the CONFIG is not:
+    # config/.env and config.json live beside the source and may hold the
+    # developer's REAL credentials. A test that inherited a live key would
+    # both leak it into a log and change behaviour (a run would try to spend
+    # quota). Tests start from "no optional credential configured".
+    _blank_credentials(core)
     return core
+
+
+def _blank_credentials(core_mod) -> None:
+    """Remove every API credential from the freshly loaded config."""
+    apis = core_mod.CFG.get("apis")
+    if not isinstance(apis, dict):
+        return
+    for name, entry in list(apis.items()):
+        if isinstance(entry, dict):
+            for field in ("key", "email", "base", "token", "org_id",
+                          "id", "secret"):
+                if field in entry:
+                    entry[field] = ""
 
 
 def fresh_tools(core_mod):

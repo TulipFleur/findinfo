@@ -132,32 +132,40 @@ def test_wildcard_answers_are_filtered_and_reported():
 
 
 def test_quota_exhausted_is_not_reported_as_empty():
-    """An exhausted budget must be a coverage gap, not "no assets found"."""
-    core = fresh_core()
-    from lib import tools
+    """An exhausted budget must be a coverage gap, not "no assets found".
 
-    # the relay answers with an error containing a quota hint
-    tools_core_base = core.api_base
-    tools_core_key = core.api_key
-    orig_curl = core.curl
-    core.api_base = lambda name: "http://relay.invalid" if name == "fofa" else tools_core_base(name)
-    core.api_key = lambda name: "k" if name == "fofa" else tools_core_key(name)
-    core.curl = lambda *a, **k: (
-        0, '{"ok": false, "error": "quota exhausted for this AK"}', "")
+    The FOFA relay is a PAID mapping backend, so this now belongs to the
+    mapping dispatch (subs is passive): a quota error on the wire is recorded
+    as ST_QUOTA on the task ledger, and a later run refuses to treat it as an
+    answered question.
+    """
+    from lib import mapdispatch, mapping, metered
+    core = fresh_core()
     store = core.Store()
     try:
-        res = tools.t_subs(store, "example.com", engines="fofa")
+        mapping.ensure_schema(store)
+        core.CFG.setdefault("apis", {}).setdefault("fofa", {})["key"] = "test-k"
+        core.CFG["apis"]["fofa"]["email"] = "probe@example.com"
+        orig = core.run
+
+        def quota_run(cmd, **kw):
+            return 0, "", "quota exhausted for this AK"
+
+        core.run = quota_run
+        try:
+            r = mapdispatch.ask(store, "RUNQ", "fofa", "domain", "example.com")
+        finally:
+            core.run = orig
+        assert r["status"] == metered.ST_QUOTA, r
+        assert r["rows"] == 0, r
+        q = mapping.question("fofa", "domain", "example.com",
+                             core.uncover_query("domain", "fofa", "example.com"))
+        assert mapping.lookup(store, q)["status"] == metered.ST_QUOTA, (
+            "an exhausted quota must be recorded as quota, not as empty")
+        cov = mapping.coverage(store)
+        assert cov["by_engine"]["fofa"]["quota"] == 1, cov
     finally:
-        core.curl = orig_curl
-        core.api_base = tools_core_base
-        core.api_key = tools_core_key
         store.close()
-    assert res.get("quota_exhausted") is True, (
-        "an exhausted quota looked exactly like a source with no results: " +
-        repr({k: v for k, v in res.items() if k != 'domains'}))
-    assert any("quota_exhausted" in s for s in res.get("sources_unavailable") or [])
-
-
 def test_quota_flag_reaches_coverage_unavailable():
     """Exercises the real fold used by the pipeline (no network involved)."""
     fin = __import__("findinfo", fromlist=["findinfo"])

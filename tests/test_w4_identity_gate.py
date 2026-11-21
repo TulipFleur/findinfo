@@ -139,4 +139,4 @@ def test_unique_company_run_is_unaffected():
     rc, payload = _run(fi, _args(), fakes)
     assert rc == 0, payload.get("result")
     # the icp code harvested from the anchor feeds the icp stage plan
-    assert "icp" in payload.get("planned_stages", []), payload.get("planned_stages")
+    assert "mapping" in payload.get("planned_stages", []), payload.get("planned_stages")

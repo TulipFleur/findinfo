@@ -341,6 +341,21 @@ class ToolMissing(FindInfoError):
     pass
 
 
+class ScopeRequired(FindInfoError):
+    """A command would take its targets from the whole shared asset store.
+
+    The store is shared across engagements (and across tasks when --task is
+    omitted), so an unscoped read hands one target's assets to another
+    target's stage. `code` is the stable error key on stdout; `hint` says
+    how to scope the command.
+    """
+    code = "scope_required"
+
+    def __init__(self, message: str, hint: str = ""):
+        super().__init__(message)
+        self.hint = hint
+
+
 class StageError(FindInfoError):
     """A pipeline stage failed at the tool level (non-zero rc, timeout, ...).
 
@@ -367,6 +382,10 @@ DEFAULT_CONFIG = {
         "urlscan": {"key": ""},
         "shodan": {"key": ""},
         "chaos": {"key": ""},
+        # Censys Platform authenticates with a token + organization id (the
+        # old "key" field never existed, so CENSYS_API_KEY was always empty).
+        "censys": {"token": "", "org_id": "", "id": "", "secret": ""},
+        "zoomeye": {"key": ""},
     },
     "http": {"timeout": 25, "user_agent": "Mozilla/5.0 findinfo"},
     "dns": {
@@ -400,6 +419,8 @@ ENV_MAP = {
     "SHODAN_KEY": ("apis", "shodan.key"),
     "CENSYS_ID": ("apis", "censys.id"),
     "CENSYS_SECRET": ("apis", "censys.secret"),
+    "CENSYS_API_TOKEN": ("apis", "censys.token"),
+    "CENSYS_ORGANIZATION_ID": ("apis", "censys.org_id"),
     "SECURITYTRAILS_KEY": ("apis", "securitytrails.key"),
     "VIRUSTOTAL_KEY": ("apis", "virustotal.key"),
     "URLSCAN_KEY": ("apis", "urlscan.key"),
@@ -470,11 +491,18 @@ def _deep_merge(base: dict, extra: dict) -> None:
 CFG = load_config()
 
 
+# The credential field differs per provider: Censys issues a token (+ org id),
+# everyone else uses "key". api_key() reads the field the provider actually
+# uses, so a configured Censys token is not reported as "no key" forever.
+_KEY_FIELD = {"censys": "token"}
+
+
 def api_key(name: str) -> str:
     v = CFG.get("apis", {}).get(name, {})
-    if isinstance(v, dict):
-        return v.get("key") or ""
-    return ""
+    if not isinstance(v, dict):
+        return ""
+    field = _KEY_FIELD.get(name, "key")
+    return v.get(field) or v.get("key") or ""
 
 
 # Which config key each uncover engine needs. An engine with no key can only
@@ -503,8 +531,58 @@ def engine_has_key(engine: str) -> bool:
         # official API entirely (see api_base).
         return bool(api_key("fofa") or api_base("fofa"))
     if name == "censys":
-        return bool(api_key("censys") or api_key("censys_id"))
+        # uncover reads CENSYS_API_TOKEN and CENSYS_ORGANIZATION_ID; a token
+        # without the org id is still a usable credential (uncover falls back
+        # to the token's own organization), but neither means "no key".
+        return bool(api_key("censys"))
     return bool(api_key(name))
+
+
+# uncover hands `-q` to every engine VERBATIM -- it does not translate between
+# query languages -- so one query string sent to five engines is right for at
+# most one of them. uncover also reports an upstream syntax or auth error as
+# rc=0 with no rows, so the other engines used to look like "found nothing".
+# Every engine is asked in its own language, one dispatch per engine, so each
+# answer (and each failure) is attributed to the engine that gave it.
+# fofa/quake/hunter mirror rust/onepass/src/sources.rs, which queries the same
+# APIs directly. An engine missing from a table is never asked: guessing its
+# syntax would only manufacture another silent zero.
+UNCOVER_DOMAIN_QUERY = {
+    "fofa": 'domain="{value}"',
+    "quake": 'domain:"{value}"',
+    "hunter": 'domain="{value}"',
+    "shodan": 'hostname:"{value}"',
+}
+UNCOVER_ICP_QUERY = {
+    "fofa": 'icp="{value}"',
+    "quake": 'icp:"{value}"',
+    "hunter": 'icp.number="{value}"',
+}
+_QUERY_TABLES = {"domain": UNCOVER_DOMAIN_QUERY, "icp": UNCOVER_ICP_QUERY}
+
+
+def uncover_query(kind: str, engine: str, value: str) -> str | None:
+    """`value` asked of `engine` in that engine's own syntax, or None.
+
+    Quotes and backslashes are stripped from the value: it is interpolated
+    inside a quoted term, and a stray quote would turn one term into a
+    different query.
+    """
+    tpl = _QUERY_TABLES.get(kind, {}).get((engine or "").strip().lower())
+    if not tpl:
+        return None
+    clean = str(value or "").replace('"', "").replace("\\", "").strip()
+    return tpl.replace("{value}", clean)
+
+
+def uncover_query_identity(kind: str, engines: list[str]) -> dict:
+    """{engine: template} for the engines that will actually be asked.
+
+    Part of a stage's checkpoint inputs: when a template changes, a stage that
+    asked the old question re-runs instead of hitting its checkpoint.
+    """
+    table = _QUERY_TABLES.get(kind, {})
+    return {e: table[e] for e in engines if e in table}
 
 
 def split_engines(engines: str) -> tuple[list[str], list[str]]:
@@ -534,34 +612,119 @@ def api_base(name: str) -> str:
     return (v.get("base") or "").rstrip("/") if isinstance(v, dict) else ""
 
 
-# ProjectDiscovery binaries (uncover, subfinder, ...) only read keys from the
-# environment, never from our config/. Without this bridge a configured FOFA key
-# shows up as `api_keys.fofa = true` in doctor while `uncover` still dies with
-# "requires keys but no keys were found".
-_ENV_KEY_MAP = {
-    "fofa": [("FOFA_EMAIL", api_email("fofa")), ("FOFA_KEY", api_key("fofa"))],
-    "quake": [("QUAKE_TOKEN", api_key("quake"))],
-    "hunter": [("HUNTER_TOKEN", api_key("hunter"))],
-    "chaos": [("CHAOS_KEY", api_key("chaos"))],
-    "securitytrails": [("SECURITYTRAILS_API_KEY", api_key("securitytrails"))],
-    "virustotal": [("VIRUSTOTAL_API_KEY", api_key("virustotal"))],
-    "urlscan": [("URLSCAN_API_KEY", api_key("urlscan"))],
-    "shodan": [("SHODAN_API_KEY", api_key("shodan"))],
-    "censys": [("CENSYS_API_KEY", api_key("censys"))],
+# ProjectDiscovery binaries only read keys from the environment, never from our
+# config/. But the variable NAME differs per consumer, and the old table used
+# one name per engine for every consumer, so several configured keys never
+# reached the tool that wanted them:
+#
+#   engine          .env key            tool              variable the tool reads
+#   hunter          HUNTER_KEY          uncover           HUNTER_API_KEY
+#                                       onepass           HUNTER_KEY
+#   securitytrails  SECURITYTRAILS_KEY  uncover/onepass   SECURITYTRAILS_API_KEY
+#   virustotal      VIRUSTOTAL_KEY      uncover/onepass   VIRUSTOTAL_API_KEY
+#   urlscan         URLSCAN_KEY         uncover/onepass   URLSCAN_API_KEY
+#   censys          CENSYS_ID/SECRET    uncover           CENSYS_API_TOKEN
+#                                                         + CENSYS_ORGANIZATION_ID
+#   zoomeye         ZOOMEYE_KEY         uncover           ZOOMEYE_API_KEY
+#
+# The uncover names come from the upstream agent sources
+# (github.com/projectdiscovery/uncover/agents/*) and from a string scan of the
+# bundled binary; the onepass names come from rust/onepass/src/sources.rs
+# (`Auth::Header(_, "HUNTER_KEY")` etc). A name is listed only when a consumer
+# is known to read it -- a guess would look configured while silently failing.
+# Evaluated AT CALL TIME, not import time: api_key() reads the live config, and
+# a module-level dict froze whatever was configured when the process started
+# (so a test that overrides a key still saw the old one).
+def _consumer_env(consumer: str) -> dict:
+    if consumer == "uncover":
+        return {
+            "fofa": [("FOFA_EMAIL", api_email("fofa")),
+                     ("FOFA_KEY", api_key("fofa"))],
+            "quake": [("QUAKE_TOKEN", api_key("quake"))],
+            "hunter": [("HUNTER_API_KEY", api_key("hunter"))],
+            "shodan": [("SHODAN_API_KEY", api_key("shodan"))],
+            "censys": [("CENSYS_API_TOKEN", api_key("censys")),
+                       ("CENSYS_ORGANIZATION_ID",
+                        str((CFG.get("apis", {}).get("censys") or {})
+                            .get("org_id") or ""))],
+            "zoomeye": [("ZOOMEYE_API_KEY", api_key("zoomeye"))],
+        }
+    if consumer == "onepass":
+        return {
+            "fofa": [("FOFA_EMAIL", api_email("fofa")),
+                     ("FOFA_KEY", api_key("fofa"))],
+            "quake": [("QUAKE_TOKEN", api_key("quake"))],
+            "hunter": [("HUNTER_KEY", api_key("hunter"))],
+            "chaos": [("CHAOS_KEY", api_key("chaos"))],
+            "securitytrails": [("SECURITYTRAILS_KEY",
+                                api_key("securitytrails"))],
+            "virustotal": [("VIRUSTOTAL_KEY", api_key("virustotal"))],
+            "urlscan": [("URLSCAN_KEY", api_key("urlscan"))],
+        }
+    return {}
+
+
+# The engine names each consumer can be asked about (values come from
+# _consumer_env() at call time).
+CONSUMER_ENV = {
+    "uncover": {k: [] for k in ("fofa", "quake", "hunter", "shodan",
+                                "censys", "zoomeye")},
+    "onepass": {k: [] for k in ("fofa", "quake", "hunter", "chaos",
+                                "securitytrails", "virustotal", "urlscan")},
 }
 
+# Variable NAMES per consumer (for stripping and for documentation).
+_CONSUMER_VARS = {
+    "uncover": ("FOFA_EMAIL", "FOFA_KEY", "QUAKE_TOKEN", "HUNTER_API_KEY",
+                "SHODAN_API_KEY", "CENSYS_API_TOKEN",
+                "CENSYS_ORGANIZATION_ID", "ZOOMEYE_API_KEY"),
+    "onepass": ("FOFA_EMAIL", "FOFA_KEY", "QUAKE_TOKEN", "HUNTER_KEY",
+                "CHAOS_KEY", "SECURITYTRAILS_KEY", "VIRUSTOTAL_KEY",
+                "URLSCAN_KEY"),
+}
 
-def tool_env() -> dict:
-    """Env vars that expose configured API keys to child binaries.
+# Every variable any consumer might read. A child that is NOT a mapping
+# dispatch has these stripped, including values inherited from the ambient
+# environment: httpx and naabu have no business holding paid API keys, and an
+# exported key is one more thing a compromised tool can leak.
+_ALL_KEY_VARS = frozenset(k for names in _CONSUMER_VARS.values()
+                          for k in names)
 
-    Only non-empty values are injected so an existing shell environment still
-    wins for anything we do not have.
+
+def tool_env(consumer: str | None = None,
+             engines=None) -> dict:
+    """API-key env vars for ONE consumer ("uncover" / "onepass"), or none.
+
+    `consumer=None` returns {} on purpose: the default for any child process is
+    NO key. Mapping dispatch passes the consumer it is actually calling, so
+    httpx/naabu/katana/dnsx never see a key and a paid tool gets exactly its
+    own variables under the names it reads.
     """
+    if not consumer:
+        return {}
+    table = _consumer_env(consumer)
+    if engines is None:
+        chosen = table
+    else:
+        want = {str(e).strip().lower() for e in (engines or [])}
+        chosen = {k: v for k, v in table.items() if k in want}
     env: dict = {}
-    for pairs in _ENV_KEY_MAP.values():
+    for pairs in chosen.values():
         for k, v in pairs:
             if v:
                 env[k] = v
+    return env
+
+
+def strip_key_env(env: dict) -> dict:
+    """Remove known API-key variables from a child environment.
+
+    Applied to every child that is not a mapping dispatch, so a key exported in
+    the user's shell (or inherited from a parent mapping process) is not handed
+    to a tool that never needs it.
+    """
+    for k in _ALL_KEY_VARS:
+        env.pop(k, None)
     return env
 
 
@@ -609,11 +772,10 @@ def run(cmd: list[str], timeout: int = 300, input_text: str | None = None,
     force over a big wordlist) can otherwise be killed mid-run and look like
     they failed when they simply had not finished.
     """
-    e = dict(os.environ)
+    e = strip_key_env(dict(os.environ))
     e.setdefault("PYTHONIOENCODING", "utf-8")
-    # API keys live in config/.env; ProjectDiscovery tools only read env vars.
-    for k, v in tool_env().items():
-        e.setdefault(k, v)
+    # No key is injected by default (see tool_env): a child gets the exact
+    # variables its tool reads only when a mapping dispatch passes them.
     if env:
         e.update(env)
     lim = None if not timeout or timeout <= 0 else timeout
@@ -838,10 +1000,8 @@ def run_stream(cmd: list[str], on_line=None, timeout: int = 300,
     records: peak memory stays flat no matter how big the output is, because the
     text is consumed line by line and dropped. Returns (rc, lines, stderr_tail).
     """
-    e = dict(os.environ)
+    e = strip_key_env(dict(os.environ))
     e.setdefault("PYTHONIOENCODING", "utf-8")
-    for k, v in tool_env().items():
-        e.setdefault(k, v)
     if env:
         e.update(env)
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -1432,6 +1592,38 @@ def canon_scope(entries: Iterable[str]) -> list[str]:
         if d and d not in out:
             out.append(d)
     return out
+
+
+def canon_match(entries: Iterable[str]) -> list[str]:
+    """Scope entries for MATCHING stored assets: strict where possible, but a
+    user-typed private name (dev.corp.local, *.test) is kept, never dropped.
+
+    canon_scope() is the crawl/JS de-noiser and drops such names; used to
+    build a query filter it turned "--scope dev.corp.local" into no filter at
+    all, i.e. the whole shared store.
+    """
+    out: list[str] = []
+    for e in entries or []:
+        d = canon_domain(e) or canon_user_domain(e)
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def is_public_ip(value: str) -> bool:
+    """True for a globally routable unicast address.
+
+    Private, loopback, link-local, CGNAT, benchmark (198.18.0.0/15, the
+    Clash/TUN fake-IP range), documentation, reserved and multicast addresses
+    are not: an address like that taken from the store came out of a page,
+    JS bundle or internal DNS answer, and probing it reaches whatever network
+    the operator happens to sit in, not the target.
+    """
+    try:
+        addr = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return bool(addr.is_global and not addr.is_multicast)
 
 
 def canon_user_scope(entries: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -2066,7 +2258,12 @@ class Store:
         if kind:
             sql += " AND kind=?"
             args.append(kind)
-        match = canon_scope(match or [])
+        requested = bool(match)
+        match = canon_match(match or [])
+        if requested and not match:
+            # The caller asked for a scope and none of it is a usable name:
+            # that is an empty scope, never "no scope" (the whole store).
+            return []
         sql_match = match if len(match) <= 50 else []
         if sql_match:
             sql += " AND (" + " OR ".join(

@@ -980,6 +980,12 @@ def _gateway_rows_to_domains(res: dict) -> tuple[list[str], list[str]]:
 
 
 # ---------------------------------------------------------------- 3. ICP reverse lookup
+# Each engine is asked in its own query language (core.uncover_query); an
+# empty answer cannot be told apart from an upstream error, so it is marked.
+UNCONFIRMED_NOTE = ("uncover answers an upstream error the same way (rc=0, "
+                    "no rows): this empty is unconfirmed")
+
+
 def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
           timeout: int = 0, ledger=None) -> dict:
     """ICP reverse lookup; `ledger` records one row per billed request."""
@@ -1006,6 +1012,8 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
     ips: list[str] = []
     rows = 0
     errors: list[dict] = []
+    unconfirmed: list[str] = []
+    unsupported: list[str] = []
     for code in codes:
         code = code.strip()
         if not code:
@@ -1054,28 +1062,29 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
                            "stderr": "no api key for engines: " +
                                      ",".join(missing)})
             continue
-        q = 'icp="' + code + '"'
-        core.throttle("fofa")
-        core.mapping_wait()
-        _t1 = time.time()
-        rc, out, err = core.run([exe, "-q", q, "-e", ",".join(usable), "-json",
-                                 "-silent"], timeout=timeout)
-        _n = sum(1 for _ in core.parse_jsonl(out))
-        _billed("uncover", input_hash=_metered.hash_input(
-                    {"icp": code, "engines": usable}),
-                unit=_metered.UNIT_NATIVE_DISPATCH,
-                rc=rc, requested=1, returned=_n,
-                elapsed_sec=time.time() - _t1,
-                error=(err or "")[-200:] if rc not in (0, None) else "",
-                status=("failed" if rc == 124 else
-                        "empty" if _n == 0 and rc in (0, None) else
-                        "ok" if rc in (0, None) else "failed"))
-        if rc != 0 or not (out or "").strip():
-            # uncover swallows upstream API errors (bad key -> empty stdout with
-            # rc=0), so a silent zero is indistinguishable from "no results".
-            # Surface it instead of returning a clean-looking empty list.
-            core.log("icp " + code + ": uncover rc=" + str(rc) + " empty "
-                     + ("; " + err.strip()[:200] if err.strip() else ""))
+        for eng in usable:
+            q = core.uncover_query("icp", eng, code)
+            if not q:
+                # Shodan/Censys have no ICP field: asking them anyway only
+                # ever produced a silent zero. Not asked, reported as a gap.
+                if eng not in unsupported:
+                    unsupported.append(eng)
+                continue
+            core.throttle(eng)
+            core.mapping_wait()
+            _t1 = time.time()
+            rc, out, err = core.run([exe, "-q", q, "-e", eng, "-json",
+                                     "-silent"], timeout=timeout)
+            _n = sum(1 for _ in core.parse_jsonl(out))
+            _billed("uncover:" + eng, input_hash=_metered.hash_input(
+                        {"icp": code, "engine": eng}),
+                    unit=_metered.UNIT_NATIVE_DISPATCH,
+                    rc=rc, requested=1, returned=_n,
+                    elapsed_sec=time.time() - _t1,
+                    error=(err or "")[-200:] if rc not in (0, None) else "",
+                    status=("failed" if rc == 124 else
+                            "empty" if _n == 0 and rc in (0, None) else
+                            "ok" if rc in (0, None) else "failed"))
             _low = (err or "").lower()
             # "requires keys but no keys were found" / "no api key" is a
             # CAPABILITY gap (docs: a missing optional credential is not a
@@ -1083,29 +1092,68 @@ def t_icp(store, codes: list[str], engines: str = "fofa,quake,hunter",
             _missing_key = any(k in _low for k in
                                ("requires keys", "no keys", "no api key",
                                 "unauthorized", "401", "403"))
-            _entry = {"code": code, "rc": rc, "stderr": err.strip()[:300]}
-            if _missing_key:
-                _entry["unavailable"] = True
-            errors.append(_entry)
-        for r in core.parse_jsonl(out):
-            rows += 1
-            host = r.get("host") or ""
-            d = core.canon_domain(host)
-            if d:
-                domains.append(d)
-                store.upsert_asset("domain", d, source="icp:" + code.split("备")[-1][:12],
-                                   confidence=0.9, passivity="passive", parent=code)
-            ip = core.canon_ip(r.get("ip") or "")
-            if ip:
-                ips.append(ip)
-                store.upsert_asset("ip", ip, source="icp:" + code.split("备")[-1][:12],
-                                   confidence=0.5, passivity="passive", parent=code)
+            if rc != 0 or (_missing_key and not (out or "").strip()):
+                core.log("icp " + code + " via " + eng + ": uncover rc=" + str(rc)
+                         + ("; " + err.strip()[:200] if err.strip() else ""))
+                _entry = {"code": code, "engine": eng, "rc": rc,
+                          "stderr": err.strip()[:300]}
+                if _missing_key:
+                    _entry["unavailable"] = True
+                errors.append(_entry)
+            elif not (out or "").strip():
+                # uncover swallows upstream API errors (bad key -> empty stdout
+                # with rc=0), so this zero is indistinguishable from "no
+                # results": a visible gap, not a clean empty and not a failure.
+                core.log("icp " + code + " via " + eng + ": no rows (" +
+                         UNCONFIRMED_NOTE + ")")
+                if "uncover:" + eng not in unconfirmed:
+                    unconfirmed.append("uncover:" + eng)
+            for r in core.parse_jsonl(out):
+                rows += 1
+                host = r.get("host") or ""
+                d = core.canon_domain(host)
+                if d:
+                    domains.append(d)
+                    store.upsert_asset("domain", d, source="icp:" + code.split("备")[-1][:12],
+                                       confidence=0.9, passivity="passive", parent=code)
+                ip = core.canon_ip(r.get("ip") or "")
+                if ip:
+                    ips.append(ip)
+                    store.upsert_asset("ip", ip, source="icp:" + code.split("备")[-1][:12],
+                                       confidence=0.5, passivity="passive", parent=code)
     domains, ips = _uniq(domains), _uniq(ips)
     return {"codes": codes, "rows": rows, "domains": domains, "ips": ips,
-            "errors": errors}
+            "errors": errors, "unconfirmed_empty": sorted(unconfirmed),
+            "unsupported_engines": unsupported}
 
 
 # ---------------------------------------------------------------- 4. passive subdomains
+# onepass sources that need NO credential (rust/onepass/src/sources.rs:
+# every entry with Auth::None). Passive collection uses exactly this
+# set, so the stage can never spend mapping quota.
+KEYLESS_ONEPASS_SOURCES = ("crtsh", "certspotter", "hackertarget",
+                            "rapiddns", "anubis", "alienvault",
+                            "threatminer", "subdomain_center")
+
+
+def _empty_provider_config() -> str:
+    """Path to an empty subfinder provider-config, created once.
+
+    subfinder reads the operator's global provider config unless -pc
+    overrides it; an empty file is how this stage stays keyless
+    (no fofa/quake/hunter key reaches it, and no second paid query).
+    """
+    path = core.DATA / "_empty_subfinder_provider.yaml"
+    try:
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# intentionally empty: findinfo queries "
+                            "engines itself" + chr(10), encoding="utf-8")
+    except OSError:
+        pass
+    return str(path)
+
+
 def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
            timeout: int = 0, ledger=None) -> dict:
     """Passive subdomain enumeration across the mapping engines.
@@ -1141,45 +1189,10 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
             return
         found.setdefault(cd, set()).add(src)
 
-    # Third-party FOFA relay first: it returns real hostnames from the `link`
-    # field, which official-protocol endpoints and uncover would miss.
-    quota_exhausted = False
-    if core.api_base("fofa"):
-        core.log("fofa gateway " + domain)
-        _gw_t0 = time.time()
-        res = fofa_gateway_query('domain="' + domain + '"', size=10000, timeout=timeout)
-        _billed("fofa-gateway",
-                status=_metered.ST_QUOTA if (res and res.get("quota_exhausted"))
-                else (_metered.ST_FAILED if res is None else
-                      (_metered.ST_EMPTY if not (res or {}).get("count")
-                       else _metered.ST_OK)),
-                requested=1, returned=int((res or {}).get("count") or 0),
-                elapsed_sec=time.time() - _gw_t0,
-                quota={"remaining": (res or {}).get("remaining"),
-                       "maxQueries": (res or {}).get("maxQueries")})
-        if res and res.get("quota_exhausted"):
-            # Reported, not silent: the source produced nothing because its
-            # budget ran out, which is a coverage gap, not "no assets exist".
-            quota_exhausted = True
-            core.log("fofa gateway: skipped for " + domain +
-                     " — quota exhausted, recorded as a coverage gap")
-        elif res:
-            gd, gip = _gateway_rows_to_domains(res)
-            for d in gd:
-                add(d, "fofa-gateway")
-            for ip in gip:
-                store.upsert_asset("ip", ip, source="fofa-gateway", confidence=0.6,
-                                   passivity="passive", parent=domain)
-            core.log("fofa gateway: total=" + str(res.get("total")) +
-                     " rows=" + str(res.get("count")) +
-                     " hosts=" + str(len(gd)) +
-                     " remaining=" + str(res.get("remaining")))
-            quota_exhausted = bool(res.get("quota_exhausted"))
+    # The FOFA relay is a PAID mapping backend: it is dispatched by the
+    # single `mapping` stage (through the ledger), never from this passive
+    # stage. Called here it paid for the same seed a second time in one run.
 
-    # Every source records its own outcome. A dead source used to be invisible:
-    # the function returned count=0 and the stage checkpointed "done", so
-    # "subfinder crashed" and "this domain has no subdomains" were the same
-    # string to the agent. Each entry below is (id, outcome, found, error).
     per_source: list[dict] = []
 
     def run_source(sid: str, cmd: list[str], *, key: str, tool: str,
@@ -1192,16 +1205,20 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
             add(r.get(key, "") or r.get("host", ""), sid)
         n = sum(1 for srcs in found.values() if sid in srcs)
         outcome = core.outcome_from_rc(rc, n)
-        per_source.append({"id": sid, "outcome": outcome, "found": n,
-                           "rc": rc,
-                           "error": ("timeout" if rc == 124 else
-                                     (err or "")[-200:].strip() if rc not in (0, None) else "")})
+        entry = {"id": sid, "outcome": outcome, "found": n, "rc": rc,
+                 "error": ("timeout" if rc == 124 else
+                           (err or "")[-200:].strip() if rc not in (0, None) else "")}
+        if tool == "uncover" and outcome == core.OUTCOME_EMPTY:
+            entry["confirmed"] = False
+            entry["note"] = UNCONFIRMED_NOTE
+        per_source.append(entry)
         if outcome in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT):
             core.log(sid + ": " + outcome + " rc=" + str(rc))
         if billed:
             # uncover is the billed dispatcher (its engines all cost quota);
-            # free sources (subfinder, chaos) never reach the ledger.
-            _billed("uncover", rc=rc, requested=1, returned=n,
+            # free sources (subfinder, chaos) never reach the ledger. One row
+            # per engine dispatch, so a quota/auth verdict names its engine.
+            _billed(sid, rc=rc, requested=1, returned=n,
                     unit=_metered.UNIT_NATIVE_DISPATCH,
                     elapsed_sec=time.time() - _t0,
                     error=(err or "")[-200:] if rc not in (0, None) else "",
@@ -1210,38 +1227,26 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
                             "ok" if rc in (0, None) else "failed"))
 
     if core.has_tool("subfinder"):
+        # subfinder reads a provider config when it can: with a global
+        # ~/.config/subfinder/provider-config.yaml it silently re-queries
+        # the same paid engines mapping already asked (and bills again).
+        # -pc points it at an EMPTY file we own, so this stage stays
+        # keyless whatever the operator has configured globally.
         run_source("subfinder",
                    [core.tool("subfinder"), "-d", domain, "-all",
-                    "-recursive", "-silent", "-json"], key="host", tool="subfinder")
+                    "-recursive", "-silent", "-json",
+                    "-pc", _empty_provider_config()],
+                   key="host", tool="subfinder")
     else:
         per_source.append({"id": "subfinder", "outcome": core.OUTCOME_UNAVAILABLE,
                            "found": 0, "rc": None, "error": "binary not found"})
 
-    if core.has_tool("chaos") and core.api_key("chaos"):
-        run_source("chaos",
-                   [core.tool("chaos"), "-d", domain, "-silent", "-json",
-                    "-key", core.api_key("chaos")], key="domain", tool="chaos")
-
-    # Only hand uncover the engines we actually have credentials for: an engine
-    # with no key can only fail, and one dead engine out of five used to turn a
-    # successful stage into "every source failed" -> partial run -> an agent
-    # that resumes forever against a problem retrying can never fix.
-    usable_engines, missing_engines = core.split_engines(engines)
-    if core.has_tool("uncover") and usable_engines:
-        core.throttle("fofa")
-        core.mapping_wait()
-        run_source("uncover",
-                   [core.tool("uncover"), "-q", 'domain:"' + domain + '"',
-                    "-e", ",".join(usable_engines), "-json", "-silent"],
-                   key="host", tool="uncover", billed=True)
-    elif not core.has_tool("uncover"):
-        per_source.append({"id": "uncover", "outcome": core.OUTCOME_UNAVAILABLE,
-                           "found": 0, "rc": None, "error": "binary not found"})
-    else:
-        per_source.append({"id": "uncover", "outcome": core.OUTCOME_UNAVAILABLE,
-                           "found": 0, "rc": None,
-                           "error": "no api key for engines: " +
-                                    ",".join(missing_engines)})
+    # Paid mapping (uncover + the FOFA gateway + Chaos's keyed sources) is
+    # NOT done here: it belongs to the single `mapping` stage, which consults
+    # the task ledger so each question is paid for once. This stage is
+    # passive and keyless by construction.
+    unsupported: list[str] = []
+    _ = engines  # accepted for interface compatibility; no dispatch here
 
     rows = []
     for d, srcs in found.items():
@@ -1252,8 +1257,6 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
     rows.sort(key=lambda x: x["domain"])
 
     outcomes = [p["outcome"] for p in per_source]
-    if quota_exhausted:
-        outcomes.append(core.OUTCOME_BUDGET)
     tried = [p for p in per_source if p["outcome"] != core.OUTCOME_UNAVAILABLE]
     if tried and all(p["outcome"] in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT)
                      for p in tried):
@@ -1271,11 +1274,13 @@ def t_subs(store, domain: str, engines: str = "fofa,quake,hunter,shodan,censys",
            "outcome": outcome, "per_source": per_source,
            "ok": outcome in (core.OUTCOME_OK, core.OUTCOME_EMPTY,
                              core.OUTCOME_PARTIAL, core.OUTCOME_BUDGET),
-           "hint": core.outcome_hint(outcome)}
-    if quota_exhausted:
-        # Never let "the budget ran out" read as "this source found nothing".
-        out["quota_exhausted"] = True
-        out["sources_unavailable"] = ["fofa-gateway:quota_exhausted"]
+           "hint": core.outcome_hint(outcome),
+           # gaps the outcome alone cannot show: an engine that answered
+           # nothing (indistinguishable from an upstream error) and an engine
+           # that was never asked because its syntax is unknown
+           "unconfirmed_empty": sorted(p["id"] for p in per_source
+                                       if p.get("confirmed") is False),
+           "unsupported_engines": unsupported}
     return out
 
 
@@ -1902,7 +1907,12 @@ def t_ipagg(store, ips: list[str] | None = None, timeout: int = 0,
     in-scope hosts. Without it a second engagement's domains would drag that
     target's IPs into ports/vhost.
     """
-    scope = core.canon_scope(scope or [])
+    requested = bool(scope)
+    scope = core.canon_match(scope or [])
+    if requested and not scope:
+        # a scope was asked for and none of it is a usable name: an empty
+        # scope, never "no scope" (every IP in the shared store)
+        return {"ips": [], "candidates": [], "count_candidates": 0, "scope": []}
     if not ips:
         if scope:
             ips = [a["canonical"] for a in store.get_assets(kind="ip", match=scope)]
@@ -2980,8 +2990,17 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
     # The binary already reports sources_ok / sources_error; derive the outcome
     # from them instead of assuming success.
     per_source = [{"id": s.get("id"), "status": s.get("status"),
-                   "found": s.get("found"), "code": s.get("code")}
+                   "found": s.get("found"), "code": s.get("code"),
+                   # paging report (onepass >= 0.2): rows the upstream holds
+                   # beyond what came back -- a coverage limit, not a failure
+                   **{k: s[k] for k in ("pages", "truncated", "total", "page_error")
+                      if k in s}}
                   for s in data.get("sources", [])]
+    truncated = sorted("onepass:" + str(s.get("id")) for s in data.get("sources", [])
+                       if s.get("truncated") is True)
+    if truncated:
+        core.log("onepass: upstream answers capped (more rows exist than were "
+                 "fetched): " + ",".join(truncated))
     try:
         n_ok = int(data.get("sources_ok") or 0)
         n_err = int(data.get("sources_error") or 0)
@@ -3004,6 +3023,7 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
         "sources_ok": data.get("sources_ok"),
         "sources_error": data.get("sources_error"),
         "per_source": per_source,
+        "truncated_sources": truncated,
         "domains": rows[:2000],
         "outcome": outcome,
         "ok": outcome in (core.OUTCOME_OK, core.OUTCOME_EMPTY, core.OUTCOME_PARTIAL),

@@ -19,6 +19,7 @@ General conventions:
 | Data persistence | Automatically written to `~/.findinfo/findinfo.db`, overridable via `FINDINFO_HOME`; the `db` field of `doctor` is authoritative |
 | Idempotency | Re-discovering the same asset only updates `sources`/`last_seen`, no duplicates |
 | Cache | CT responses only (`~/.findinfo/cache/certs/`, 7 days); other stages have no cache |
+| Store reads | A single-stage command that takes its targets from the store (`--from-store`, or no explicit target) needs a scope: `--scope <domain>` (passive/subs/icp/dns/probe/ipagg/ports) or `--domain <domain>` (vhost/crawl/extract), repeatable. Without one it exits `2` with `{"error":"scope_required","message":...,"hint":...}` and runs nothing; a scope with no valid name in it is refused the same way, never widened. `--whole-store` reads every asset in the current store on purpose. Explicit targets (`--domain`/`--host`/`--ip`/`--url`/`--code`) need no scope |
 
 ---
 
@@ -100,15 +101,16 @@ python findinfo.py entity --name "Example Corp" --invest 51 --deep 2
 
 ```bash
 python findinfo.py passive --domain example.com
-python findinfo.py passive --from-store --min-conf 0.7
+python findinfo.py passive --from-store --scope example.com --min-conf 0.7
 python findinfo.py passive --domain example.com --sources crtsh,certspotter,rapiddns
 bin/windows/onepass.exe sources   # Linux: bin/linux/onepass                 # list the 15 sources: id / key needed / ready
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--domain` | — | repeatable; omitted = use store domains ≥0.7 |
-| `--from-store` | false | explicitly take domains from the store |
+| `--domain` | — | repeatable; omitted = read store domains ≥0.7 (needs `--scope`) |
+| `--from-store` | false | explicitly take domains from the store (needs `--scope` or `--whole-store`) |
+| `--scope` | — | scope of a store read, repeatable |
 | `--sources` | all usable sources | comma-separated ids, see `onepass sources` |
 | `--min-conf` | 0.0 | drop records below this confidence |
 
@@ -126,6 +128,13 @@ bin/windows/onepass.exe sources   # Linux: bin/linux/onepass                 # l
 **Sources (15)**: crtsh / certspotter / hackertarget / rapiddns / anubis / alienvault /
 threatminer / subdomain.center — 8 key-free; urlscan / virustotal / securitytrails /
 chaos / fofa / quake / hunter need keys (a missing key auto-skips without error; `per_source` marks it `missing_key`).
+
+**Paging (onepass ≥ 0.2)**: VirusTotal (`links.next`, same origin only) and urlscan (`search_after`) are paged up to 4 pages
+(the onepass binary's own page budget, 1–20; 4 fits VirusTotal's free 4 requests/minute). FOFA, Quake and Hunter are **never paged
+automatically** (every page spends quota): their first page is kept and the upstream total is reported instead. Each
+`per_source` entry carries `pages`, `truncated` and `total`; a source whose upstream holds more rows than were fetched is
+listed in `truncated_sources` (and, in a `run`, in `coverage.unavailable.truncated_sources`). A cap is a coverage limit,
+not a failure: the outcome is unchanged.
 
 **Confidence**: computed from the **number of independent sources** (1 ≤0.6, 2 ≥0.7, 3+ ≤0.95), stored with `sources`.
 **Value**: one command covers 8 free sources, much faster on cold start than chaining `certs` + `subs`; `per_source` shows immediately which source is down today.
@@ -158,7 +167,7 @@ python findinfo.py certs --domain example.com
 
 ```bash
 python findinfo.py subs --domain example.com
-python findinfo.py subs --from-store        # runs against every store domain >= 0.7
+python findinfo.py subs --from-store --scope example.com   # store domains >= 0.7 under the scope
 ```
 
 | Parameter | Default | Description |
@@ -179,7 +188,15 @@ python findinfo.py subs --from-store        # runs against every store domain >=
 }
 ```
 
-**Degradation**: without mapping keys `uncover` fails → only subfinder remains (+chaos if keyed); **it never errors out**.
+**Degradation**: without mapping keys `uncover` is not run → only subfinder remains (+chaos if keyed); **it never errors out**.
+
+**One dispatch per engine, in that engine's own syntax.** uncover hands `-q` to every engine verbatim, so each keyed engine is
+asked separately: fofa `domain="x"`, quake `domain:"x"`, hunter `domain="x"`, shodan `hostname:"x"` (the first three match
+`rust/onepass/src/sources.rs`). Each answer is attributed as `uncover:<engine>` in `per_source` and in asset `sources`.
+An engine with no known query (e.g. `censys`) is **not asked**: it gets an `unavailable` entry and is listed in
+`unsupported_engines`. uncover reports an upstream syntax/auth error as rc=0 with no rows, so an engine that returns nothing
+is marked `confirmed: false` and listed in `unconfirmed_empty` — a gap to report, not proof that nothing exists.
+The query templates are part of the stage checkpoint (only when an engine is usable), so a corrected query re-runs.
 
 ---
 
@@ -229,7 +246,7 @@ Division of labour with subs: subs finds subdomains that exist AND are indexed; 
 
 ```bash
 python findinfo.py icp --code "京ICP备10210538号"
-python findinfo.py icp --from-store           # reuses the ICP numbers ENScan stored
+python findinfo.py icp --from-store --scope example.com   # reuses the ICP numbers ENScan stored
 ```
 
 **Output**
@@ -238,7 +255,10 @@ python findinfo.py icp --from-store           # reuses the ICP numbers ENScan st
 {"codes": ["京ICP备10210538号"], "rows": 156, "domains": ["..."], "ips": ["..."]}
 ```
 
-**Dependency**: at least one mapping-platform key. Query syntax: `icp="京ICP备10210538号"`.
+**Dependency**: at least one mapping-platform key. One dispatch per engine, each in its own syntax: fofa `icp="京ICP备10210538号"`,
+quake `icp:"…"`, hunter `icp.number="…"`; engines without an ICP field (shodan, censys) are not asked and are listed in
+`unsupported_engines`. An engine that returns no rows is listed in `unconfirmed_empty` (a gap, not an error); a non-zero
+exit is an `errors` entry naming its `engine`.
 **Note**: filing numbers often carry `-1`/`-2` suffixes — query the principal number for full coverage.
 **Storage**: the filing number itself is stored as `assets(kind=icp, canonical="京ICP备…")` (sources `enscan`/`icp-seed`),
 which is why `icp --from-store` can reuse numbers ENScan saved; domains/IPs from the reverse lookup land as `kind=domain`/`kind=ip` with confidence 0.9/0.5.
@@ -248,7 +268,7 @@ which is why `icp --from-store` can reuse numbers ENScan saved; domains/IPs from
 ## dns — resolution + wildcard filtering (stage 1C)
 
 ```bash
-python findinfo.py dns --from-store
+python findinfo.py dns --from-store --scope example.com
 python findinfo.py dns --domain example.com --min-conf 0.4
 ```
 
@@ -271,7 +291,7 @@ python findinfo.py dns --domain example.com --min-conf 0.4
 ## probe — liveness / fingerprint / IP mapping (stage 2, **ACTIVE**)
 
 ```bash
-python findinfo.py probe --from-store
+python findinfo.py probe --from-store --scope example.com
 python findinfo.py probe --host a.example.com --host b.example.com
 ```
 
@@ -297,7 +317,8 @@ It also writes `status/title/tech` back into `assets.attrs` and records the land
 ## ipagg — IP aggregation and CDN removal
 
 ```bash
-python findinfo.py ipagg
+python findinfo.py ipagg --scope example.com      # IPs owned by in-scope domains
+python findinfo.py ipagg --ip 1.2.3.4 --ip 1.2.3.5 # explicit IPs, no scope needed
 ```
 
 **Output**
@@ -321,8 +342,16 @@ python findinfo.py ipagg
 ## ports — port scanning (**ACTIVE**)
 
 ```bash
-python findinfo.py ports --ip 1.2.3.4 --top-ports 1000
+python findinfo.py ports --ip 1.2.3.4 --top-ports 1000   # explicit targets, used as given
+python findinfo.py ports --scope example.com             # public IPs owned by in-scope domains
 ```
+
+Without `--ip`, the targets come from the store and need `--scope` (alias `--domain`) or `--whole-store`. Only IPs
+**owned** by an in-scope domain (their `parent`) are taken: an IP scraped out of a page/JS has no owner and an ICP-lookup
+IP is owned by a filing number, so neither is scanned. Private, loopback, link-local, CGNAT, benchmark/fake-IP
+(198.18.0.0/15), reserved and multicast addresses are skipped even when owned and returned in `skipped_private` —
+from the operator's machine they reach the operator's own network, not the target. Pass such an address with `--ip`
+to scan it deliberately.
 
 **Output**
 
@@ -338,22 +367,23 @@ Every open port is stored as `assets(kind=endpoint, canonical="1.2.3.4:8080")`.
 ## vhost — Host-header collision (core of stage 2, **ACTIVE**)
 
 ```bash
-python findinfo.py vhost --ip 1.2.3.4 --from-store
+python findinfo.py vhost --ip 1.2.3.4 --from-store --domain example.com
 python findinfo.py vhost --ip 1.2.3.4 --wordlist wordlists/vhost.txt --domain example.com        --ports 80,443,8080,8443
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
 | `--ip` | required | target IP |
-| `--host` / `--from-store` | — | candidate Hosts (store domains) |
+| `--host` / `--from-store` | — | candidate Hosts (explicit, or store domains — a store read needs `--domain`) |
 | `--wordlist` | — | dictionary; bare labels expand via `--domain` |
-| `--domain` | store parent/base domain | base domain for bare labels, repeatable |
+| `--domain` | registrable domains of the `--host` values | base domain for bare labels and scope of a store read, repeatable |
 | `--ports` | 80,443 | comma-separated |
 | `--threads` | 20 | concurrency |
 
 **Wordlist semantics**: `wordlists/vhost.txt` holds **bare labels** (`dev`/`uat`/`jenkins`); a lone label is not a valid hostname.
 `--domain example.com` expands each into `dev.example.com`, `uat.example.com`...; without `--domain`
-the store domains' parents are used. Entries containing dots (`admin.example.com`) are used verbatim, never double-appended.
+the registrable domains of the hosts being collided are used (never every domain in the shared store). Entries containing
+dots (`admin.example.com`) are used verbatim, never double-appended.
 
 **Output**
 
@@ -381,7 +411,7 @@ the candidate's difference is judged. Bodies over 2000 chars are compared by edi
 ## crawl — crawling (stage 3, **ACTIVE**)
 
 ```bash
-python findinfo.py crawl --from-store --depth 3
+python findinfo.py crawl --from-store --domain example.com --depth 3
 python findinfo.py crawl --url https://app.example.com
 ```
 
@@ -400,11 +430,12 @@ Each URL becomes `endpoints(method, path_template, params)`; digits/UUIDs in pat
 ```bash
 python findinfo.py extract --url https://app.example.com/static/app.js
 python findinfo.py extract --from-run runs/xxx/crawl.jsonl
-python findinfo.py extract --from-store        # reflow: use the store URL assets directly (recommended)
+python findinfo.py extract --from-store --domain example.com   # reflow: the store's URL assets (recommended)
 ```
 
 **Three inputs**: `--url` names one JS/page; `--from-run` reads a crawl JSONL artifact;
-`--from-store` uses the store's `kind=url` assets directly (use this in the reflow loop — no need to know run-dir paths).
+`--from-store` uses the store's `kind=url` assets directly (use this in the reflow loop — no need to know run-dir paths);
+it needs `--domain` (or `--whole-store`) so another engagement's JS is never re-fetched.
 At most 40 JS/JSON/map files fetched per call, with a 4 MB text budget (memory safety).
 
 **Engine**: pure-Python regexes (`lib/jsleak.py`) extracting API paths, domains, IPs, secrets and sourcemaps — zero dependencies, runs anywhere.
@@ -628,7 +659,9 @@ python findinfo.py --task example-com run --domain example.com --active --vhost 
            "elapsed_sec":812.0,"artifacts":{...}}
 "coverage": {"planned_stages":[...],"done_stages":[...],"skipped_stages":[...],
              "failed_stages":[{"stage":"certs","error":"..."}],"not_run_stages":[...],
-             "unavailable":{"missing_tools":[],"engines_without_key":["quake"],"blocking":false},
+             "unavailable":{"missing_tools":[],"engines_without_key":["quake"],"blocking":false,
+                            "unconfirmed_empty":["uncover:hunter"],"unsupported_engines":["censys"],
+                            "truncated_sources":["onepass:virustotal"]},
              "rounds":[{"round":1,"new_domains":3,"stop":"continue"}],
              "stop_reason":"no_new_assets|max_rounds|time_budget",
              "budget":{"rounds":3,"rounds_used":3,"elapsed_sec":812.0},"complete":true}
@@ -641,6 +674,9 @@ python findinfo.py --task example-com run --domain example.com --active --vhost 
 |---|---|---|
 | Transient failure (timeout/rate-limit/5xx) | auto-retried `limits.source_retries` times (default 2, backoff 1.5s→3s); still failing → stage `ok: false` | the stage is marked failed and writes no done checkpoint; other sources' results are kept |
 | Missing key | `coverage.unavailable.engines_without_key`, `doctor.api_keys` | marked `unavailable`, never disguised as "nothing found" |
+| Engine returned no rows | `coverage.unavailable.unconfirmed_empty` (`uncover:<engine>`) | uncover reports an upstream error the same way: report it as unconfirmed, not as "nothing exists" |
+| Engine has no known query | `coverage.unavailable.unsupported_engines` | that engine was not asked at all |
+| Upstream answer capped | `coverage.unavailable.truncated_sources` (`onepass:<id>`) | more rows exist than were fetched (page budget, or a billed engine's first page); not a failure |
 | Quota exhausted | `doctor.fofa_gateway.remaining` at zero | marked `quota_exhausted`, written into delivery gaps |
 | Wildcard pollution | `dns`'s `wildcard: [{parent, ip}]` | matching names filtered, not stored; report the list under "data quality" |
 | Empty result | stage `found: 0` with `ok: true` | a valid result, not a failure |
@@ -686,8 +722,9 @@ python findinfo.py clean --all --vacuum                            # wipe everyt
 | `--all` | delete every asset and endpoint |
 | `--vacuum` | reclaim disk (measured 163MB → 5MB) |
 
-**Preventing pollution**: `passive/subs/dns/probe/vhost/extract --from-store` all accept `--scope X`
-(vhost uses `--domain`) to read only that domain's assets. **Always pass it on a new task**, or you inherit the previous target's assets.
+**Preventing pollution**: every single-stage store read is scoped or refused — `--scope X` for
+passive/subs/icp/dns/probe/ipagg/ports, `--domain X` for vhost/crawl/extract; without one the command exits 2 with
+`scope_required` instead of inheriting the previous target's assets. `--whole-store` is the explicit opt-in.
 
 ## report — human deliverables (md / html)
 
@@ -805,29 +842,29 @@ and `provenance` normalizes it into a tool list with labels; onepass's many upst
 
 ```bash
 # 1. self-check
-python findinfo.py doctor
+python findinfo.py --task example-com doctor
 
-# 2. passive expansion (zero risk, run it fully first)
-python findinfo.py entity --name "Example Corp"
-python findinfo.py passive --from-store           # 15 sources in parallel, the fastest route
-python findinfo.py certs --domain example.com
-python findinfo.py icp  --from-store
-python findinfo.py subs --from-store
-python findinfo.py dns  --from-store
+# 2. passive expansion (no target contact, run it fully first)
+python findinfo.py --task example-com entity --name "Example Corp"
+python findinfo.py --task example-com passive --from-store --scope example.com   # 15 sources in parallel
+python findinfo.py --task example-com certs --domain example.com
+python findinfo.py --task example-com icp --from-store --scope example.com
+python findinfo.py --task example-com subs --from-store --scope example.com
+python findinfo.py --task example-com dns --from-store --scope example.com
 
 # 3. glance at the asset graph, decide whether to continue
-python findinfo.py assets --kind domain --limit 20
+python findinfo.py --task example-com assets --kind domain --limit 20
 
-# 4. active
-python findinfo.py probe --from-store --min-conf 0.7
-python findinfo.py ipagg
-python findinfo.py vhost --ip <candidate-ip> --from-store
+# 4. active (only after authorisation is confirmed)
+python findinfo.py --task example-com probe --from-store --scope example.com --min-conf 0.7
+python findinfo.py --task example-com ipagg --scope example.com
+python findinfo.py --task example-com vhost --ip <candidate-ip> --from-store --domain example.com
 
 # 5. reflow
-python findinfo.py crawl --from-store
-python findinfo.py extract --url <js>
+python findinfo.py --task example-com crawl --from-store --domain example.com
+python findinfo.py --task example-com extract --from-store --domain example.com
 
 # 6. delivery (brief for the agent to read; report emits md/html for humans)
-python findinfo.py brief --match example.com
-python findinfo.py report --match example.com
+python findinfo.py --task example-com brief --match example.com
+python findinfo.py --task example-com report --match example.com
 ```

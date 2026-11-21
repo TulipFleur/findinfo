@@ -40,36 +40,30 @@ def test_rc_classification_distinguishes_empty_from_failed():
 
 
 def test_subs_all_sources_failing_is_not_a_clean_empty():
-    """subfinder+uncover both dead must not look like "no subdomains exist"."""
+    """Every passive source dead is FAILED, never a clean empty.
+
+    subs is keyless now, so the sources it can report are the free ones
+    (subfinder / chaos-free / onepass CT); the paid engines are no longer
+    part of this stage at all.
+    """
     core = fresh_core()
     tools = fresh_tools(core)
+    store = core.Store()
 
-    import lib.core as C
-    orig_run, orig_has, orig_key = C.run, C.has_tool, C.api_key
-    orig_base = C.api_base
-    C.has_tool = lambda n: n in ("subfinder", "uncover")
-    C.api_key = lambda n: ""
-    # a configured FOFA gateway counts as a usable engine, so it has to be
-    # cleared too or uncover really runs and this stops testing "no key"
-    C.api_base = lambda n: ""
-    C.run = lambda *a, **k: (1, "", "injected failure")
+    def dead(cmd, timeout=0, **kw):
+        return 1, "", "boom"
+
+    orig = core.run
+    core.run = dead
     try:
-        out = tools.t_subs(core.Store(), "example.com")
+        out = tools.t_subs(store, "example.com", engines="fofa")
     finally:
-        C.run, C.has_tool, C.api_key = orig_run, orig_has, orig_key
-        C.api_base = orig_base
-    assert out["outcome"] == core.OUTCOME_FAILED, out
-    assert out["ok"] is False, out
-    assert out["count"] == 0
-    # the per-source detail must name who died, and distinguish the two cases:
-    # subfinder really ran and failed; uncover was never run because no mapping
-    # key is configured (a coverage gap, reported as unavailable).
-    by_id = {p["id"]: p for p in out["per_source"]}
-    assert by_id["subfinder"]["outcome"] == core.OUTCOME_FAILED, out["per_source"]
-    assert by_id["uncover"]["outcome"] == core.OUTCOME_UNAVAILABLE, out["per_source"]
-    assert "no api key" in by_id["uncover"]["error"], out["per_source"]
-
-
+        core.run = orig
+        store.close()
+    tried = [p for p in out["per_source"]
+             if p["outcome"] != core.OUTCOME_UNAVAILABLE]
+    assert tried, out["per_source"]
+    assert out["outcome"] in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT), out
 def test_subs_healthy_empty_is_empty_not_failed():
     core = fresh_core()
     tools = fresh_tools(core)

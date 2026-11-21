@@ -145,8 +145,17 @@ if [ "$MODE" = "steps" ]; then
       run "$PY" "$SKILL/findinfo.py" ${PY_ARGS[@]+"${PY_ARGS[@]}"} brute --domain "$t"
     fi
   done
-  run "$PY" "$SKILL/findinfo.py" ${PY_ARGS[@]+"${PY_ARGS[@]}"} icp --from-store
-  run "$PY" "$SKILL/findinfo.py" ${PY_ARGS[@]+"${PY_ARGS[@]}"} dns --from-store
+  # 读库必须带范围（否则 findinfo 以 scope_required 拒绝）：用 -t 给出的目标；
+  # 只给了 --name 时，有 --task 的独立库可整库读取，否则跳过并说明。
+  SCOPE_ARGS=()
+  for t in ${TARGETS[@]+"${TARGETS[@]}"}; do SCOPE_ARGS+=(--scope "$t"); done
+  if [ ${#SCOPE_ARGS[@]} -eq 0 ] && [ -n "$TASK" ]; then SCOPE_ARGS=(--whole-store); fi
+  if [ ${#SCOPE_ARGS[@]} -gt 0 ]; then
+    run "$PY" "$SKILL/findinfo.py" ${PY_ARGS[@]+"${PY_ARGS[@]}"} icp --from-store "${SCOPE_ARGS[@]}"
+    run "$PY" "$SKILL/findinfo.py" ${PY_ARGS[@]+"${PY_ARGS[@]}"} dns --from-store "${SCOPE_ARGS[@]}"
+  else
+    echo "[findinfo] steps：icp/dns 需要范围，已跳过；用 -t 指定目标域名，或用 --task 隔离资产库" >&2
+  fi
   if [ "$ACTIVE" -eq 1 ]; then
     launch "$PY" "$SKILL/findinfo.py" ${PY_ARGS[@]+"${PY_ARGS[@]}"} run "${ARGS[@]}"
   fi

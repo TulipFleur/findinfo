@@ -40,22 +40,21 @@ Every command writes **one JSON line to stdout** (for agents); progress and warn
 
 | What you have / want | Run |
 |---|---|
-| Domain only, want a first pass fast | `passive --domain X` → `certs --domain X` → `dns --from-store` → `assets --min-conf 0.7` (5–10 min) |
+| Domain only, want a first pass fast | `passive --domain X` → `certs --domain X` → `dns --from-store --scope X` → `assets --min-conf 0.7` (5–10 min) |
 | Company name | `run --name "Company"` (passive full chain; ENScan needs a Cookie) |
-| Internal services (vhost is the best ROI) | `run --active --vhost`, or `probe --from-store` → `ipagg` → `vhost --ip <candidate>` |
+| Internal services (vhost is the best ROI) | `run --active --vhost`, or `probe`/`ipagg --scope X` → `vhost --ip <candidate>` |
 | Large target / sessions time out | **`run` always `--background`**: get run_id → loop `wait --run <id> --timeout 30`; never wait on a foreground `run`. Single-stage commands may run foreground with `--tool-timeout` |
 | Crashed / interrupted | Re-issue the same command (checkpoints skip done work); add `--force-stage` to redo from scratch |
-| Endpoints for vuln hunting | `crawl --from-store` → `extract` → `assets --export` |
+| Endpoints for vuln hunting | `crawl`/`extract --from-store --domain X` → `assets --export` |
 | Just query existing assets | `assets --kind domain --min-conf 0.7` (generates no traffic) |
 
 **Passive before active** (quota-free, zero target contact), **vhost before ports**, **run only with a clear target** (it is an orchestrator; re-running wastes quota).
 
-**⚠ Shared asset-graph isolation**: without `--task` the store is globally shared and `--from-store` reads the previous target's assets back in.
-For a new target you **must pass scope flags**: `--scope <domain>` for `subs`/`passive`/`icp`/`dns`/`probe`, `--domain <domain>` for `crawl`/`extract`/`vhost`/`ports`/`brute`. Afterwards `clean --keep <domain> --vacuum`.
+**⚠ Shared asset-graph isolation**: without `--task` the store is shared across targets, so a store read **must be scoped**: `--scope <domain>` for `subs`/`passive`/`icp`/`dns`/`probe`/`ipagg`/`ports`, `--domain <domain>` for `crawl`/`extract`/`vhost`. Unscoped it exits 2 `scope_required` (`--whole-store` reads all, on purpose); `ports` skips private/unowned IPs (pass them via `--ip`).
 
 ## 1.5 A complete collection session (agent loop)
 
-**The full loop lives in [prompts/AGENT.txt](prompts/AGENT.txt)** — a prompt template for a fresh agent session; replace the `{{TARGET}}`/`{{NAME}}` placeholders. It covers locating the skill → self-check → authorisation gate → starting a job → bounded waits → result progression → delivery → recovery. This section keeps only the essentials.
+**The full loop is in [prompts/AGENT.txt](prompts/AGENT.txt)** (a template for a fresh session; fill `{{TARGET}}`/`{{NAME}}`: self-check → authorisation → job → bounded waits → delivery → recovery). Essentials:
 
 1. **First results, then depth**: `passive → certs → dns` yields a first pass in minutes, then deepen with `--active --vhost --crawl`.
 2. **Never block on the foreground**: long commands go `--background` + loop `wait --run <id> --timeout 30`; a timeout only ends that wait window — do not restart, do not declare completion early.
@@ -86,7 +85,7 @@ Stage 1B passive   python findinfo.py passive --domain example.com     # onepass
         icp        python findinfo.py icp --from-store --scope example.com
 Stage 1C dns       python findinfo.py dns --from-store --scope example.com   # resolve + wildcard filtering (mandatory)
 Stage 2   probe    python findinfo.py probe --from-store --scope example.com
-        ipagg      python findinfo.py ipagg                            # group by IP, drop CDN
+        ipagg      python findinfo.py ipagg --scope example.com        # group by IP, drop CDN
         ports      python findinfo.py ports --ip 1.2.3.4 --top-ports 1000
         vhost      python findinfo.py vhost --ip 1.2.3.4 --from-store --domain example.com   # * internal services
 Stage 3   crawl    python findinfo.py crawl --from-store --domain example.com
@@ -115,7 +114,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 
 `brief` is the single agent read API (≤32 KB, writes no files): counts / coverage gaps / top_hosts / internal_services / leaks / next_steps; truncated arrays report kept and total in `truncated`. `report.md` is a 5-minute human read, `report.html` a self-contained dashboard, `report.json` (`--with-json`) runs 600 KB+ on large targets — **do not read it into context**.
 
-**`truncated` / `coverage.known=false` never mean "data is complete"**: the former is display truncation, the latter means no run was read at all (**not** "no gaps"). State conclusions with the gaps they describe; field and scoring rules in [docs/DATA-MODEL.md](docs/DATA-MODEL.md).
+**`truncated` / `coverage.known=false` never mean "data is complete"**: the former is display truncation, the latter means no run was read at all (**not** "no gaps"). `coverage.unavailable` also lists `unconfirmed_empty` (empty, maybe an error), `unsupported_engines` (not asked) and `truncated_sources` (upstream holds more rows). State conclusions with the gaps they describe; rules in [docs/DATA-MODEL.md](docs/DATA-MODEL.md).
 
 ## 5. Hard rules (violating them is a bug)
 
@@ -129,7 +128,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 4. **Do not bypass third-party API rate limits** (mapping/cert sources have a built-in token bucket; bypassing gets keys banned); traffic to the target is not rate-limited — concurrency is `limits.http_concurrency`.
 5. **Missing key / missing Cookie = coverage gap, not failure**: keyless engines are never handed to `uncover`, they appear only in `coverage.unavailable`, do not count as `failed_stages`, exit code stays ≠5;
    re-running after adding a key really executes them (usable engines are part of the stage input hash), old checkpoints will not skip them.
-6. **Any external-tool argument change must be verified against real output**: katana's `-fs` was once switched to an unsupported `rdn:` prefix — no error, filtered everything, crawl ran 33 minutes for zero output.
+6. **External-tool argument changes must be verified against real output** (an unsupported katana `-fs rdn:` once filtered everything, silently).
 7. **ENScan is serial (enforced in code)**: concurrency gets the Cookie banned, and two simultaneous enscan.exe runs return the same entity. In-process mutex + cross-process file lock (`<home>/enscan.lock`).
 8. **Do not trade `--depth` for "more coverage"**: noise and runtime scale linearly; `d 3` is enough.
 9. **Only certificate transparency (CT) responses are cached** (`cache/certs/`, 7 days); every other stage re-probes on re-run.
@@ -141,6 +140,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 | Symptom | Fix |
 |---|---|
 | `{"error":"tool_missing"}` | Tool missing from `bin/<platform>/` (no PATH fallback): Linux `scripts/setup-linux.sh`, Windows drop `bin/windows/*.exe`; do not install yourself |
+| `{"error":"scope_required"}` | Store read without scope: add `--scope`/`--domain` (§1) or `--whole-store` |
 | `subs` thin / keys missing | Coverage gap — **deliver as-is, do not `--resume`** (see `docs/API-KEYS.md`) |
 | `entity` empty | aiqicha Cookie missing/expired; or seed with `--domain` directly |
 | `vhost` 0 hits | Single site per IP, or a proxy blocks direct IP access |
@@ -166,4 +166,4 @@ A single `run` takes 5–40 minutes, far beyond one tool call: `--background` + 
 
 ## POSIX wrapper script (optional)
 
-`scripts/findinfo.sh` is a thin bash wrapper for humans in a POSIX shell (same python logic). **Agents must not use it** (PowerShell-only hosts cannot run bash); see [docs/LINUX.md](docs/LINUX.md) for its flags.
+`scripts/findinfo.sh`: bash wrapper for humans. **Agents must not use it** (see [docs/LINUX.md](docs/LINUX.md)).

@@ -70,7 +70,7 @@ def test_icp_is_planned_only_when_it_can_run():
     named = fi._plan_stages(_args(no_icp=False, name="某公司"), active=False)
     domain_only = fi._plan_stages(_args(no_icp=False, name=""), active=False)
     disabled = fi._plan_stages(_args(no_icp=True, name="某公司"), active=False)
-    assert "icp" in named, named
+    assert "mapping" in named, named   # the paid stage is now `mapping`
     assert "icp" not in domain_only,         "a domain-only run has no ICP codes, so icp is not a real stage: %r" % (domain_only,)
     assert "icp" not in disabled, "an explicitly disabled stage must not be planned"
 

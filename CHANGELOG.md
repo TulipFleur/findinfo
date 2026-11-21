@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+### 测绘每任务只做一次（进行中）
+
+- **测绘阶段合并、任务级账本、子进程免 key**。来源：`37953fd` 之后的改造。
+  带 key 的请求只发生在唯一的 `mapping` 阶段（配套 `map` 命令）；同一任务内
+  每个「引擎 + 规范化问题」只问一次，失败/配额/凭据被拒都记入任务账本且不自动
+  重试，`--remap` 才是显式重问；复用结果保留原观测时间。`subs`/`passive` 改为纯
+  免 key；`core.run` 默认不给子进程任何密钥（httpx/naabu 等拿不到），只有测绘
+  派发按目标工具注入它真正读取的变量名（Hunter 对 uncover 是 `HUNTER_API_KEY`、
+  对 onepass 是 `HUNTER_KEY` 等）。`uncover` 显式设置 `-limit`，满页标记截断。
+  缺 key 或凭据被拒的引擎默认跳过并记为能力缺口，不报错、不反复重试。
+
+### 采集准确性修复
+
+- **测绘引擎按各自语法逐个查询**。uncover 会把 `-q` 原样发给每个引擎、不做语法转换；
+  `subs` 过去把 Quake 语法 `domain:"x"` 一次性发给 fofa/quake/hunter/shodan/censys，
+  `icp` 把 FOFA 语法 `icp="x"` 发给 quake/hunter，除一个引擎外都可能静默返回 0。
+  现在每个有 key 的引擎单独派发：subs 用 fofa `domain="x"` / quake `domain:"x"` /
+  hunter `domain="x"` / shodan `hostname:"x"`，icp 用 fofa `icp="…"` / quake `icp:"…"` /
+  hunter `icp.number="…"`（fofa/quake/hunter 与 onepass 一致）；结果按
+  `uncover:<engine>` 归属，计费记录按引擎分行。没有已知语法的引擎（subs 的 censys、
+  icp 的 shodan/censys）不再盲发，记入 `unsupported_engines`；rc=0 且无结果的派发标记
+  `confirmed: false` 并记入 `unconfirmed_empty`，经 `coverage.unavailable` 进入 brief。
+  icp 的空结果不再算作阶段错误。查询模板进入 subs/icp 的 checkpoint 输入（仅有可用引擎时），
+  已用旧查询完成的阶段会重跑。
+- **单阶段命令读库必须带范围**。probe/dns/passive/subs/icp/ipagg/ports/vhost/crawl/extract
+  在从共享资产库取目标时（`--from-store` 或未给显式目标），必须给 `--scope`（vhost/crawl/extract
+  用 `--domain`），否则以 exit 2 和 `{"error":"scope_required"}` 拒绝执行；范围里没有合法域名
+  同样拒绝，不再退化为全库。`--whole-store` 是显式全库开关。`ports` 新增 `--scope`
+  （别名 `--domain`），从库中只取归属于范围内域名的公网 IP，私网/保留地址跳过并返回
+  `skipped_private`（显式 `--ip` 照常使用）。`ipagg` 新增 `--scope`。`vhost --wordlist`
+  未给 `--domain` 时用被碰撞主机的注册域，不再取全库域名。`Store.get_assets` 与
+  `t_ipagg` 对 `.local` 等私有后缀的范围不再放宽为全库（新增 `core.canon_match`）。
+- **onepass 0.2.0：翻页与截断上报**。VirusTotal（`links.next`，仅同源）与 urlscan
+  （`search_after`）按页预算翻页（默认 4 页，`--max-pages` 1–20）；FOFA/Quake/Hunter 不自动翻页
+  （每页消耗配额），改为报告上游总数。每个源返回 `pages`/`truncated`/`total`，被截断的源进入
+  `truncated_sources` 与 `coverage.unavailable.truncated_sources`。Windows 二进制已重建；
+  Linux 二进制需用 `scripts/build-onepass.sh` 重建。
+- 文档示例全部补齐范围参数，并新增测试保证文档中的读库命令都带 scope。
+
 ## [0.8.1] - 2026-11-21
 
 本版把 docs/NON-DNS-REPAIR.md（非 DNS 自动化修复）五个批次全部落地，并修正两轮真实任务暴露的缺陷。范围不含 DNS 解析器 / DoH / 泛解析 / DNS 到 probe 及相应完成判定。

@@ -78,7 +78,8 @@ def _make_worker_root(tmp: Path) -> Path:
     (root / "lib").mkdir(parents=True)
     shutil.copy2(ROOT / "findinfo.py", root / "findinfo.py")
     for mod in ("__init__.py", "core.py", "jobs.py", "report.py", "jsleak.py",
-                "doh.py", "work.py", "spec.py", "metered.py", "offline.py"):
+                "doh.py", "work.py", "spec.py", "metered.py", "offline.py",
+                "mapping.py", "mapdispatch.py"):
         shutil.copy2(ROOT / "lib" / mod, root / "lib" / mod)
     (root / "lib" / "tools.py").write_text(FAKE_TOOLS, encoding="utf-8")
     (root / "wordlists").mkdir(exist_ok=True)
