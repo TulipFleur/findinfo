@@ -303,3 +303,59 @@ def test_wait_payload_carries_recovery_fields_in_both_modes():
     assert compact["attempt"] == 3 and compact["terminal"] is True
     assert compact["reaped_by_host"] is False
     assert compact["gaps"] == ["icp", "vhost"]
+
+
+# ---------------------------------------------------------------- lock safety
+def test_a_slow_live_holder_is_never_stolen_from():
+    """A stale mtime on a LIVE holder must not let another writer take over.
+
+    The old lock stole on mtime alone: a writer paused by GC/antivirus/disk
+    looked stale, the intruder removed its file and acquired the name, then
+    the holder's exit unlinked the intruder's lock -- both writes were lost.
+    """
+    core = fresh_core()
+    from lib import jobs
+    import os
+    import threading
+    import time
+    rd = core.RUNS_DIR / "20261121-190400-locksafe"
+    rd.mkdir(parents=True, exist_ok=True)
+    lockp = rd / "state.lock"
+    seen: dict = {}
+
+    def holder():
+        with jobs._Lock(lockp, timeout=20.0):
+            seen["entered"] = True
+            # the process is alive, its lock file merely looks old
+            os.utime(str(lockp), (time.time() - 60, time.time() - 60))
+            time.sleep(1.2)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    time.sleep(0.3)
+    try:
+        with jobs._Lock(lockp, timeout=0.5):
+            seen["intruder_entered"] = True
+    except core.FindInfoError:
+        seen["intruder_entered"] = False
+    t.join()
+    assert seen.get("entered") is True
+    assert seen.get("intruder_entered") is False, (
+        "a live holder was stolen from", seen)
+    assert not lockp.exists(), "the owner's exit must clean its own lock"
+
+
+def test_a_dead_holders_lock_is_reclaimed():
+    """A crashed writer's leftover lock is still recoverable."""
+    core = fresh_core()
+    from lib import jobs
+    import os
+    import time
+    rd = core.RUNS_DIR / "20261121-190500-lockdead"
+    rd.mkdir(parents=True, exist_ok=True)
+    lockp = rd / "state.lock"
+    lockp.write_text("999999", encoding="utf-8")     # no such process
+    os.utime(str(lockp), (time.time() - 120, time.time() - 120))
+    with jobs._Lock(lockp, timeout=2.0):
+        pass
+    assert not lockp.exists()

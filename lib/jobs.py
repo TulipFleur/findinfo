@@ -86,12 +86,41 @@ class _Lock:
     status.json is a read-modify-write file; the worker's heartbeat thread and
     its main thread both update it, so a lock is required to keep the seq
     monotonic and to avoid losing fields.
+
+    Stale recovery must not become "steal from a live holder". A writer that
+    is merely SLOW (a GC pause, an antivirus scan, a stalled disk) leaves an
+    old mtime while still running; the old rule broke the lock on mtime alone,
+    so a second writer removed the live holder's file, took the name, and then
+    the holder's exit unlinked the INTRUDER's lock -- both writes were lost.
+    The lock file records the owner pid, so a steal is allowed only when that
+    pid is provably gone (or the file carries no readable pid and is old).
     """
 
     def __init__(self, path: Path, timeout: float = 10.0):
         self.path = path
         self.timeout = timeout
         self.fd = None
+        self._owned = False
+
+    def _holder_gone(self) -> bool:
+        """True only when the recorded owner cannot be alive any more."""
+        try:
+            raw = self.path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return False           # vanished/racy: let the loop retry the open
+        try:
+            pid = int(raw or 0)
+        except ValueError:
+            pid = 0
+        if pid > 0:
+            # the owner writes its pid on acquisition; a live pid is a live
+            # holder, no matter how stale the mtime looks
+            return not pid_alive(pid)
+        # no usable pid (very old writer, or a torn write): fall back to mtime
+        try:
+            return time.time() - self.path.stat().st_mtime > 30
+        except OSError:
+            return False
 
     def __enter__(self):
         deadline = time.time() + self.timeout
@@ -99,15 +128,15 @@ class _Lock:
             try:
                 self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.write(self.fd, str(os.getpid()).encode())
+                self._owned = True
                 return self
             except FileExistsError:
-                # a crashed writer may leave the file behind: steal it if stale
-                try:
-                    if time.time() - self.path.stat().st_mtime > 30:
+                if self._holder_gone():
+                    try:
                         self.path.unlink()
                         continue
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
                 if time.time() > deadline:
                     raise core.FindInfoError("state lock timeout: " + str(self.path))
                 time.sleep(0.02)
@@ -118,10 +147,18 @@ class _Lock:
                 os.close(self.fd)
         except OSError:
             pass
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        if self._owned:
+            # Only the owner removes the file. A lock we never acquired, or
+            # one that was stolen and re-created under us, must not be
+            # unlinked here -- deleting an intruder's lock is the other half
+            # of the corruption this class now prevents.
+            try:
+                if self.path.read_text(encoding="utf-8",
+                                       errors="replace").strip() == str(os.getpid()):
+                    self.path.unlink()
+            except OSError:
+                pass
+        self._owned = False
         return False
 
 
