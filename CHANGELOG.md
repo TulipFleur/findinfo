@@ -29,7 +29,7 @@
   dispatch_seq 排序；审计区分真实重复派发与日志重放、provider_http/native_dispatch
   单位、未结算状态；IP:port 目标明确报 unsupported_target_kind；同步 SKILL/AGENT/
   TOOLS/DATA-MODEL。
-- **真实测试修正**（`b770666`；前序 docs 同步见 `8ad6493`；状态锁被慢速存活持有者误抢的修复见 `0853ce4`，changelog 补引见 `3e980b2`）。对湖南信息职业技术学院
+- **真实测试修正**（`b770666`；前序 docs 同步见 `8ad6493`；状态锁被慢速存活持有者误抢的修复见 `0853ce4`，changelog 补引见 `3e980b2`；方案与审查文档入库见 `9951c97`）。对湖南信息职业技术学院
   实测发现并修复：旧任务 checkpoint 命中时因缺少 subject ref 丢种子；缺可选密钥时
   icp 被误判为阶段失败并导致 exit 5；resume 后 percent 超过 100；无 crawl/extract
   阶段时迁移的 108 条 open JS 变成无人消费的永久缺口。
