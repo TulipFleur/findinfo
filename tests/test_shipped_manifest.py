@@ -132,8 +132,13 @@ def test_changelog_covers_every_commit_since_0_7_2():
 
 def test_version_is_bumped_and_matches_skill_md():
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    assert version == "0.8.0", "VERSION is " + version
+    # the version must be a released section in the changelog, not just a
+    # number in a file: a bundle whose VERSION has no entry cannot be audited
+    assert version and all(c.isdigit() or c == "." for c in version), (
+        "VERSION is not a plain x.y.z: " + version)
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     assert "0.7.2" not in skill
     cl = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "## [0.8.0]" in cl and version in cl
+    assert "## [" + version + "]" in cl, (
+        "CHANGELOG has no section for VERSION " + version)
+    assert "## [0.8.0]" in cl, "the 0.8.0 section must stay for history"

@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-21
+
+本版把 docs/NON-DNS-REPAIR.md（非 DNS 自动化修复）五个批次全部落地，并修正两轮真实任务暴露的缺陷。范围不含 DNS 解析器 / DoH / 泛解析 / DNS 到 probe 及相应完成判定。
+
 ### 非 DNS 自动化修复（docs/NON-DNS-REPAIR.md）
 
 - **JS 与租约**（`b542692`）。run 模式只以 work_items 调度/统计 JS，standalone
@@ -229,5 +233,6 @@
 本文件从 0.8.0 开始记录。0.7.2 及更早的改动见 `git log`（`v0.7.2` 之前未打 tag，
 对应提交为 `e793464`）。
 
-[Unreleased]: https://github.com/TulipFleur/findinfo/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/TulipFleur/findinfo/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/TulipFleur/findinfo/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/TulipFleur/findinfo/compare/e793464...v0.8.0
