@@ -80,9 +80,11 @@ MODULES = [
     "tests.test_batch_e_audit_docs",
     "tests.test_mapping_ledger",
     "tests.test_mapping_dispatch",
+    "tests.test_mapping_queries",
     "tests.test_title_encoding",
     "tests.test_engine_queries",
     "tests.test_store_scope_gate",
+    "tests.test_scope_policy",
     "tests.test_onepass_truncation",
 ]
 
