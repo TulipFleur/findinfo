@@ -9,7 +9,12 @@
 
 ### 结构调整
 
-- **流水线拆成阶段函数**。`_run_pipeline` 从 1238 行缩成约 40 行的驱动；每个阶段是
+- **StageRegistry 成为真正的调度器**。registry 移入 `lib/pipeline.py`，14 个阶段登记的
+  是真实的阶段函数（原来全是 `lambda: None` 占位，生产代码从不调用）。每个阶段带
+  `phase`：`seed` 在轮次前跑一次，`round` 每轮跑一次；运行时按 registry 顺序执行计划
+  （`_plan_stages`）里的阶段，计划里出现未登记的阶段直接报错，不会被静默跳过。`icp`
+  仍是展示用别名，由 mapping 派发，计划从不包含它。执行顺序与之前完全一致。
+- **流水线拆成阶段函数**（`eb37643`）。`_run_pipeline` 从 1238 行缩成约 40 行的驱动；每个阶段是
   `lib.pipeline` 里一个以 `RunContext` 为参数的函数（entity / onepass / certs / subs /
   brute / mapping，以及每轮的 dns / probe / ipagg / ports / vhost / crawl / extract），
   阶段正文与原来一致。原先放在 `summary` 里、只有流水线自己用的私有键（`_ledger`、已批准

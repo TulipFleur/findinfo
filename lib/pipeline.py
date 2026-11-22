@@ -1611,21 +1611,134 @@ def _stage_extract(ctx: RunContext) -> None:
                       "outcome": r.get("outcome")})
 
 
+# ---------------------------------------------------------------- registry
+class StageRegistry:
+    """Validated stage registry: names, order, phase, runners, dependencies.
+
+    docs/RELIABILITY-PLAN.md par.5: one registry so the plan, the runner and
+    the report can never disagree about which stages exist. It is also the
+    scheduler: a run executes every planned stage through its registered
+    runner, in registry order, within its phase ("seed" runs once before the
+    rounds, "round" once per discovery -> verify round). Runners are held as
+    function objects: to change what a stage does in a test, patch the
+    collectors it calls (lib.tools) or this registry, not the module name.
+    Validation catches, at import time: an unknown stage name, a duplicate
+    runner, a dependency cycle, a stage missing a runner and an unknown
+    phase (T01).
+    """
+
+    PHASES = ("seed", "round")
+
+    def __init__(self):
+        self._order: list = []
+        self._runners: dict = {}
+        self._needs: dict = {}
+        self._phase: dict = {}
+
+    def register(self, name: str, runner=None, needs=(), phase: str = "seed"):
+        """Add a stage. The optional-stage convention stays: a stage the
+        caller can switch off is registered with needs=() and decided by
+        the planner, never silently absent from the registry."""
+        if name in self._order:
+            raise ValueError("duplicate stage in registry: " + name)
+        self._order.append(name)
+        self._runners[name] = runner
+        self._needs[name] = tuple(needs)
+        self._phase[name] = phase
+
+    def validate(self):
+        """Raise ValueError on any structural defect (T01)."""
+        missing_runner = [n for n, r in self._runners.items() if r is None]
+        if missing_runner:
+            raise ValueError("stages without a runner: " + ",".join(missing_runner))
+        bad_phase = [n for n, p in self._phase.items() if p not in self.PHASES]
+        if bad_phase:
+            raise ValueError("stages with an unknown phase: " + ",".join(bad_phase))
+        # dependency cycle: iterative colouring
+        WHITE, GREY, BLACK = 0, 1, 2
+        colour = {n: WHITE for n in self._order}
+
+        def visit(n, path):
+            if colour[n] == GREY:
+                raise ValueError("stage dependency cycle: " + "->".join(path + [n]))
+            if colour[n] == BLACK:
+                return
+            colour[n] = GREY
+            for d in self._needs.get(n, ()):
+                if d not in colour:
+                    raise ValueError("unknown dependency stage: " + d)
+                visit(d, path + [n])
+            colour[n] = BLACK
+
+        for n in self._order:
+            visit(n, [])
+        return self
+
+    def order(self, phase: str | None = None) -> list:
+        """Registered names in execution order: every stage, or one phase."""
+        return [n for n in self._order if phase is None or self._phase[n] == phase]
+
+    def runner(self, name):
+        return self._runners.get(name)
+
+
+def _stage_icp_alias(ctx: RunContext) -> None:
+    """"icp" is a presentation alias: filing questions are asked by the
+    mapping stage. It stays registered so old plans and checkpoints that
+    name it keep resolving; the planner never plans it, so this never runs."""
+
+
+def _build_default_registry():
+    """The pipeline stage registry: names, order, phase and dependencies.
+
+    The execution order is preserved exactly (docs par.2):
+    entity? -> onepass? -> certs -> subs -> brute? -> mapping? ->
+    [dns -> probe? -> ipagg? -> ports? -> vhost? -> crawl?/extract?].
+    Optional stages are registered with their dependency so the planner
+    decides from flags; each entry runs through its runner (T01).
+    """
+    reg = StageRegistry()
+    reg.register("entity", runner=_stage_entity, needs=())
+    reg.register("onepass", runner=_stage_onepass, needs=())
+    reg.register("certs", runner=_stage_certs, needs=())
+    reg.register("subs", runner=_stage_subs, needs=("certs",))
+    reg.register("brute", runner=_stage_brute, needs=("dns",))
+    # "mapping" is the ONLY stage allowed to spend mapping quota (batch 1).
+    # "icp" stays registered as a presentation alias so old plans and
+    # checkpoints that name it keep resolving; dispatch happens in mapping.
+    reg.register("mapping", runner=_stage_mapping, needs=())
+    reg.register("icp", runner=_stage_icp_alias, needs=())
+    reg.register("dns", runner=_stage_dns, needs=("certs",), phase="round")
+    reg.register("probe", runner=_stage_probe, needs=("dns",), phase="round")
+    reg.register("ipagg", runner=_stage_ipagg, needs=("probe",), phase="round")
+    reg.register("ports", runner=_stage_ports, needs=("ipagg",), phase="round")
+    reg.register("vhost", runner=_stage_vhost, needs=("ipagg",), phase="round")
+    reg.register("crawl", runner=_stage_crawl, needs=("probe",), phase="round")
+    reg.register("extract", runner=_stage_extract, needs=("crawl",), phase="round")
+    return reg.validate()
+
+
+STAGE_REGISTRY = _build_default_registry()
+
+
+def _run_planned(ctx: RunContext, phase: str, skip=()) -> None:
+    """Run every planned stage of one phase through its registered runner,
+    in registry order: the plan decides which stages take part, the
+    registry decides the order and what runs for each."""
+    known = set(STAGE_REGISTRY.order())
+    unknown = [s for s in ctx.planned if s not in known]
+    if unknown:
+        raise ValueError("planned stage(s) missing from the registry: " +
+                         ",".join(unknown))
+    for name in STAGE_REGISTRY.order(phase):
+        if name in ctx.planned and name not in skip:
+            STAGE_REGISTRY.runner(name)(ctx)
+
+
 def _run_round(ctx: RunContext, round_no: int) -> None:
-    """One discovery -> verify round: dns, then the active stages."""
+    """One discovery -> verify round: dns, then the planned active stages."""
     ctx.round_no = round_no
-    _stage_dns(ctx)
-    if not ctx.active:
-        return
-    _stage_probe(ctx)
-    _stage_ipagg(ctx)
-    if ctx.args.ports:
-        _stage_ports(ctx)
-    if ctx.args.vhost:
-        _stage_vhost(ctx)
-    if ctx.args.crawl:
-        _stage_crawl(ctx)
-        _stage_extract(ctx)
+    _run_planned(ctx, "round")
 
 
 def _migrate_legacy_js(ctx: RunContext) -> None:
@@ -1968,24 +2081,17 @@ def _run_pipeline(args) -> int:
         core.log("mapping schema init failed: " + repr(exc)[:200])
     ctx = _prepare_run(args, store, max_seed)
     try:
-        # 1. entity
-        if args.name:
-            _stage_entity(ctx)
+        # 1. entity anchors the subjects every seed step reads, so the seed
+        # set is fixed right after it, before any other stage runs.
+        if "entity" in ctx.planned:
+            STAGE_REGISTRY.runner("entity")(ctx)
         _collect_seed_domains(ctx)
         if ctx.identity_ambiguous:
             return _finish_identity_ambiguous(ctx)
         _fix_seed_scope(ctx)
-        if not getattr(args, "no_onepass", False):
-            _stage_onepass(ctx)
-        _stage_certs(ctx)
-        _stage_subs(ctx)
-        if ctx.active and args.brute:
-            _stage_brute(ctx)
-        # 4. mapping runs only when the PLAN contains it: a domain-only run
-        # (no seed subject, no filings) has nothing to map, and planning it
-        # would manufacture a phantom gap no retry could close.
-        if "mapping" in ctx.planned and not getattr(args, "no_mapping", False):
-            _stage_mapping(ctx)
+        # onepass? certs subs brute? mapping?: _plan_stages decides which take
+        # part (--no-onepass, --brute with --active, --no-mapping).
+        _run_planned(ctx, "seed", skip=("entity",))
         _migrate_legacy_js(ctx)
         _run_rounds(ctx)
         return _finish_run(ctx)

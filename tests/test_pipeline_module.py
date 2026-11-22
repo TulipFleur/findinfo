@@ -63,3 +63,28 @@ def test_a_stage_runs_on_its_own_from_a_run_context():
         assert entry["stage"] == "certs" and entry["found"] == 2, entry
     finally:
         store.close()
+
+
+def test_planned_stages_run_through_their_registered_runners_in_order():
+    """StageRegistry is the scheduler: the plan decides WHICH stages take part,
+    the registry decides the order and what runs for each."""
+    from lib import pipeline
+    calls = []
+    reg = pipeline.StageRegistry()
+    for name, phase in (("b", "round"), ("s", "seed"), ("a", "round"), ("c", "round")):
+        reg.register(name, runner=lambda ctx, n=name: calls.append(n), phase=phase)
+    ctx = SimpleNamespace(planned=["a", "s", "b"])
+    with mock.patch.object(pipeline, "STAGE_REGISTRY", reg.validate()):
+        pipeline._run_planned(ctx, "round")
+    assert calls == ["b", "a"], calls
+
+
+def test_the_shipped_registry_holds_the_real_stage_functions():
+    from lib import pipeline
+    reg = pipeline.STAGE_REGISTRY
+    assert reg.order("seed") == ["entity", "onepass", "certs", "subs", "brute",
+                                 "mapping", "icp"]
+    assert reg.order("round") == ["dns", "probe", "ipagg", "ports", "vhost",
+                                  "crawl", "extract"]
+    assert reg.runner("certs") is pipeline._stage_certs
+    assert reg.runner("dns") is pipeline._stage_dns

@@ -353,6 +353,7 @@ from lib.pipeline import (  # noqa: E402,F401  (re-exported)
     _adopt_membership,
     _attach,
     _BLOCKING_TOOLS,
+    _build_default_registry,
     _coverage_unavailable,
     _current_attempt,
     _DNS_SOURCES,
@@ -371,6 +372,8 @@ from lib.pipeline import (  # noqa: E402,F401  (re-exported)
     _worker_run_dir,
     _write_status,
     ENGAGEMENT,
+    STAGE_REGISTRY,
+    StageRegistry,
 )
 
 
@@ -1700,97 +1703,6 @@ def _resume_run_locked(args, rd) -> int:
               "attempt": spec["attempt"], "pid": pid}, **_run_paths(rd),
              next=_followup("wait", rd, "--timeout", "30")))
     return 0
-
-
-# ---------------------------------------------------------------- pipeline
-# ---------------------------------------------------------------- registry
-class StageRegistry:
-    """Validated stage registry: names, order, runners, dependencies.
-
-    docs/RELIABILITY-PLAN.md par.5: one registry so the plan, the runner and
-    the report can never disagree about which stages exist. Validation
-    catches, at import time: an unknown stage name, a duplicate runner, a
-    dependency cycle, and a stage missing a runner (T01).
-    """
-
-    def __init__(self):
-        self._order: list = []
-        self._runners: dict = {}
-        self._needs: dict = {}
-
-    def register(self, name: str, runner=None, needs=()):
-        """Add a stage. The optional-stage convention stays: a stage the
-        caller can switch off is registered with needs=() and decided by
-        the planner, never silently absent from the registry."""
-        if name in self._order:
-            raise ValueError("duplicate stage in registry: " + name)
-        self._order.append(name)
-        self._runners[name] = runner
-        self._needs[name] = tuple(needs)
-
-    def validate(self):
-        """Raise ValueError on any structural defect (T01)."""
-        missing_runner = [n for n, r in self._runners.items() if r is None]
-        if missing_runner:
-            raise ValueError("stages without a runner: " + ",".join(missing_runner))
-        # dependency cycle: iterative colouring
-        WHITE, GREY, BLACK = 0, 1, 2
-        colour = {n: WHITE for n in self._order}
-
-        def visit(n, path):
-            if colour[n] == GREY:
-                raise ValueError("stage dependency cycle: " + "->".join(path + [n]))
-            if colour[n] == BLACK:
-                return
-            colour[n] = GREY
-            for d in self._needs.get(n, ()):
-                if d not in colour:
-                    raise ValueError("unknown dependency stage: " + d)
-                visit(d, path + [n])
-            colour[n] = BLACK
-
-        for n in self._order:
-            visit(n, [])
-        return self
-
-    def order(self) -> list:
-        return list(self._order)
-
-    def runner(self, name):
-        return self._runners.get(name)
-
-
-def _build_default_registry():
-    """The pipeline stage registry: names, order and dependencies.
-
-    The initial execution order is preserved exactly (docs par.2):
-    entity? -> onepass -> certs -> subs -> brute? -> icp? ->
-    [dns -> probe? -> ipagg? -> ports? -> vhost? -> crawl?/extract?].
-    Optional stages are registered with their dependency so the planner
-    decides from flags; each entry needs a runner to exist (T01).
-    """
-    reg = StageRegistry()
-    reg.register("entity", runner=lambda *a, **k: None, needs=())
-    reg.register("onepass", runner=lambda *a, **k: None, needs=())
-    reg.register("certs", runner=lambda *a, **k: None, needs=())
-    reg.register("subs", runner=lambda *a, **k: None, needs=("certs",))
-    reg.register("brute", runner=lambda *a, **k: None, needs=("dns",))
-    # "mapping" is the ONLY stage allowed to spend mapping quota (batch 1).
-    # "icp" stays registered as a presentation alias so old plans and
-    # checkpoints that name it keep resolving; dispatch happens in mapping.
-    reg.register("mapping", runner=lambda *a, **k: None, needs=())
-    reg.register("icp", runner=lambda *a, **k: None, needs=())
-    reg.register("dns", runner=lambda *a, **k: None, needs=("certs",))
-    reg.register("probe", runner=lambda *a, **k: None, needs=("dns",))
-    reg.register("ipagg", runner=lambda *a, **k: None, needs=("probe",))
-    reg.register("ports", runner=lambda *a, **k: None, needs=("ipagg",))
-    reg.register("vhost", runner=lambda *a, **k: None, needs=("ipagg",))
-    reg.register("crawl", runner=lambda *a, **k: None, needs=("probe",))
-    reg.register("extract", runner=lambda *a, **k: None, needs=("crawl",))
-    return reg.validate()
-
-
-STAGE_REGISTRY = _build_default_registry()
 
 
 def cmd_dry_run(args) -> int:
