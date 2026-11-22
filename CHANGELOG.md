@@ -89,6 +89,7 @@
   显式范围。私网/保留地址过滤移入 `tools.t_ports`（`run` 流水线直接调用同一
   函数），`--ip` 显式给出的地址照旧原样使用。
 - **抽取降噪与预算**（`7efc7e2`）：JS 拼接碎片、版本号假 IP、内网地址不再进入资产图；JS 抓取预算改为 `limits.js_fetch_limit`（默认 2000）；brief 补带 `coverage.metered`/`coverage.mapping`；`crawl 未运行` 假警告改按证据判断。
+- 测试注册表收录 `test_mapping_queries` / `test_scope_policy`（`32d92fa`）。
 - 文档示例全部补齐范围参数，并新增测试保证文档中的读库命令都带 scope。
 
 ## [0.8.1] - 2026-11-21
