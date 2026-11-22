@@ -9,8 +9,8 @@
 
 ### 测绘每任务只做一次
 
-- **测绘阶段合并、任务级账本、子进程免 key**。来源：`37953fd` 之后的改造
-  （实现在本条目所属的提交中，尚无独立哈希）。
+- **测绘阶段合并、任务级账本、子进程免 key**（`6e190dc`）。来源：`37953fd`
+  之后的改造。
   带 key 的请求只发生在唯一的 `mapping` 阶段（配套 `map` 命令）；同一任务内
   每个「引擎 + 规范化问题」只问一次，失败/配额/凭据被拒都记入任务账本且不自动
   重试，`--remap` 才是显式重问；复用结果保留原观测时间。`subs`/`passive` 改为纯
@@ -36,7 +36,7 @@
 
 ### 采集准确性修复
 
-- **测绘引擎按各自语法逐个查询**。uncover 会把 `-q` 原样发给每个引擎、不做语法转换；
+- **测绘引擎按各自语法逐个查询**（`fd9acda`）。uncover 会把 `-q` 原样发给每个引擎、不做语法转换；
   `subs` 过去把 Quake 语法 `domain:"x"` 一次性发给 fofa/quake/hunter/shodan/censys，
   `icp` 把 FOFA 语法 `icp="x"` 发给 quake/hunter，除一个引擎外都可能静默返回 0。
   现在每个有 key 的引擎单独派发：subs 用 fofa `domain="x"` / quake `domain:"x"` /
@@ -61,7 +61,7 @@
   （每页消耗配额），改为报告上游总数。每个源返回 `pages`/`truncated`/`total`，被截断的源进入
   `truncated_sources` 与 `coverage.unavailable.truncated_sources`。Windows 二进制已重建；
   Linux 二进制需用 `scripts/build-onepass.sh` 重建。
-- **查询语法可配置、显式上限、操作员自检**。每个引擎的查询模板可由
+- **查询语法可配置、显式上限、操作员自检**（`3b8ed81`）。每个引擎的查询模板可由
   `config/config.json` 的 `mapping.queries.<kind>.<engine>` 覆盖，模板缺少
   `{value}` 占位符在加载时报错（旧模板只对一个引擎正确，其余静默返回 0）；
   每条派发都显式传 uncover `-limit`，**它是花费上限而不是越大越好**：uncover 对
@@ -79,7 +79,7 @@
   （单次开销由构造保证有界），旧参数 `--yes-spend-quota` 仍然接受但被忽略。
   依据（二进制字符串 + 上游源码 + 官方文档）与新文档
   `docs/MAPPING-QUERIES.md` 一并入库，无法离线确认的条目列为待真实验证。
-- **读库策略 `scope.unscoped_reads`**。单阶段命令从共享库取目标而未给
+- **读库策略 `scope.unscoped_reads`；APP/小程序落库；无域名时给出引擎查询**（`b17e97c`）。单阶段命令从共享库取目标而未给
   `--scope`/`--domain` 时按策略处理：`infer`（默认）在库中只有一个注册域时
   自动采用并输出 `scope_source:"inferred"`，库中混有多个目标仍拒绝；
   `refuse` 从不推断；`legacy` 读全库并打印告警（旧脚本兼容）。拒绝时输出
