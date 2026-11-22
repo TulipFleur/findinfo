@@ -68,7 +68,7 @@
   带 `name_probe`（应答/尝试/跳过的引擎），全部引擎失败时标记 `unavailable` 而不是
   静默空跑。名称不经域名规范化（中文名会被整条丢掉），由 `uncover_query` 的引号
   剥离保证仍是单个词项。
-- **ENScan 失败时保留按名称查到的种子**。ENScan 非 0 退出且没写出 JSON（例如爱企查
+- **ENScan 失败时保留按名称查到的种子**（`3537574`）。ENScan 非 0 退出且没写出 JSON（例如爱企查
   Cookie 失效）时同样锚不到目标，会改由引擎按名称询问；但随后的退出码检查抛出
   `StageError`，把引擎答到的主体一起丢掉，运行以 `seed_domain_required` 结束。现在
   entity 阶段仍记为失败（不写检查点，修好 Cookie 后重跑会再试 ENScan），引擎答到的

@@ -9,7 +9,7 @@
 ```
 findinfo/
 ├── SKILL.md            ← the file agents read to decide how to use the skill
-├── findinfo.py         ← CLI entry point (23 subcommands)
+├── findinfo.py         ← CLI entry point (23 subcommands); `run` drives lib/pipeline.py
 ├── prompts/AGENT.txt    ← ★ copy-and-use prompt template (manual copy, never auto-loaded)
 ├── bin/                ← per-platform directories: bin/windows/, bin/linux/ (no macOS support)
 │   ├── windows/        ← 12 .exe files (preinstalled on Windows; doctor tracks 12)
@@ -19,6 +19,7 @@ findinfo/
 ├── deploy/             ← systemd templates (findinfo@.service / .timer)
 ├── lib/
 │   ├── core.py         ← config/storage/normalization/cache/rate-limiting/execution
+│   ├── pipeline.py     ← the `run` pipeline: one function per stage over a RunContext, StageRegistry (the scheduler), checkpoints, verdict
 │   ├── tools.py        ← 13 stage implementations (all return structured data)
 │   ├── jsleak.py       ← JS leak extraction · regex engine (zero dependencies)
 │   └── report.py       ← two final outputs (json for AI / html+md for humans) + provenance + priority scoring
