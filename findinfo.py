@@ -2450,20 +2450,60 @@ def _run_pipeline(args) -> int:
                                 "icp": len(r.get("icp", [])),
                                 "domains": len(r.get("domains", []))})
                 if r.get("anchor_failed"):
-                    # ENScan answered, but with companies that are NOT the one
-                    # asked for (aiqicha returns a popular lookalike when the
-                    # query misses). Nothing was stored, so this stage has no
-                    # result of its own: reporting it as a plain success made a
-                    # wrong entity look like a mapped target. A StageError
-                    # records it as a coverage gap the agent must read.
-                    raise core.StageError(
-                        "enscan returned no entity matching the requested name "
-                        "(rejected " + str(len(r.get("rejected") or [])) +
-                        " unrelated result(s)" +
-                        (": " + ", ".join((r.get("rejected") or [])[:3])
-                         if r.get("rejected") else "") + ")",
-                        result={"companies": 0, "icp": 0, "domains": 0,
-                                "anchor_failed": True})
+                    # ENScan could NOT anchor the target (aiqicha has no such
+                    # keyword, or answered with lookalikes only). The operator's
+                    # rule: do not stop here -- the NAME is still the best
+                    # search value we have, so ask the internet engines for the
+                    # company's main domain and let the normal seed path take
+                    # over from whatever comes back.
+                    #
+                    # This is deliberately NOT a StageError: failing the stage
+                    # left the agent with "enscan did not match" and nothing to
+                    # run, which is exactly the dead end the rule removes. The
+                    # engine answer is recorded as the stage result, with the
+                    # probe's own status so a total failure is still visible.
+                    _probe = mapdispatch.resolve_by_name(
+                        store, summary.get("_run_public_id") or "",
+                        args.name, engines=getattr(args, "engines", None),
+                        timeout=tool_timeout or 0,
+                        ledger=summary.get("_ledger"))
+                    r = dict(r)
+                    r["name_probe"] = _probe
+                    r["domains"] = list(_probe.get("domains") or [])
+                    r["companies"] = []
+                    # The seed step reads domains from the STORE by subject
+                    # reference, so the engine answer must land there -- with a
+                    # name-derived reference, since ENScan supplied none.
+                    if r["domains"]:
+                        _ref = "name:" + str(args.name).strip()
+                        for _d in r["domains"]:
+                            try:
+                                # 0.9: the seed step reads approved
+                                # subjects' domains at that floor, and this
+                                # IS an engine-confirmed answer for the
+                                # anchored name (not a scraped guess).
+                                store.upsert_asset(
+                                    "domain", _d, source="mapping:name",
+                                    confidence=0.9, passivity="passive",
+                                    parent=_ref)
+                            except Exception:
+                                continue
+                        r["subjects"] = [{"ref": _ref,
+                                          "legal_name": str(args.name).strip(),
+                                          "approved": True,
+                                          "domains": len(r["domains"])}]
+                    _dbg = ("enscan could not anchor '" + str(args.name) +
+                            "'; asked the mapping engines by NAME instead -> " +
+                            str(len(r["domains"])) + " domain(s) from " +
+                            str(_probe.get("answered") or 0) + " engine(s)")
+                    core.log(_dbg)
+                    if not r["domains"] and not _probe.get("answered"):
+                        # No engine could even be asked: that IS a gap, and the
+                        # agent must see why (no key / refused credential).
+                        r["outcome"] = core.OUTCOME_UNAVAILABLE
+                        r["unavailable_sources"] = list(
+                            (_probe.get("skipped_engines") or [])[:5])
+                    # fall through: the normal seed step below uses r["domains"]
                 if r.get("rc") not in (0, None) and not r.get("json_files"):
                     # rc != 0 with no JSON used to fail the stage outright. But
                     # ENScan can print a complete report table and still not

@@ -27,6 +27,13 @@
   `assets(kind=app)` 落库（含归属主体），`assets --kind app`、xlsx 的「APP/小程序」
   sheet 均可查。存储逻辑抽成 `tools.store_approved_entities()`，不必启动 ENScan
   二进制即可测试。
+- **ENScan 锚不到目标时，改由引擎按名称收集主域名**。过去 `anchor_failed`（aqicha
+  无此关键词，或只返回同名干扰项）直接抛 `StageError` 结束，把唯一可用的事实
+  （公司名）丢掉。现在不终止：用名称向各引擎发 `domain="<名称>"`，答案以
+  `mapping:name` 落库并挂在由名称派生的主体引用下，再由正常种子流程接管；阶段结果
+  带 `name_probe`（应答/尝试/跳过的引擎），全部引擎失败时标记 `unavailable` 而不是
+  静默空跑。名称不经域名规范化（中文名会被整条丢掉），由 `uncover_query` 的引号
+  剥离保证仍是单个词项。
 - **只锚定到主体、没有域名时给出可执行的下一步**。过去直接报 `no seed domain`
   并以退出码 2 结束，把唯一已确认的事实（公司）丢掉，Agent 无从下手。现在返回
   结构化错误 `seed_domain_required`：`candidates` 是已锚定的主体名，`queries`

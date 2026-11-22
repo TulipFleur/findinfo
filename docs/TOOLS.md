@@ -100,7 +100,14 @@ mini-program names from ENScan's `app` / `wx_app` / `wechat` fields). `app` rows
 payload but never written before, so the brief / report / xlsx reported zero mini-programs for companies whose
 ENScan answer listed a dozen.
 
-**When a subject is anchored but no domain is filed** the run does not stop with "no seed": it exits `2` with
+**When ENScan cannot anchor the target at all** (aiqicha has no such keyword, or answers with lookalikes only) the
+run does **not** stop: the company name is still the best search value there is, so the mapping engines are asked
+`domain="<name>"` for it, their answer is stored as `mapping:name` under a name-derived subject reference, and the
+normal seed path continues with whatever main domain came back. The stage result carries `name_probe` (answered /
+attempted engines, skipped ones) so a total engine failure is still visible as a gap rather than a silent empty run.
+If no engine could even be asked (no key, refused credential), the stage is marked `unavailable` with the reasons.
+
+**When a subject IS anchored but filed no domain** the run does not stop with "no seed" either: it exits `2` with
 `{"error":"seed_domain_required","candidates":["<company name>"],"queries":["icp=\"<name>\"","domain=\"<name>\""],"hint":"..."}`.
 The company IS the search value — run the engines on it and seed the run with whatever comes back:
 

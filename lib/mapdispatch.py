@@ -463,6 +463,55 @@ def ask(store, run_id: str, engine: str, kind: str, value: str,
             "reason": (err or "").strip()[:200]}
 
 
+def resolve_by_name(store, run_id: str, name: str, *,
+                    engines: str | None = None, timeout: int = 0,
+                    ledger=None, kind: str = "domain") -> dict:
+    """Find a company's MAIN DOMAIN by asking the engines for its NAME.
+
+    Used when ENScan cannot anchor a target at all (no such keyword, or only
+    lookalikes came back): the operator's rule is that the company name is
+    still a usable search value, so the engines are asked `icp="<name>"` and
+    `domain="<name>"` and whatever domains come back seed the run.
+
+    A name is NOT a domain, so it deliberately bypasses canon_user_domain
+    (which would drop every Chinese corporate name). Safety comes from
+    core.uncover_query, which strips quotes and backslashes so the value stays
+    inside its quoted term.
+
+    Returns {"domains": [...], "answered": n_engines_with_an_answer,
+    "attempted": n, "skipped_engines": [...], "results": [(kind, value)]}.
+    """
+    label = str(name or "").strip()
+    out = {"domains": [], "answered": 0, "attempted": 0,
+           "skipped_engines": [], "results": [], "name": label}
+    if not label:
+        return out
+    usable, skipped = engines_for_task(store, kind, engines)
+    out["skipped_engines"] = list(skipped)
+    domains: list = []
+    results: list = []
+    for engine in usable:
+        out["attempted"] += 1
+        r = ask(store, run_id, engine, kind, label, timeout=timeout,
+                ledger=ledger)
+        if r.get("status") in (metered.ST_OK, metered.ST_EMPTY,
+                               metered.ST_TRUNCATED):
+            out["answered"] += 1
+        for k, v in (r.get("results") or []):
+            results.append((k, v))
+            if k == "domain" and v not in domains:
+                domains.append(v)
+        # an engine that refused the credential stays in the ledger's blocked
+        # list, so the rest of the run will not touch it again
+        if r.get("status") == metered.ST_AUTH:
+            out["skipped_engines"].append(
+                {"engine": engine, "reason": "credential rejected: " +
+                 str(r.get("reason") or "")[:120]})
+    out["domains"] = domains
+    out["results"] = results
+    return out
+
+
 def ask_all(store, run_id: str, kind: str, values, *,
             engines: str | None = None, remap: bool = False,
             timeout: int = 0, ledger=None) -> dict:

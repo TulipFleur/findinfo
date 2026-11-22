@@ -268,3 +268,49 @@ def test_no_domain_but_an_anchored_subject_asks_the_engines():
     assert any('icp="fixture-subject"' in q for q in payload["queries"]), payload
     assert payload.get("hint"), payload
     assert calls == [], calls
+
+
+def test_anchor_failure_falls_back_to_engine_name_search():
+    """ENScan cannot anchor the target -> ask the engines for its main domain.
+
+    Operator rule: a company ENScan has never heard of is not the end of the
+    run. The name is still the best search value, so the engines are asked
+    `domain="<name>"` and whatever comes back becomes the seed. Previously this
+    path raised a StageError and left the caller with nothing to run.
+    """
+    core = fresh_core()
+    fresh_tools(core)
+    fi = import_findinfo()
+    for e in ("fofa", "quake"):
+        core.CFG.setdefault("apis", {}).setdefault(e, {})["key"] = "test-key"
+    core.CFG["apis"]["fofa"]["base"] = ""
+    core.CFG.setdefault("limits", {})["mapping_rows"] = 1
+
+    def fake_enscan(store, name, **kw):
+        return {"rc": 0, "json_files": 1, "companies": [], "icp": [],
+                "domains": [], "apps": [], "subjects": [], "candidates": [],
+                "stderr": "", "table_only": False, "anchor_failed": True,
+                "rejected": ["lookalike-co"]}
+
+    def fake_run(cmd, **kw):
+        if "-q" in cmd:
+            return 0, json.dumps({"host": "mt-a.example.com"}) + chr(10), ""
+        return 0, "", ""
+
+    def fake_dns(store, domains, **kw):
+        return {"count": 0, "resolved": [], "domains": [], "hosts": []}
+
+    buf = io.StringIO()
+    with mock.patch.object(fi.tools, "t_enscan", side_effect=fake_enscan), \
+            mock.patch.object(fi.tools, "t_dns", side_effect=fake_dns), \
+            mock.patch.object(fi.mapdispatch.core, "run", side_effect=fake_run), \
+            redirect_stdout(buf):
+        rc = fi.main(["run", "--name", "fixture-subject", "--rounds", "1",
+                      "--no-onepass", "--no-icp"])
+    payload = json.loads([l for l in buf.getvalue().splitlines()
+                          if l.startswith("{")][-1])
+    # the run proceeds on the engine-answered domain instead of dying
+    assert payload.get("error") != "seed_domain_required", payload
+    assert "mt-a.example.com" in (payload.get("seed_domains") or []), payload
+    ent = [s for s in payload["stages"] if s.get("stage") == "entity"]
+    assert ent and ent[0].get("anchor_failed") is not True, ent
