@@ -89,7 +89,12 @@
   显式范围。私网/保留地址过滤移入 `tools.t_ports`（`run` 流水线直接调用同一
   函数），`--ip` 显式给出的地址照旧原样使用。
 - **抽取降噪与预算**（`7efc7e2`）：JS 拼接碎片、版本号假 IP、内网地址不再进入资产图；JS 抓取预算改为 `limits.js_fetch_limit`（默认 2000）；brief 补带 `coverage.metered`/`coverage.mapping`；`crawl 未运行` 假警告改按证据判断。
-- 测试注册表收录 `test_mapping_queries` / `test_scope_policy`（`32d92fa`）；changelog 补引见 `0a79e51`、`74fc88a`、`8b834da`。
+- 测试注册表收录 `test_mapping_queries` / `test_scope_policy`（`32d92fa`）；changelog 补引见 `0a79e51`、`74fc88a`、`8b834da`、`4d55eaa`、`9dc10a6`。
+- **后台作业终态只有一个写者**（`504f3fb`）。pipeline 过去在每次运行结束时也写
+  `state="completed"`，而后台 worker 还会带着 `exit_code` 再写一次；前者产生的
+  帧里 `completed` 没有 `exit_code`，而 `wait` 把 completed 当终态，调用方会撞上
+  一个真实终态里必然存在的字段缺失（worker e2e 约 1/6 复现）。现在后台由 worker
+  单次围栏写入终态，前台由 pipeline 自己写并给出退出码。修复后连跑 18 次 0 失败。
 - 文档示例全部补齐范围参数，并新增测试保证文档中的读库命令都带 scope。
 
 ## [0.8.1] - 2026-11-21
