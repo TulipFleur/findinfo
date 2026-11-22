@@ -9,7 +9,7 @@
 
 ### 结构调整
 
-- **StageRegistry 成为真正的调度器**。registry 移入 `lib/pipeline.py`，14 个阶段登记的
+- **StageRegistry 成为真正的调度器**（`07f19ef`）。registry 移入 `lib/pipeline.py`，14 个阶段登记的
   是真实的阶段函数（原来全是 `lambda: None` 占位，生产代码从不调用）。每个阶段带
   `phase`：`seed` 在轮次前跑一次，`round` 每轮跑一次；运行时按 registry 顺序执行计划
   （`_plan_stages`）里的阶段，计划里出现未登记的阶段直接报错，不会被静默跳过。`icp`
@@ -68,6 +68,11 @@
   带 `name_probe`（应答/尝试/跳过的引擎），全部引擎失败时标记 `unavailable` 而不是
   静默空跑。名称不经域名规范化（中文名会被整条丢掉），由 `uncover_query` 的引号
   剥离保证仍是单个词项。
+- **ENScan 失败时保留按名称查到的种子**。ENScan 非 0 退出且没写出 JSON（例如爱企查
+  Cookie 失效）时同样锚不到目标，会改由引擎按名称询问；但随后的退出码检查抛出
+  `StageError`，把引擎答到的主体一起丢掉，运行以 `seed_domain_required` 结束。现在
+  entity 阶段仍记为失败（不写检查点，修好 Cookie 后重跑会再试 ENScan），引擎答到的
+  域名照常作为种子继续收集，结果为 `partial`、退出码 5。
 - **只锚定到主体、没有域名时给出可执行的下一步**。过去直接报 `no seed domain`
   并以退出码 2 结束，把唯一已确认的事实（公司）丢掉，Agent 无从下手。现在返回
   结构化错误 `seed_domain_required`：`candidates` 是已锚定的主体名，`queries`

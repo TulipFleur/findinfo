@@ -786,10 +786,16 @@ def _stage_entity(ctx: RunContext) -> None:
             # record a coverage gap instead of a red failure.
             msg = ("enscan rc=" + str(r.get("rc")) + " no output files" +
                    (" (report table printed, JSON missing)" if r.get("table_only") else ""))
-            raise core.StageError(
-                msg,
-                result={"companies": 0, "icp": 0, "domains": 0,
-                        "table_only": bool(r.get("table_only"))})
+            partial = {"companies": 0, "icp": 0, "domains": 0,
+                       "table_only": bool(r.get("table_only"))}
+            if r.get("subjects"):
+                # The engines answered the NAME after ENScan failed. The
+                # stage still fails (ENScan must be retried), but the
+                # answered subject goes on to seed the run instead of
+                # being thrown away together with ENScan's error.
+                partial["domains"] = len(r.get("domains") or [])
+                partial["subjects"] = r["subjects"]
+            raise core.StageError(msg, result=partial)
         # Subject gate (docs par.8, T06): a brand that matches MORE
         # than one plausible legal subject is ambiguous. Without an
         # explicit --domain seed the run must stop and ask, never

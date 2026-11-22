@@ -314,3 +314,46 @@ def test_anchor_failure_falls_back_to_engine_name_search():
     assert "mt-a.example.com" in (payload.get("seed_domains") or []), payload
     ent = [s for s in payload["stages"] if s.get("stage") == "entity"]
     assert ent and ent[0].get("anchor_failed") is not True, ent
+
+
+def test_enscan_failure_keeps_the_seeds_the_engines_found_by_name():
+    """ENScan exits non-zero and writes no JSON (an expired Cookie looks like
+    this), so nothing anchors and the engines are asked by NAME. Their answer
+    must seed the run. The entity stage still reports the ENScan failure (and
+    is not checkpointed, so a re-run retries it), but its rc check used to
+    throw the name probe away and end the run on seed_domain_required."""
+    core = fresh_core()
+    fresh_tools(core)
+    fi = import_findinfo()
+    for e in ("fofa", "quake"):
+        core.CFG.setdefault("apis", {}).setdefault(e, {})["key"] = "test-key"
+    core.CFG["apis"]["fofa"]["base"] = ""
+    core.CFG.setdefault("limits", {})["mapping_rows"] = 1
+
+    def fake_enscan(store, name, **kw):
+        return {"rc": 1, "json_files": 0, "companies": [], "icp": [],
+                "domains": [], "apps": [], "subjects": [], "candidates": [],
+                "stderr": "cookie expired", "table_only": False,
+                "anchor_failed": True, "rejected": []}
+
+    def fake_run(cmd, **kw):
+        if "-q" in cmd:
+            return 0, json.dumps({"host": "mt-a.example.com"}) + chr(10), ""
+        return 0, "", ""
+
+    buf = io.StringIO()
+    with mock.patch.object(fi.tools, "t_enscan", side_effect=fake_enscan), \
+            mock.patch.object(fi.tools, "t_certs", return_value={"count": 0, "ok": True}), \
+            mock.patch.object(fi.tools, "t_subs", return_value={"count": 0}), \
+            mock.patch.object(fi.tools, "t_dns", return_value={"count": 0}), \
+            mock.patch.object(fi.mapdispatch.core, "run", side_effect=fake_run), \
+            redirect_stdout(buf):
+        rc = fi.main(["run", "--name", "fixture-subject", "--rounds", "1",
+                      "--no-onepass", "--no-icp"])
+    payload = json.loads([l for l in buf.getvalue().splitlines()
+                          if l.startswith("{")][-1])
+    assert payload.get("error") != "seed_domain_required", payload
+    assert "mt-a.example.com" in (payload.get("seed_domains") or []), payload
+    ent = [s for s in payload["stages"] if s.get("stage") == "entity"]
+    assert ent and ent[0].get("failed") is True, ent
+    assert rc == 5, rc
