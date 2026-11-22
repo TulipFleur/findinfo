@@ -90,3 +90,50 @@ def test_extract_from_text_canon_gate():
     assert "www.example.com.au" in got["domains"]
 
 
+
+
+def test_version_strings_are_not_ips():
+    """`03.06.03.118` matches the permissive regex but is not an address.
+
+    A real target (南开大学) collected 36 such strings -- version numbers and
+    dates from JS bundles -- into the asset graph because this module returned
+    regex hits verbatim. Every hit now goes through core.canon_ip, which
+    rejects a leading-zero octet (and anything ipaddress refuses).
+    """
+    import lib.jsleak as js
+    got = js.extract("var v='03.06.03.118'; var d='06.118.206.148';", [])
+    assert got["ips"] == [], got["ips"]
+
+
+def test_a_real_ip_is_still_kept():
+    import lib.jsleak as js
+    got = js.extract("const api='http://93.184.216.34:8080/x'", [])
+    assert got["ips"] == ["93.184.216.34"], got["ips"]
+
+
+def test_internal_addresses_are_evidence_not_assets():
+    """127.0.0.1 in a bundle proves a leak; it is not a host to scan.
+
+    Kept in the report as `internal_ips`, excluded from `ips` so probe/ports
+    never treat the operator's own machine or a private range as target.
+    """
+    from lib import tools
+    got = tools.extract_from_text(
+        "a 127.0.0.1 b 10.2.2.2 c 93.184.216.34 d 03.06.03.118", [])
+    assert got["ips"] == ["93.184.216.34"], got
+    assert sorted(got["internal_ips"]) == ["10.2.2.2", "127.0.0.1"], got
+
+
+def test_js_concatenation_fragments_are_not_endpoints():
+    """katana reports `'/_upload/tpl/' + tecUrl + '/x'` pieces as paths.
+
+    A real target produced 25,510 such fragments against 492 real API
+    endpoints. They can never be requested, so they are dropped before
+    storage rather than after triage fails.
+    """
+    from lib import core
+    assert core.is_junk_path("/_upload/tpl/{n}/template1/js/'+tecUrl+'")
+    assert core.is_junk_path("/a%27+%20x")
+    assert not core.is_junk_path("/api/cas/login")
+    assert not core.is_junk_path("/api/user/{n}")
+    assert not core.is_junk_path("/")

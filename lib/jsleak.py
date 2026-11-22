@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import re
 
+from . import core
+
 # Generic alpha TLD: an explicit whitelist (com|cn|net|...) both missed real
 # multi-label suffixes (.com.au) and TRUNCATED matches -- "service.example.com.au"
 # was captured as "service.example.com". Consumers must still validate with a
@@ -60,7 +62,12 @@ def extract(text: str, root_domains: list[str] | None = None) -> dict:
         return any(d == r or d.endswith("." + r) for r in root_domains)
 
     domains = sorted({m.group(1).lower() for m in DOMAIN.finditer(text)})
-    ips = sorted({m.group(0) for m in IPV4.finditer(text)})
+    # The regex is deliberately permissive (it also matches `03.06.03.118`,
+    # which is a version string, not an address). canonicalise every hit and
+    # drop what ipaddress rejects: a leading-zero "address" is not routable and
+    # storing it put 36 version strings into the asset graph of a real target.
+    ips = sorted({core.canon_ip(m.group(0)) for m in IPV4.finditer(text)}
+                 - {None})
     paths = sorted({m.group(1) for m in API_PATH.finditer(text)})
     smaps = sorted({m.group(1) for m in SOURCEMAP.finditer(text)})
     secrets = {}

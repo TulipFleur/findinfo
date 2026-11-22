@@ -7,9 +7,10 @@
 
 ## [Unreleased]
 
-### 测绘每任务只做一次（进行中）
+### 测绘每任务只做一次
 
-- **测绘阶段合并、任务级账本、子进程免 key**。来源：`37953fd` 之后的改造。
+- **测绘阶段合并、任务级账本、子进程免 key**。来源：`37953fd` 之后的改造
+  （实现在本条目所属的提交中，尚无独立哈希）。
   带 key 的请求只发生在唯一的 `mapping` 阶段（配套 `map` 命令）；同一任务内
   每个「引擎 + 规范化问题」只问一次，失败/配额/凭据被拒都记入任务账本且不自动
   重试，`--remap` 才是显式重问；复用结果保留原观测时间。`subs`/`passive` 改为纯
@@ -17,6 +18,21 @@
   派发按目标工具注入它真正读取的变量名（Hunter 对 uncover 是 `HUNTER_API_KEY`、
   对 onepass 是 `HUNTER_KEY` 等）。`uncover` 显式设置 `-limit`，满页标记截断。
   缺 key 或凭据被拒的引擎默认跳过并记为能力缺口，不报错、不反复重试。
+
+### 实体与 APP 面补全
+
+- **ENScan 的 APP / 小程序不再被丢弃**。`app` / `wx_app` / `wechat` 字段一直被解析并
+  出现在阶段返回值里，却**从未落库**，于是 brief、report、xlsx 里 APP 数量恒为 0——
+  一个 ENScan 报了十多个小程序的主体，在交付物里完全看不见。现在按
+  `assets(kind=app)` 落库（含归属主体），`assets --kind app`、xlsx 的「APP/小程序」
+  sheet 均可查。存储逻辑抽成 `tools.store_approved_entities()`，不必启动 ENScan
+  二进制即可测试。
+- **只锚定到主体、没有域名时给出可执行的下一步**。过去直接报 `no seed domain`
+  并以退出码 2 结束，把唯一已确认的事实（公司）丢掉，Agent 无从下手。现在返回
+  结构化错误 `seed_domain_required`：`candidates` 是已锚定的主体名，`queries`
+  是可直接执行的引擎查询（`icp="<名称>"` / `domain="<名称>"`），`hint` 说明用
+  `map --name` 去查再用返回结果做种子。新增 `map --name/--kind`：中文公司名不经过
+  域名规范化（会被整条丢掉），由 `uncover_query` 的引号剥离保证仍是单个词项。
 
 ### 采集准确性修复
 
@@ -40,10 +56,38 @@
   未给 `--domain` 时用被碰撞主机的注册域，不再取全库域名。`Store.get_assets` 与
   `t_ipagg` 对 `.local` 等私有后缀的范围不再放宽为全库（新增 `core.canon_match`）。
 - **onepass 0.2.0：翻页与截断上报**。VirusTotal（`links.next`，仅同源）与 urlscan
-  （`search_after`）按页预算翻页（默认 4 页，`--max-pages` 1–20）；FOFA/Quake/Hunter 不自动翻页
+  （`search_after`）按页预算翻页；本 skill 默认取上限 20 页（`limits.mapping_pages`，
+  口径是最大程度收集资产，免费游标页不额外计费），`--max-pages` 仍可 1–20；FOFA/Quake/Hunter 不自动翻页
   （每页消耗配额），改为报告上游总数。每个源返回 `pages`/`truncated`/`total`，被截断的源进入
   `truncated_sources` 与 `coverage.unavailable.truncated_sources`。Windows 二进制已重建；
   Linux 二进制需用 `scripts/build-onepass.sh` 重建。
+- **查询语法可配置、显式上限、操作员自检**。每个引擎的查询模板可由
+  `config/config.json` 的 `mapping.queries.<kind>.<engine>` 覆盖，模板缺少
+  `{value}` 占位符在加载时报错（旧模板只对一个引擎正确，其余静默返回 0）；
+  每条派发都显式传 uncover `-limit`，**它是花费上限而不是越大越好**：uncover 对
+  quake 固定 `Size=100` 并用 `Start` 偏移循环翻页（`sources/agent/quake/quake.go`），
+  每页计费。真实账户实测：`-limit 1` 扣 100、`-limit 100` 扣 100、`-limit 10000`
+  在 50 行的答案上扣 **700**（7 页）。但**一页的成本与返回 10 条还是 100 条无关**，
+  小 limit 不省钱、只是把同一次花费拆成多次往返并增加拿不全的概率。因此默认值
+  **一次拉满 3000**（= quake 免费额度 3000 credit ÷ 1 credit/行，约 30 页），
+  一个问题一次问完、一次付清、不重复；按引擎覆写用 `limits.mapping_rows_<engine>`，
+  余额更少时按余额下调，而不是靠反复小批量试探。每次派发记录 `pages`；
+  可选用 `limits.measure_credits` 在派发前后读余额得到实测值（默认关闭，避免多余请求）。
+  满页标记 `truncated` 并进入 `coverage.unavailable.truncated_sources`。新增
+  `doctor --check-mapping --domain X`：每引擎一条 `-limit 1` 最小查询，逐引擎报告
+  key/语法是否被接受，不写任务账本。本 skill 由 Agent 自动驱动，**不设同意闸门**
+  （单次开销由构造保证有界），旧参数 `--yes-spend-quota` 仍然接受但被忽略。
+  依据（二进制字符串 + 上游源码 + 官方文档）与新文档
+  `docs/MAPPING-QUERIES.md` 一并入库，无法离线确认的条目列为待真实验证。
+- **读库策略 `scope.unscoped_reads`**。单阶段命令从共享库取目标而未给
+  `--scope`/`--domain` 时按策略处理：`infer`（默认）在库中只有一个注册域时
+  自动采用并输出 `scope_source:"inferred"`，库中混有多个目标仍拒绝；
+  `refuse` 从不推断；`legacy` 读全库并打印告警（旧脚本兼容）。拒绝时输出
+  `{"error":"scope_required","candidates":[...],"scope_source":"refused"}`，
+  `candidates` 是库自身能给的候选注册域；输出一律带 `scope_source`
+  （`explicit`/`inferred`/`whole_store`/`legacy`），调用方不会把推断范围误当
+  显式范围。私网/保留地址过滤移入 `tools.t_ports`（`run` 流水线直接调用同一
+  函数），`--ip` 显式给出的地址照旧原样使用。
 - 文档示例全部补齐范围参数，并新增测试保证文档中的读库命令都带 scope。
 
 ## [0.8.1] - 2026-11-21
@@ -119,6 +163,8 @@
 
 ### 0.8.x 维护提交补录
 
+- 忽略本地发布产物与草稿目录（`b28046a`）；0.8.1 解包发行版构建、版本号与
+  changelog（`936ce79`）。
 - 收敛提取域名的范围与通配符探测的可信度，资产带上时间戳（`947bfaa`）。
 - CHANGELOG 覆盖检查允许最新的两条提交暂时缺席（编辑本文件的提交不可能
   包含自己的哈希）（`d0ecfe7`）。

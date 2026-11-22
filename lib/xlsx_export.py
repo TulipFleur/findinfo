@@ -31,6 +31,10 @@ SHEETS = (
                          "first_seen", "last_seen")),
     ("icp", "备案", ("canonical", "parent", "confidence", "sources",
                      "first_seen", "last_seen")),
+    # ENScan reports APP / mini-program names alongside domains and filings;
+    # they were parsed but never stored, so this sheet had nothing to show.
+    ("app", "APP/小程序", ("canonical", "parent", "confidence", "sources",
+                           "first_seen", "last_seen")),
 )
 ENDPOINT_SHEET = ("endpoint", "端点",
                   ("asset", "method", "path", "params", "status", "title",

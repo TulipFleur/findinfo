@@ -518,8 +518,14 @@ def collect(store, match=None, min_conf=0.4, limit=300, ep_limit=400,
     if "probe" not in ran and hosts:
         warnings.append("liveness probe (probe) was not run: " + str(len(hosts)) +
                         " domains have no status/title/fingerprint; live=0 means 'not probed', not 'all dead'.")
-    if "crawl" not in ran and hosts:
-        warnings.append("crawl/extract was not run: an empty endpoint table and leak list does not mean the sites have no APIs.")
+    # "crawl not run" must be about EVIDENCE, not the checkpoint table: a
+    # standalone `crawl`/`extract` never writes `steps`, so a report built
+    # after exactly that run claimed the crawler had not run at all (seen on
+    # the 南开大学 run: 40k endpoints and a "crawl was not run" warning).
+    crawled = any((e.get("source") or "") in ("katana", "jsleak")
+                  for e in (store.get_endpoints(limit=2000) or []))
+    if not crawled and "crawl" not in ran and hosts:
+        warnings.append("crawl was not run: an empty endpoint table does not mean the sites have no APIs.")
     if fake_ip_count:
         warnings.append(
             "detected " + str(fake_ip_count) + " domains resolving into 198.18.0.0/15 (Clash/TUN fake-IP). "
@@ -1530,7 +1536,11 @@ def _brief_coverage(data=None, coverage=None):
     # these stages under-collected" -- the most action-relevant fact after
     # the counts. Carried verbatim when the run's coverage block has them.
     for key in ("complete", "requested_complete", "stop_reason", "reason",
-                "partial_stages", "stage_states", "work_queue", "js_queue"):
+                "partial_stages", "stage_states", "work_queue", "js_queue",
+                # What the paid mapping spent and what this TASK already owns:
+                # a run whose engines were all skipped or refused looks exactly
+                # like a target with no assets unless these travel with it.
+                "metered", "mapping"):
         if key in cov and cov.get(key) is not None:
             out[key] = cov[key]
     res = (data or {}).get("result") if isinstance(data, dict) else None

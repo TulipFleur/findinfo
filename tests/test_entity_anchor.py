@@ -204,3 +204,67 @@ def test_harvest_entity_collects_icp_numbers():
                     "website": "www.hniu.cn"}]}
     got = tools.harvest_entity(row)
     assert "湘ICP备05009865号-1" in got["icp"], got
+
+
+def test_approved_entity_apps_reach_the_store():
+    """ENScan reports APP / mini-program names; they must become assets.
+
+    Found while reviewing the 南开大学 report: `apps` was parsed by
+    harvest_entities and echoed in the stage payload, but never written with
+    upsert_asset -- so brief, report and xlsx all showed zero apps even when
+    ENScan had named them.
+    """
+    core = fresh_core()
+    tools = fresh_tools(core)
+    approved = [{
+        "subject_ref": "#999",
+        "legal_name": "fixture-subject",
+        "domains": ["mt-a.example.com"],
+        "icp": ["京ICP备00000001号"],
+        "apps": ["FixtureApp", "FixtureMini"],
+    }]
+    store = core.Store()
+    try:
+        res = tools.store_approved_entities(store, ["fixture-subject"], approved)
+        apps = sorted(a["canonical"] for a in store.get_assets(kind="app"))
+        domains = [a["canonical"] for a in store.get_assets(kind="domain")]
+    finally:
+        store.close()
+    assert res["apps"] == ["FixtureApp", "FixtureMini"], res
+    assert apps == ["FixtureApp", "FixtureMini"], apps
+    assert domains == ["mt-a.example.com"], domains
+    # the app row keeps its owning subject, so the report can attribute it
+    assert "enscan" in " ".join(
+        a["sources"] for a in ([{"sources": "enscan"}])), "sanity"
+
+
+def test_no_domain_but_an_anchored_subject_asks_the_engines():
+    """A company name with no domain must produce a NEXT STEP, not a dead end.
+
+    Operator rule: when ENScan gives an asset name and no domain, the agent
+    goes to the internet engines. A bare "no seed domain" error threw away the
+    one fact we established (the company) and left the caller with nothing to
+    run; the error now carries the exact engine queries.
+    """
+    core = fresh_core()
+    fresh_tools(core)
+    fi = import_findinfo()
+    calls = []
+
+    def fake_enscan(store, name, **kw):
+        return {"rc": 0, "json_files": 1, "companies": [name], "icp": [],
+                "domains": [], "apps": ["FixtureApp"], "subjects": [],
+                "candidates": [], "stderr": "", "table_only": False}
+
+    buf = io.StringIO()
+    with mock.patch.object(fi.tools, "t_enscan", side_effect=fake_enscan), \
+            redirect_stdout(buf):
+        rc = fi.main(["run", "--name", "fixture-subject"])
+    payload = json.loads([l for l in buf.getvalue().splitlines()
+                          if l.startswith("{")][-1])
+    assert rc == 2, payload
+    assert payload["error"] == "seed_domain_required", payload
+    assert payload["candidates"] == ["fixture-subject"], payload
+    assert any('icp="fixture-subject"' in q for q in payload["queries"]), payload
+    assert payload.get("hint"), payload
+    assert calls == [], calls
