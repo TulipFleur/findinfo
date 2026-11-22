@@ -5,6 +5,8 @@ SAME object the run executes: a second copy left in findinfo.py would let a
 caller (or a test patch) talk to code the run never calls.
 """
 import re
+from types import SimpleNamespace
+from unittest import mock
 
 import tests.util as util
 from tests.util import fresh_core, fresh_tools, import_findinfo
@@ -31,3 +33,33 @@ def test_pipeline_reaches_core_through_the_module_only():
     pointing at the previous home."""
     src = (util.ROOT / "lib" / "pipeline.py").read_text(encoding="utf-8")
     assert not re.search(r"^\s*from\s+(\.|lib\.)core\s+import", src, re.M)
+
+
+def test_a_stage_runs_on_its_own_from_a_run_context():
+    """Each stage is a function of the run's context: certs runs with no other
+    stage around it. This is the seam the StageRegistry runners plug into."""
+    core = fresh_core("stage-unit")
+    tools = fresh_tools(core)
+    from lib import pipeline
+    store = core.Store()
+    try:
+        rd = core.new_run_dir("stage-unit")
+        summary = {"stages": [], "_run_public_id": rd.name, "attempt": 1}
+        ctx = pipeline.RunContext(
+            args=SimpleNamespace(), store=store, run_id=None, run_dir=rd,
+            summary=summary, active=False, attempt=1, target_label="stage-unit",
+            planned=["certs"], ledger=None, rounds=1, time_budget=0.0,
+            tool_timeout=0, max_seed=0, t_start=0.0, seeds=["example.com"])
+        asked = []
+
+        def certs(store_, domain, timeout=0):
+            asked.append(domain)
+            return {"count": 2, "ok": True}
+
+        with mock.patch.object(tools, "t_certs", certs):
+            pipeline._stage_certs(ctx)
+        assert asked == ["example.com"]
+        entry = summary["stages"][-1]
+        assert entry["stage"] == "certs" and entry["found"] == 2, entry
+    finally:
+        store.close()

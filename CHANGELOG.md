@@ -9,7 +9,14 @@
 
 ### 结构调整
 
-- **run 流水线移到 `lib/pipeline.py`**。findinfo.py 只保留命令行层（参数解析、各子命令、
+- **流水线拆成阶段函数**。`_run_pipeline` 从 1238 行缩成约 40 行的驱动；每个阶段是
+  `lib.pipeline` 里一个以 `RunContext` 为参数的函数（entity / onepass / certs / subs /
+  brute / mapping，以及每轮的 dns / probe / ipagg / ports / vhost / crawl / extract），
+  阶段正文与原来一致。原先放在 `summary` 里、只有流水线自己用的私有键（`_ledger`、已批准
+  主体的引用与名称、主体歧义判定）改为 `RunContext` 字段；`_stage` / `_attach` /
+  `_adopt_membership` 读的 `_run_public_id`、`_run_producers`、`_stage_total` 保留在
+  `summary` 里。`summary.jsonl` 和 stdout 的内容不变。
+- **run 流水线移到 `lib/pipeline.py`**（`3c147bd`）。findinfo.py 只保留命令行层（参数解析、各子命令、
   后台启动与续跑）；`_run_pipeline` 以及只有它用到的检查点、心跳、状态写入、成员关系、
   计划与覆盖率/判定辅助函数原样搬入 `lib/pipeline.py`。findinfo 继续导出这些名字（就是
   同一个对象），`python findinfo.py …` 的用法、输出和 `__worker` 入口都不变；要改流水线
