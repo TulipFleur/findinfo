@@ -7,6 +7,8 @@
 
 ## [0.9.0] - 2026-11-22
 
+版本号提升与本节切分见 `97d9b55`。
+
 本版把测绘收敛成唯一入口，修正计费口径与凭据判定，补齐 APP/小程序与「锚不到目标」两条资产面，并清理抽取噪声。含一次真实任务（南开大学，989 域名 / 106 存活 / 40,823 端点）暴露的十个缺陷。
 
 ### 结构调整
@@ -54,6 +56,16 @@
   派发按目标工具注入它真正读取的变量名（Hunter 对 uncover 是 `HUNTER_API_KEY`、
   对 onepass 是 `HUNTER_KEY` 等）。`uncover` 显式设置 `-limit`，满页标记截断。
   缺 key 或凭据被拒的引擎默认跳过并记为能力缺口，不报错、不反复重试。
+
+### 仓库卫生与流水线拆分
+
+- **流水线移入 `lib/pipeline.py` 并拆成阶段函数**（`3c147bd`、`eb37643`、`07f19ef`、`f8b7b62`）：
+  `_run_pipeline` 由 1238 行缩为约 40 行驱动，14 个阶段登记真实函数（原为 `lambda: None` 占位），
+  registry 成为真正的调度器并按 `phase`（seed/round）执行。
+- **停止跟踪 9 个误提交的工具配置与一个伪路径**（`c02936e`）：ProjectDiscovery 二进制首次运行时
+  会往当前目录写 `config.yaml`，`cdncheck/chaos/dnsx/httpx/katana/naabu/subfinder/uncover` 八个目录
+  被误提交（`subfinder` 另含 `provider-config.yaml`），内容无任何密钥；`%SystemDrive%/` 是 shell 把
+  未展开的环境变量当字面路径所建。两者均已忽略并在规则旁注明原因。
 
 ### 三次采集：域名 / 证书 / 备案号
 
