@@ -508,6 +508,44 @@ def classify_nxdomain(answer: dict) -> bool:
     """True only for an authoritative NXDOMAIN rcode (T15)."""
     return bool((answer or {}).get("rcode") == 3)
 
+def store_approved_entities(store, companies, approved) -> dict:
+    """Write the company / domain / ICP / APP rows for the APPROVED subjects.
+
+    Split out of t_enscan so the storage contract can be tested without
+    starting the ENScan binary (it holds a cross-process lock and resumes a job
+    cache). `approved` is the per-subject list harvest_entities() produced;
+    anything not approved by the anchor gate is never stored (F06).
+
+    Apps were the gap: the payload carried them, the store did not, so the
+    brief / report / xlsx all reported zero mini-programs for a company whose
+    ENScan answer listed a dozen.
+    """
+    for c in companies or []:
+        store.upsert_asset("company", c, source="enscan",
+                           confidence=0.9, passivity="passive")
+    domains: list = []
+    icp: list = []
+    apps: list = []
+    for ent in approved or []:
+        ref = ent["subject_ref"]
+        store.upsert_asset("company", ent["legal_name"] or ref,
+                           source="enscan:" + ref, confidence=0.9,
+                           passivity="passive", parent=ref)
+        for d in ent["domains"]:
+            store.upsert_asset("domain", d, source="enscan",
+                               confidence=0.9, passivity="passive", parent=ref)
+            domains.append(d)
+        for code in ent["icp"]:
+            store.upsert_asset("icp", code, source="enscan", confidence=0.9,
+                               passivity="passive", parent=ref)
+            icp.append(code)
+        for app in ent.get("apps") or []:
+            store.upsert_asset("app", app, source="enscan", confidence=0.85,
+                               passivity="passive", parent=ref)
+            apps.append(app)
+    return {"domains": _uniq(domains), "icp": _uniq(icp), "apps": _uniq(apps)}
+
+
 def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
              outdir: Path | None = None, timeout: int = 0,
              field: str = "icp,app,wx_app,wechat,copyright,invest,enterprise_info",
@@ -641,28 +679,10 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
             approved = entities
     candidates = [e for e in entities if e not in approved]
     merged["companies"] = kept
-    for c in kept:
-        store.upsert_asset("company", c, source="enscan",
-                           confidence=0.9, passivity="passive")
-    approved_domains: list = []
-    approved_icp: list = []
-    for ent in approved:
-        ref = ent["subject_ref"]
-        # The subject reference (stable id, marked name fallback) is the
-        # parent, so a later display-name change cannot orphan the seed (T07).
-        store.upsert_asset("company", ent["legal_name"] or ref,
-                           source="enscan:" + ref, confidence=0.9,
-                           passivity="passive", parent=ref)
-        for d in ent["domains"]:
-            store.upsert_asset("domain", d, source="enscan",
-                               confidence=0.9, passivity="passive", parent=ref)
-            approved_domains.append(d)
-        for code in ent["icp"]:
-            store.upsert_asset("icp", code, source="enscan", confidence=0.9,
-                               passivity="passive", parent=ref)
-            approved_icp.append(code)
-    approved_domains = _uniq(approved_domains)
-    approved_icp = _uniq(approved_icp)
+    _stored = store_approved_entities(store, kept, approved)
+    approved_domains = _stored["domains"]
+    approved_icp = _stored["icp"]
+    approved_apps = _stored["apps"]
     if files == 0 and table:
         core.log("enscan: printed a report table but wrote no JSON to " +
                  str(outdir) + " — entity data could not be parsed; treat as a "
@@ -675,7 +695,7 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
             "table_only": files == 0 and table,
             "companies": merged["companies"][:200],
             "icp": approved_icp, "domains": approved_domains,
-            "apps": _uniq([a for e in approved for a in e["apps"]])[:100],
+            "apps": approved_apps[:100],
             "subjects": [{"ref": e["subject_ref"],
                           "legal_name": e["legal_name"],
                           "approved": True,
@@ -2141,9 +2161,32 @@ def parse_cert_der(der: bytes) -> dict:
 
 
 def t_ports(store, ips: list[str], top_ports: int = 1000, timeout: int = 0,
-            scope: list[str] | None = None) -> dict:
+            scope: list[str] | None = None,
+            allow_private: bool = False) -> dict:
+    """Scan the given addresses with naabu.
+
+    A private, loopback, link-local, CGNAT, benchmark (198.18.0.0/15 -- the
+    Clash/TUN fake-IP range), documentation, reserved or multicast address is
+    skipped unless ``allow_private`` is set: such an address came out of a
+    page, a JS bundle or an internal DNS answer, and scanning it reaches
+    whatever network the operator sits in, not the target. The filter lives
+    here rather than only in the CLI because the run pipeline calls this
+    function too, and it used to scan whatever the store held.
+    """
     targets = _uniq([core.canon_ip(i) for i in ips if core.canon_ip(i)])
+    skipped_private: list[str] = []
+    if not allow_private:
+        keep = [ip for ip in targets if core.is_public_ip(ip)]
+        skipped_private = [ip for ip in targets if not core.is_public_ip(ip)]
+        if skipped_private:
+            core.log("ports: skipped " + str(len(skipped_private)) +
+                     " private/reserved address(es); pass them with --ip to "
+                     "scan them deliberately")
+        targets = keep
     if not targets:
+        if skipped_private:
+            return {"ok": True, "count": 0, "rows": [],
+                    "skipped_private": skipped_private, "error": "", "rc": 0}
         raise core.FindInfoError("no valid ip for naabu")
     path = _tmp_lines(targets)
     rows: list[dict] = []
@@ -2214,7 +2257,8 @@ def t_ports(store, ips: list[str], top_ports: int = 1000, timeout: int = 0,
     return {"targets": targets, "count": total, "rows": rows,
             "truncated": total > len(rows), "lines": lines, "rc": rc, "ok": rc == 0,
             "cert_ports": cert_ports, "cert_in_scope": cert_in_scope,
-            "cert_related": cert_related, "tls_grab_failed": tls_failed}
+            "cert_related": cert_related, "tls_grab_failed": tls_failed,
+            "skipped_private": skipped_private}
 
 
 # ---------------------------------------------------------------- 9. vhost collision
@@ -2472,8 +2516,10 @@ def t_crawl(store, urls: list[str], depth: int = 3, timeout: int = 0,
 
     def live(item) -> None:
         url, h, p, params, method = item
-        store.upsert_endpoint(h, method, core.path_template(p), params,
-                              source="katana")
+        # A JS-concatenation fragment is source text, not a location.
+        if not core.is_junk_path(p):
+            store.upsert_endpoint(h, method, core.path_template(p), params,
+                                  source="katana")
         store.upsert_asset("url", url, source="katana", confidence=0.7,
                            passivity="active", parent=h)
 
@@ -2546,16 +2592,26 @@ def t_crawl(store, urls: list[str], depth: int = 3, timeout: int = 0,
 
 
 def extract_from_text(text: str, root_domains: list[str]) -> dict:
-    domains, ips = [], []
+    """Domains and IPv4 addresses mentioned in text.
+
+    An address is canonicalised first, so a version string like
+    `03.06.03.118` is dropped instead of becoming an asset. A PRIVATE or
+    loopback address is kept but reported separately (`internal_ips`): an
+    internal address in a JS bundle is real evidence of a leak, yet it is not
+    a scan target -- putting it in `ips` made ports/probe treat it as one.
+    """
+    domains, ips, internal = [], [], []
     for m in DOMAIN_RE.finditer(text or ""):
         d = core.canon_domain(m.group(1))
         if d and _looks_public(d):
             domains.append(d)
     for m in IPV4_RE.finditer(text or ""):
         ip = core.canon_ip(m.group(0))
-        if ip:
-            ips.append(ip)
-    return {"domains": _uniq(domains), "ips": _uniq(ips)}
+        if not ip:
+            continue
+        (ips if core.is_public_ip(ip) else internal).append(ip)
+    return {"domains": _uniq(domains), "ips": _uniq(ips),
+            "internal_ips": _uniq(internal)}
 
 
 
@@ -2613,12 +2669,27 @@ def _finish_tail(store, got, api_paths, api_hits, scope) -> tuple:
     (in_scope_domains, related_domains).
     """
     got["domains"] = _uniq(d for d in got["domains"] if core.canon_domain(d))
-    got["ips"] = _uniq(got["ips"])
+    # An internal/loopback address is evidence of a leak, not a scan target:
+    # keep it in the report, keep it OUT of the asset graph, where probe and
+    # ports would treat it as something to touch.
+    internal = list(got.get("internal_ips") or [])
+    public: list = []
+    for ip in got["ips"]:
+        if core.is_public_ip(ip):
+            public.append(ip)
+        else:
+            internal.append(ip)
+    got["ips"] = _uniq(public)
+    got["internal_ips"] = _uniq(internal)
     api_paths = _uniq(api_paths)[:500]
     for p in api_paths:
+        if core.is_junk_path(p):
+            continue
         store.upsert_endpoint("leak", "GET", core.path_template(p), [], source="jsleak")
     seen_ep: set = set()
     for host, p, verb in api_hits:
+        if core.is_junk_path(p):
+            continue
         tpl = core.path_template(p)
         key = (host, tpl, verb)
         if key in seen_ep:
@@ -2643,7 +2714,7 @@ def _finish_tail(store, got, api_paths, api_hits, scope) -> tuple:
 
 
 def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
-              timeout: int = 0, fetch_limit: int = 40,
+              timeout: int = 0, fetch_limit: int | None = None,
               scope: list[str] | None = None,
               run_id: str | None = None) -> dict:
     """Extract leaked domains/IPs/paths/secrets from crawl output and fetched JS.
@@ -2652,6 +2723,10 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
     from a scoped store query (see run's extract stage), and crawl_rows from
     the crawler's full output. fetch_limit caps how many bundles are fetched
     (a work budget, reported as such), never how many are discovered.
+
+    `fetch_limit` defaults to `limits.js_fetch_limit` (2000): a work
+    budget for how many bundles THIS call scans, never a cap on what is
+    discovered or queued.
 
     Two scheduling backends, ONE claimable queue per invocation:
 
@@ -2664,6 +2739,14 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
     """
     from . import jsleak
     from . import work as _work
+
+    if fetch_limit is None:
+        try:
+            fetch_limit = int((core.CFG.get("limits") or {})
+                              .get("js_fetch_limit") or 0) or 2000
+        except (TypeError, ValueError):
+            fetch_limit = 2000
+    fetch_limit = max(0, int(fetch_limit))
 
     SCAN_BUDGET = 4 << 20
     parts: list[str] = []
@@ -2765,6 +2848,7 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
         in_scope, related = _finish_tail(store, got, api_paths, api_hits, scope)
         return {"count_domains": len(got["domains"]),
                 "count_ips": len(got["ips"]),
+                "internal_ips": got.get("internal_ips") or [],
                 "fetched": max(0, int(after_q.get("done") or 0)
                                - int(before.get("done") or 0)),
                 "attempted": attempted,
@@ -2806,6 +2890,7 @@ def t_extract(store, crawl_rows: list[dict], urls: list[str] | None = None,
     budget_hit = pending > 0 or attempted >= fetch_limit
     in_scope, related = _finish_tail(store, got, api_paths, api_hits, scope)
     return {"count_domains": len(got["domains"]), "count_ips": len(got["ips"]),
+            "internal_ips": got.get("internal_ips") or [],
             "fetched": after["succeeded"] - before["succeeded"],
             "attempted": attempted,
             "js_discovered": after["discovered"],
@@ -2958,6 +3043,17 @@ def t_onepass(store, domain: str, sources: list[str] | None = None,
     cmd = [exe, "query", "--domain", domain]
     if sources:
         cmd += ["--sources", ",".join(sources)]
+    # Follow every page a paged source will give: the CLI default is 4 and
+    # the binary clamps at 20, so "collect everything" means asking for the
+    # clamp. A source that still holds more is reported truncated, never
+    # silently treated as complete.
+    pages = 0
+    try:
+        pages = int((core.CFG.get("limits") or {}).get("mapping_pages") or 0)
+    except (TypeError, ValueError):
+        pages = 0
+    if pages > 0:
+        cmd += ["--max-pages", str(min(20, pages))]
     core.log("onepass: " + " ".join(cmd[1:]))
     rc, out, err = core.run(cmd, timeout=timeout)
     try:

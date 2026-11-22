@@ -19,7 +19,7 @@ General conventions:
 | Data persistence | Automatically written to `~/.findinfo/findinfo.db`, overridable via `FINDINFO_HOME`; the `db` field of `doctor` is authoritative |
 | Idempotency | Re-discovering the same asset only updates `sources`/`last_seen`, no duplicates |
 | Cache | CT responses only (`~/.findinfo/cache/certs/`, 7 days); other stages have no cache |
-| Store reads | A single-stage command that takes its targets from the store (`--from-store`, or no explicit target) needs a scope: `--scope <domain>` (passive/subs/icp/dns/probe/ipagg/ports) or `--domain <domain>` (vhost/crawl/extract), repeatable. Without one it exits `2` with `{"error":"scope_required","message":...,"hint":...}` and runs nothing; a scope with no valid name in it is refused the same way, never widened. `--whole-store` reads every asset in the current store on purpose. Explicit targets (`--domain`/`--host`/`--ip`/`--url`/`--code`) need no scope |
+| Store reads | A single-stage command that takes its targets from the store (`--from-store`, or no explicit target) is scoped by `--scope <domain>` (passive/subs/icp/dns/probe/ipagg/ports) or `--domain <domain>` (vhost/crawl/extract), repeatable. With no scope flag the policy `scope.unscoped_reads` decides: `infer` (default) uses the store's **single** registrable domain and reports `"scope_source":"inferred"`; a store mixing targets is still refused; `refuse` never infers; `legacy` reads the whole store with a log line. A refusal exits `2` with `{"error":"scope_required","hint":...,"candidates":[...],"scope_source":"refused"}` and runs nothing; a scope with no valid name in it is refused the same way, never widened. `--whole-store` reads every asset on purpose (`"scope_source":"whole_store"`). Explicit targets (`--domain`/`--host`/`--ip`/`--url`/`--code`) need no scope |
 
 ---
 
@@ -95,6 +95,84 @@ python findinfo.py entity --name "Example Corp" --invest 51 --deep 2
 **Prerequisite**: `bin/config.yaml` must carry `cookies.aiqicha`. On failure stderr says the Cookie is not configured.
 **Note**: eyeball `companies` before continuing (same-name noise).
 
+**What lands in the store**: `company` (approved subjects only), `domain`, `icp`, and **`app`** (APP /
+mini-program names from ENScan's `app` / `wx_app` / `wechat` fields). `app` rows were parsed and echoed in this
+payload but never written before, so the brief / report / xlsx reported zero mini-programs for companies whose
+ENScan answer listed a dozen.
+
+**When a subject is anchored but no domain is filed** the run does not stop with "no seed": it exits `2` with
+`{"error":"seed_domain_required","candidates":["<company name>"],"queries":["icp=\"<name>\"","domain=\"<name>\""],"hint":"..."}`.
+The company IS the search value — run the engines on it and seed the run with whatever comes back:
+
+```bash
+python findinfo.py map --name "<company name>" --kind icp      # or --kind domain
+```
+
+`map --name` asks the engines with the name verbatim (a Chinese company name is not passed through domain
+canonicalisation, which would drop it); the quoted-term guard in `core.uncover_query` keeps it a single term.
+
+---
+
+## map — metered mapping (the ONLY quota-spending command)
+
+```bash
+python findinfo.py map --domain example.com
+python findinfo.py map --domain example.com --engines fofa,quake --remap
+python findinfo.py map --from-store --scope example.com        # reuse stored seeds/codes
+```
+
+Mapping is consolidated into ONE entry point: the `mapping` stage of `run` and the `map` command share a task-scoped
+ledger, so **each (engine, question) is paid for at most once per task**. A question already answered in this task is
+reused with its ORIGINAL observation time; `--remap` is the explicit opt-in to ask again. `icp` is a compatibility alias
+of `map --icp`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--domain` | — | seed domain, repeatable |
+| `--icp` | — | filing number, repeatable (`-1`/`-2` suffixes normalise to one question) |
+| `--from-store` | false | take seeds/codes from the store (needs `--scope`) |
+| `--engines` | fofa,quake,hunter,shodan | engines to ask; an engine with no key or no known syntax is listed as a gap, never silently dropped |
+| `--name` | — | company name to search by (repeatable) — the escape hatch when ENScan anchors a subject but files no domain |
+| `--kind` | domain | how to ask about `--name`: `domain="…"` or `icp="…"` |
+| `--remap` | false | ask again even though this task already has the answer |
+| `--scope` | — | limit `--from-store` reads to these suffixes |
+
+**Output**
+
+```json
+{"stored": {"domain": 12, "ip": 3},
+ "domains": {"dispatched": 2, "reused": 0, "failures": [], "skipped_engines": []},
+ "truncated_sources": [], "coverage": {"questions": 2, "by_engine": {}},
+ "note": "each engine+question is asked once per task; ..."}
+```
+
+**Every outcome is recorded, none is retried automatically.** A dispatch is one billed request: OK, EMPTY, TRUNCATED,
+QUOTA, AUTH or FAILED. A key the provider rejects (`AUTH`) drops that engine for the rest of the task — the operator's
+rule is "no key or a dead key -> skip", never an error and never an endless retry. `EMPTY` is a real answer (uncover
+reports an upstream error the same way, so it is reported as `unconfirmed_empty`). A full page is `truncated`, not "that
+is all there is". `uncover` is always given an explicit `-limit` (`limits.mapping_rows`, default 100 = one page); uncover's own
+default is also 100 but the skill must state it, and a page that fills the ceiling is reported as truncated.
+
+**No other command or stage holds a key**: `core.run` strips every known credential variable by default, so `httpx`,
+`naabu`, `katana`, `dnsx` and friends run with no credential at all. Full evidence for each engine's query syntax and
+credential variable name: [docs/MAPPING-QUERIES.md](MAPPING-QUERIES.md).
+
+**Verifying a key / syntax** (runs unattended; one `-limit 1` query per engine):
+
+```bash
+python findinfo.py doctor --check-mapping --domain example.com
+```
+
+Reports `key_accepted` / `syntax_accepted` / `rows` / `error` per engine and writes nothing to the task ledger. It needs
+no consent flag: this skill is driven by an agent, and the cost is bounded by construction (one row per engine).
+`--yes-spend-quota` is still accepted for compatibility.
+
+**How much it spends**: `-limit` is explicit on every dispatch (`limits.mapping_rows`, default **3000**). uncover
+paginates on quake (fixed `Size=100`, looping on a `Start` offset) and the engine bills per page — but a page costs the
+same however many rows it returns, so a small limit saves nothing and only multiplies round trips. The default asks for
+everything in one dispatch (3000 = quake's free monthly balance at 1 credit/row); override per engine with
+`limits.mapping_rows_<engine>`. Each dispatch reports its `pages`; a page that fills the ceiling is `truncated`.
+
 ---
 
 ## passive — 15-source passive aggregation (route 0 of stage 1B, onepass)
@@ -113,6 +191,7 @@ bin/windows/onepass.exe sources   # Linux: bin/linux/onepass                 # l
 | `--scope` | — | scope of a store read, repeatable |
 | `--sources` | all usable sources | comma-separated ids, see `onepass sources` |
 | `--min-conf` | 0.0 | drop records below this confidence |
+| `limits.mapping_pages` | 20 | pages followed per paged source (VirusTotal, urlscan); onepass clamps at 20 |
 
 **Output**
 
@@ -174,7 +253,7 @@ python findinfo.py subs --from-store --scope example.com   # store domains >= 0.
 |---|---|---|
 | `--domain` | — | repeatable |
 | `--from-store` | false | use store domains |
-| `--engines` | fofa,quake,hunter,shodan,censys | engine list for uncover |
+| `--engines` | — | accepted for compatibility; **subs is passive and keyless** |
 
 **Output**
 
@@ -188,15 +267,14 @@ python findinfo.py subs --from-store --scope example.com   # store domains >= 0.
 }
 ```
 
-**Degradation**: without mapping keys `uncover` is not run → only subfinder remains (+chaos if keyed); **it never errors out**.
+**`subs` is passive and keyless**: it runs subfinder only, with an empty provider config (`-pc`), so it cannot spend a
+mapping quota and holds no credential. Metered mapping lives in `map` / the `mapping` stage; keeping it here too is how one
+seed was sent to FOFA three times per run. **It never errors out** for a missing key.
 
-**One dispatch per engine, in that engine's own syntax.** uncover hands `-q` to every engine verbatim, so each keyed engine is
-asked separately: fofa `domain="x"`, quake `domain:"x"`, hunter `domain="x"`, shodan `hostname:"x"` (the first three match
-`rust/onepass/src/sources.rs`). Each answer is attributed as `uncover:<engine>` in `per_source` and in asset `sources`.
-An engine with no known query (e.g. `censys`) is **not asked**: it gets an `unavailable` entry and is listed in
-`unsupported_engines`. uncover reports an upstream syntax/auth error as rc=0 with no rows, so an engine that returns nothing
-is marked `confirmed: false` and listed in `unconfirmed_empty` — a gap to report, not proof that nothing exists.
-The query templates are part of the stage checkpoint (only when an engine is usable), so a corrected query re-runs.
+**Where the metered answer comes from.** Domains harvested by `mapping` are in the store before `subs` runs in a pipeline, and
+`map --domain X` asks the paid engines once per task (see `map` below). Every engine answer is attributed as
+`uncover:<engine>` in asset `sources`, so `subs` output and mapped rows never look like the same evidence. Query syntaxes,
+credential variable names and their evidence: [docs/MAPPING-QUERIES.md](MAPPING-QUERIES.md).
 
 ---
 
@@ -242,7 +320,7 @@ Division of labour with subs: subs finds subdomains that exist AND are indexed; 
 
 ---
 
-## icp — ICP filing reverse lookup (route 2 of stage 1B)
+## icp — ICP filing reverse lookup (alias of `map --icp`)
 
 ```bash
 python findinfo.py icp --code "京ICP备10210538号"
@@ -255,11 +333,14 @@ python findinfo.py icp --from-store --scope example.com   # reuses the ICP numbe
 {"codes": ["京ICP备10210538号"], "rows": 156, "domains": ["..."], "ips": ["..."]}
 ```
 
-**Dependency**: at least one mapping-platform key. One dispatch per engine, each in its own syntax: fofa `icp="京ICP备10210538号"`,
-quake `icp:"…"`, hunter `icp.number="…"`; engines without an ICP field (shodan, censys) are not asked and are listed in
-`unsupported_engines`. An engine that returns no rows is listed in `unconfirmed_empty` (a gap, not an error); a non-zero
-exit is an `errors` entry naming its `engine`.
-**Note**: filing numbers often carry `-1`/`-2` suffixes — query the principal number for full coverage.
+**Dependency**: at least one mapping-platform key. `icp` is a compatibility alias for `map --icp` (see `map` below): both
+go through the same task ledger, so a filing this task already paid for is reused, never re-asked. One dispatch per engine,
+each in its own syntax: fofa `icp="京ICP备10210538号"`, quake `icp:"…"`, hunter `icp.number="…"`; engines without an ICP
+field (shodan, censys) are not asked and are listed in `unsupported_engines`. An engine that returns no rows is listed in
+`unconfirmed_empty` (a gap, not an error); a non-zero exit is an `errors` entry naming its `engine`.
+**Note**: filing numbers often carry `-1`/`-2` suffixes — they normalise to the principal number, so `…-1` and `…-2` are ONE
+question, asked once. Query syntaxes, credential variable names and their evidence live in
+[docs/MAPPING-QUERIES.md](MAPPING-QUERIES.md).
 **Storage**: the filing number itself is stored as `assets(kind=icp, canonical="京ICP备…")` (sources `enscan`/`icp-seed`),
 which is why `icp --from-store` can reuse numbers ENScan saved; domains/IPs from the reverse lookup land as `kind=domain`/`kind=ip` with confidence 0.9/0.5.
 
@@ -346,12 +427,13 @@ python findinfo.py ports --ip 1.2.3.4 --top-ports 1000   # explicit targets, use
 python findinfo.py ports --scope example.com             # public IPs owned by in-scope domains
 ```
 
-Without `--ip`, the targets come from the store and need `--scope` (alias `--domain`) or `--whole-store`. Only IPs
-**owned** by an in-scope domain (their `parent`) are taken: an IP scraped out of a page/JS has no owner and an ICP-lookup
-IP is owned by a filing number, so neither is scanned. Private, loopback, link-local, CGNAT, benchmark/fake-IP
-(198.18.0.0/15), reserved and multicast addresses are skipped even when owned and returned in `skipped_private` —
-from the operator's machine they reach the operator's own network, not the target. Pass such an address with `--ip`
-to scan it deliberately.
+Without `--ip`, the targets come from the store and are scoped by `--scope` (alias `--domain`) or `--whole-store`, or
+inferred per `scope.unscoped_reads` (see the Store reads row). Only IPs **owned** by an in-scope domain (their `parent`)
+are taken: an IP scraped out of a page/JS has no owner and an ICP-lookup IP is owned by a filing number, so neither is
+scanned. Private, loopback, link-local, CGNAT, benchmark/fake-IP (198.18.0.0/15), reserved and multicast addresses are
+skipped even when owned and returned in `skipped_private` — from the operator's machine they reach the operator's own
+network, not the target. The filter lives in `tools.t_ports`, so the `run` pipeline obeys it too. Pass such an address
+with `--ip` to scan it deliberately (an explicit address is used verbatim).
 
 **Output**
 
@@ -462,8 +544,14 @@ Extracts: domains, IPv4s, API paths, sourcemap references, common secret pattern
 ```bash
 python findinfo.py assets --kind domain --limit 50
 python findinfo.py assets --kind icp                  # see the ICP numbers ENScan stored
+python findinfo.py assets --kind app                  # APP / mini-programs ENScan named
 python findinfo.py assets --min-conf 0.7 --export runs/assets.jsonl
+python findinfo.py assets --export-xlsx out.xlsx      # one sheet per kind, 说明 sheet records scope
 ```
+
+`--kind` covers `company` / `icp` / `domain` / `ip` / `url` / `endpoint` / `app`; `all` is the default
+(`all` includes `app` now — it used to be parsed from ENScan and dropped before storage, so the mobile surface
+never appeared in any output).
 
 **Output**
 

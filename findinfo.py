@@ -370,6 +370,23 @@ def cmd_doctor(args) -> None:
     if getattr(args, "offline", False):
         out(tools.doctor_offline())
         return
+    if getattr(args, "check_mapping", False):
+        # Verification of engine credentials AND query syntax: one -limit 1
+        # query per configured engine, reported per engine. It runs unattended
+        # -- this skill is driven by an agent, and an agent cannot answer a
+        # consent prompt. The cost is bounded by construction (one row per
+        # engine), so the old --yes-spend-quota gate only blocked the caller
+        # that was supposed to use it. The flag is still accepted (and ignored)
+        # so an existing command line keeps working.
+        domain = core.canon_user_domain(getattr(args, "domain", "") or "")
+        if not domain:
+            raise core.FindInfoError(
+                "doctor --check-mapping needs --domain <your-domain>")
+        import lib.mapdispatch as mapdispatch
+        out({"check_mapping": mapdispatch.check_engines(
+            domain, getattr(args, "engines", None),
+            timeout=getattr(args, "tool_timeout", 0) or 30)})
+        return
     out(tools.doctor())
 
 
@@ -400,14 +417,16 @@ def cmd_passive(args) -> None:
         domains = args.domain or []
         if args.from_store or not domains:
             domains = _domains_from_store(
-                store, 0.7, _store_scope(args, args.scope, "--scope", "passive"))
+                store, 0.7, _store_scope(args, args.scope, "--scope", "passive",
+                                        store=store))
         srcs = [s.strip() for s in args.sources.split(",") if s.strip()] if args.sources else None
         merged = []
         for d in domains:
             merged.append(tools.t_onepass(store, d, sources=srcs,
                                           min_confidence=args.min_conf,
                                           timeout=args.tool_timeout))
-        out({"domains": merged, "total": sum(m.get("count", 0) for m in merged)})
+        out(_with_scope(args, {"domains": merged,
+                              "total": sum(m.get("count", 0) for m in merged)}))
     finally:
         store.close()
 
@@ -430,11 +449,12 @@ def cmd_icp(args) -> None:
             # The ICP table is shared across engagements, so an unscoped
             # --from-store reverse-lookups another project's filings (and
             # spends quota on them). Scope it like every other store read.
-            scope = _store_scope(args, args.scope, "--scope", "icp")
+            scope = _store_scope(args, args.scope, "--scope", "icp",
+                                 store=store)
             codes = [a["canonical"] for a in
                      store.get_assets(kind="icp", match=scope)]
-        out(tools.t_icp(store, codes, engines=args.engines,
-                        timeout=args.tool_timeout))
+        out(_with_scope(args, tools.t_icp(store, codes, engines=args.engines,
+                                         timeout=args.tool_timeout)))
     finally:
         store.close()
 
@@ -464,8 +484,24 @@ def cmd_map(args) -> None:
                 raise core.FindInfoError("invalid domain: " + ",".join(args.domain))
         if args.icp:
             codes = list(args.icp)
+        # A company NAME is a legitimate search value: when ENScan anchors a
+        # subject but files no domain, the engines are the only way to find
+        # one. The value is asked verbatim, in the kind the caller picked.
+        names = [str(n).strip() for n in (getattr(args, "name", None) or [])
+                 if str(n).strip()]
+        name_kind = getattr(args, "kind", "domain") or "domain"
+        if names:
+            if name_kind == "icp":
+                codes = list(codes) + names
+            else:
+                # a name is not a domain: it must NOT go through
+                # canon_user_domain (that would drop every Chinese name and
+                # silently empty the search). The engine's quoted-term guard
+                # in uncover_query is what keeps it safe.
+                domains = list(domains) + names
         if args.from_store or not (domains or codes):
-            scope = _store_scope(args, args.scope, "--scope", "map")
+            scope = _store_scope(args, args.scope, "--scope", "map",
+                                 store=store)
             if not domains:
                 domains = [a["canonical"] for a in
                            store.get_assets(kind="domain", match=scope)]
@@ -512,13 +548,15 @@ def cmd_subs(args) -> None:
         domains = args.domain or []
         if args.from_store:
             domains = _domains_from_store(
-                store, 0.7, _store_scope(args, args.scope, "--scope", "subs"))
+                store, 0.7, _store_scope(args, args.scope, "--scope", "subs",
+                                        store=store))
         merged = []
         for d in domains:
             r = tools.t_subs(store, d, engines=args.engines,
                              timeout=args.tool_timeout)
             merged.append(r)
-        out({"domains": merged, "total": sum(m.get("count", 0) for m in merged)})
+        out(_with_scope(args, {"domains": merged,
+                              "total": sum(m.get("count", 0) for m in merged)}))
     finally:
         store.close()
 
@@ -541,15 +579,46 @@ def _domains_from_store(store, min_conf: float, match: list[str] | None = None) 
             store.get_assets(kind="domain", min_conf=min_conf, match=scope or None)]
 
 
-def _store_scope(args, values, flag: str, command: str) -> list[str] | None:
+def _note_scope(args, source: str) -> None:
+    """Remember how this command's store read was scoped (published in output)."""
+    try:
+        args._scope_source = source
+    except Exception:
+        pass
+
+
+def _with_scope(args, payload):
+    """Attach `scope_source` to a command's JSON answer.
+
+    A caller must be able to tell an INFERRED scope from one it typed: the
+    inferred one is a guess about the store's contents, and guessing wrong is
+    how one target's assets end up in another target's stage.
+    """
+    if isinstance(payload, dict) and "scope_source" not in payload:
+        src = getattr(args, "_scope_source", "")
+        if src:
+            return dict(payload, scope_source=src)
+    return payload
+
+
+def _store_scope(args, values, flag: str, command: str,
+                 store=None) -> list[str] | None:
     """Scope of a single-stage command that takes its targets from the store.
 
-    Returns the canonical scope, or None when --whole-store was given on
-    purpose. Otherwise raises ScopeRequired: the store is shared across
-    engagements (and across tasks without --task), so an unscoped read hands
-    one target's assets to another target's stage -- `ports` with no --ip
-    used to scan every IP ever stored. A scope with no valid name in it is
-    refused too, instead of quietly becoming "no scope".
+    Returns the canonical scope, or None for a deliberate whole-store read.
+    Otherwise raises ScopeRequired carrying the scopes the store suggests.
+
+    Policy comes from `scope.unscoped_reads` (lib.core.scope_mode):
+
+    ``infer``   no scope flag, but the store holds exactly ONE registrable
+                domain -> use it, and say so via `scope_source:"inferred"`.
+                A store mixing targets is still refused: guessing there would
+                hand one weaponised asset graph to another engagement.
+    ``refuse``  never infer; the strict behaviour.
+    ``legacy``  no scope flag -> read everything, loudly (old scripts).
+
+    An explicit scope always wins and is never widened; a scope that
+    canonicalises to nothing is refused, never silently treated as "no scope".
     """
     if values:
         accepted, rejected = core.canon_user_scope(values)
@@ -557,18 +626,37 @@ def _store_scope(args, values, flag: str, command: str) -> list[str] | None:
             raise core.ScopeRequired(
                 command + " " + flag + " " + ", ".join(str(v) for v in values) +
                 ": no valid domain in it; refusing to widen to the whole store",
-                hint="pass a domain, e.g. " + flag + " example.com")
+                hint="pass a domain, e.g. " + flag + " example.com",
+                candidates=core.scope_candidates(store) if store is not None else [])
         if rejected:
             core.log(command + ": ignored invalid " + flag + " value(s): " +
                      ", ".join(rejected))
+        _note_scope(args, "explicit")
         return accepted
     if getattr(args, "whole_store", False):
+        _note_scope(args, "whole_store")
         return None
+    mode = core.scope_mode()
+    if mode == "legacy":
+        # The old behaviour, kept for scripts written before the gate. It is
+        # loud on purpose: a whole-store read is never silent.
+        core.log(command + ": scope.unscoped_reads=legacy -> reading EVERY "
+                 "asset in this store (other engagements included)")
+        _note_scope(args, "legacy")
+        return None
+    if mode == "infer" and store is not None:
+        guessed = core.infer_scope(store)
+        if guessed:
+            core.log(command + ": no " + flag + " given; inferred scope " +
+                     guessed[0] + " from the store (scope.unscoped_reads=infer)")
+            _note_scope(args, "inferred")
+            return guessed
     raise core.ScopeRequired(
         command + " would take its targets from the whole asset store, which "
         "is shared across engagements",
         hint="pass " + flag + " <domain> (repeatable), give explicit targets, "
-             "or --whole-store to read every asset in this store on purpose")
+             "or --whole-store to read every asset in this store on purpose",
+        candidates=core.scope_candidates(store) if store is not None else [])
 
 
 def _host_bases(hosts: list[str]) -> list[str]:
@@ -598,8 +686,10 @@ def cmd_dns(args) -> None:
         domains = args.domain or []
         if args.from_store or not domains:
             domains = _domains_from_store(
-                store, args.min_conf, _store_scope(args, args.scope, "--scope", "dns"))
-        out(tools.t_dns(store, domains, timeout=args.tool_timeout))
+                store, args.min_conf, _store_scope(args, args.scope, "--scope", "dns",
+                                                  store=store))
+        out(_with_scope(args, tools.t_dns(store, domains,
+                                         timeout=args.tool_timeout)))
     finally:
         store.close()
 
@@ -610,7 +700,8 @@ def cmd_probe(args) -> None:
         hosts = args.host or []
         if args.from_store or not hosts:
             hosts = _domains_from_store(
-                store, args.min_conf, _store_scope(args, args.scope, "--scope", "probe"))
+                store, args.min_conf, _store_scope(args, args.scope, "--scope", "probe",
+                                                  store=store))
         res = tools.t_httpx(store, hosts, timeout=args.tool_timeout)
         if getattr(args, "repair_titles", False):
             # Re-read titles the OLD decode pipeline destroyed. Those rows
@@ -620,7 +711,7 @@ def cmd_probe(args) -> None:
             res["title_repair"] = tools.repair_broken_titles(
                 store, hosts if args.host else None,
                 scope=args.scope, timeout=args.tool_timeout)
-        out(res)
+        out(_with_scope(args, res))
     finally:
         store.close()
 
@@ -629,10 +720,13 @@ def cmd_ipagg(args) -> None:
     store = core.Store()
     try:
         if args.ip:
-            out(tools.t_ipagg(store, args.ip, timeout=args.tool_timeout))
+            out(_with_scope(args, tools.t_ipagg(store, args.ip,
+                                               timeout=args.tool_timeout)))
         else:
-            out(tools.t_ipagg(store, None, timeout=args.tool_timeout,
-                              scope=_store_scope(args, args.scope, "--scope", "ipagg")))
+            out(_with_scope(args, tools.t_ipagg(
+                store, None, timeout=args.tool_timeout,
+                scope=_store_scope(args, args.scope, "--scope", "ipagg",
+                                   store=store))))
     finally:
         store.close()
 
@@ -641,26 +735,30 @@ def cmd_ports(args) -> None:
     store = core.Store()
     try:
         if args.ip:
-            # explicit addresses are the operator's own decision: used as given
-            out(tools.t_ports(store, args.ip, top_ports=args.top_ports,
-                              timeout=args.tool_timeout))
+            # Explicit addresses are the operator's own decision. An address
+            # the operator typed is used VERBATIM, private or not: the
+            # private-range guard exists to stop the store from handing over
+            # scraped internal addresses, not to second-guess --ip.
+            res = tools.t_ports(store, args.ip, top_ports=args.top_ports,
+                                timeout=args.tool_timeout, allow_private=True)
+            out(_with_scope(args, res))
             return
         # From the store, only addresses OWNED by an in-scope domain (their
         # parent): an IP scraped out of a page/JS has no owner, an ICP-lookup
-        # IP is owned by a filing number, and neither is a scan target. A
-        # private/reserved address is skipped even when owned -- from here it
-        # reaches the operator's own network, not the target.
-        scope = _store_scope(args, args.scope, "--scope", "ports")
+        # IP is owned by a filing number, and neither is a scan target.
+        scope = _store_scope(args, args.scope, "--scope", "ports", store=store)
         owned = [a["canonical"] for a in store.get_assets(kind="ip", match=scope)]
-        ips = [ip for ip in owned if core.is_public_ip(ip)]
-        skipped = [ip for ip in owned if not core.is_public_ip(ip)]
-        if skipped:
-            core.log("ports: skipped " + str(len(skipped)) + " private/reserved "
-                     "address(es) from the store; pass them with --ip to scan them")
-        res = tools.t_ports(store, ips, top_ports=args.top_ports,
+        # Drop private/reserved addresses BEFORE handing the list over, so a
+        # scan never even targets the operator's own network. t_ports() also
+        # refuses them (the run pipeline calls it directly), which is why the
+        # two skipped lists are merged instead of one of them being trusted.
+        public = [ip for ip in owned if core.is_public_ip(ip)]
+        dropped = [ip for ip in owned if not core.is_public_ip(ip)]
+        res = tools.t_ports(store, public, top_ports=args.top_ports,
                             timeout=args.tool_timeout)
+        skipped = list(dict.fromkeys(list(res.get("skipped_private") or []) + dropped))
         res["skipped_private"] = skipped
-        out(res)
+        out(_with_scope(args, res))
     finally:
         store.close()
 
@@ -671,7 +769,8 @@ def cmd_vhost(args) -> None:
         hosts = args.host or []
         if args.from_store or not hosts:
             hosts = _domains_from_store(
-                store, 0.4, _store_scope(args, args.domain, "--domain", "vhost"))
+                store, 0.4, _store_scope(args, args.domain, "--domain", "vhost",
+                                         store=store))
         if args.wordlist:
             # Accept the same bare names as `brute --wordlist` ("vhost" ->
             # wordlists/vhost.txt); a plain Path() read breaks that contract.
@@ -684,9 +783,9 @@ def cmd_vhost(args) -> None:
                      str(len(extra)) + " hosts from " + str(len(bases)) + " base domain(s)")
             hosts = hosts + extra
         ports = [int(p) for p in (args.ports or "80,443").split(",") if p.strip()]
-        out(tools.t_vhost(store, args.ip, hosts, ports=ports, threads=args.threads,
-                          timeout=args.tool_timeout,
-                          skip_live=not args.no_skip_live))
+        out(_with_scope(args, tools.t_vhost(
+            store, args.ip, hosts, ports=ports, threads=args.threads,
+            timeout=args.tool_timeout, skip_live=not args.no_skip_live)))
     finally:
         store.close()
 
@@ -699,7 +798,8 @@ def cmd_crawl(args) -> None:
         if args.from_store or not urls:
             # an unscoped read used to crawl other engagements' URLs with only
             # a warning in the output; it is refused now (see _store_scope)
-            read = _store_scope(args, args.domain, "--domain", "crawl")
+            read = _store_scope(args, args.domain, "--domain", "crawl",
+                                store=store)
             for a in store.get_assets(kind="domain", min_conf=0.7, match=read):
                 attrs = a.get("attrs") or {}
                 if attrs.get("url"):
@@ -709,9 +809,11 @@ def cmd_crawl(args) -> None:
             scope = [core.registrable_domain(core.split_url(u)[0] or "") or ""
                      for u in urls]
             scope = [s for s in scope if s]
-        out(tools.t_crawl(store, urls, depth=args.depth, timeout=args.tool_timeout,
-                          scope_domains=scope)
-            | {"scope": scope})
+        out(_with_scope(
+            args,
+            tools.t_crawl(store, urls, depth=args.depth,
+                          timeout=args.tool_timeout, scope_domains=scope)
+            | {"scope": scope}))
     finally:
         store.close()
 
@@ -737,7 +839,8 @@ def cmd_extract(args) -> None:
             # --domain scopes them to the given domains: the store usually
             # mixes other engagements' history, and without it the JS of
             # unrelated sites would be fetched too -- so it is required.
-            only = _store_scope(args, args.domain, "--domain", "extract")
+            only = _store_scope(args, args.domain, "--domain", "extract",
+                                store=store)
             for a in store.get_assets(kind="url", min_conf=0.4):
                 u = a["canonical"]
                 if not u.startswith("http"):
@@ -748,8 +851,10 @@ def cmd_extract(args) -> None:
                         continue
                 urls.append(u)
         scope_arg = [d for d in (core.canon_user_scope(args.domain or [])[0] or [])]
-        out(tools.t_extract(store, rows, urls=urls, timeout=args.tool_timeout,
-                              scope=scope_arg))
+        out(_with_scope(args, tools.t_extract(
+            store, rows, urls=urls, timeout=args.tool_timeout,
+            fetch_limit=getattr(args, "fetch_limit", 0) or None,
+            scope=scope_arg)))
     finally:
         store.close()
 
@@ -2606,7 +2711,28 @@ def _run_pipeline(args) -> int:
         domains = core.canon_scope(named + discovered)
         summary["seed_domains"] = domains
         if not domains:
-            raise core.FindInfoError("no seed domain; give --domain or check ENScan output")
+            # The operator's rule: when ENScan anchors a real company but this
+            # source filed NO domain, the run must not just die -- it must tell
+            # the agent WHAT to search the internet engines for. A bare
+            # "no seed domain" left the agent with nothing to act on, and the
+            # anchored company (the one asset we DID establish) was thrown away.
+            _anchor_names = list(summary.get("_approved_company_names") or [])
+            if _anchor_names:
+                _cands = [n for n in _anchor_names if n][:5]
+                _queries = ['icp="' + n + '"' for n in _cands] +                            ['domain="' + n + '"' for n in _cands]
+                raise core.SeedDomainRequired(
+                    "enscan anchored " + str(len(_cands)) + " subject(s) " +
+                    ", ".join(_cands) + " but no source filed a domain for " +
+                    "them; the company is real, its domain set is empty here",
+                    candidates=_cands, queries=_queries,
+                    hint=("search the company name on the mapping engines "
+                          "before seeding: python findinfo.py map --<kind> "
+                          "<value> (icp / domain), then re-run with "
+                          "--domain <what comes back>"))
+            raise core.SeedDomainRequired(
+                "no seed domain and no anchored subject; give --domain or "
+                "check ENScan output",
+                hint="give --domain <domain> (repeatable) to seed the run")
         # Explicit seeds are USER INPUT, not evidence. They must reach the DNS
         # stage even when every passive source returns nothing -- otherwise
         # "this domain has no subdomains" silently skips the target the user
@@ -3314,6 +3440,17 @@ def _run_pipeline(args) -> int:
                 store, summary["_run_public_id"])
         except Exception:
             coverage["work_queue"] = {}
+        # The task mapping ledger's summary: which questions were asked, which
+        # were reused, which engines the provider rejected. Coverage.metered
+        # counts what THIS run spent; this says what the TASK already owns.
+        try:
+            import lib.mapping as _mapping
+            cov_map = _mapping.coverage(store)
+            if cov_map.get("questions"):
+                cov_map["blocked_engines"] = _mapping.blocked_engines(store)
+                coverage["mapping"] = cov_map
+        except Exception:
+            pass
         _wq_outstanding = int((coverage.get("work_queue") or {}).get(
             "outstanding") or 0)
         if failed_stages and not done_stages:
@@ -3546,6 +3683,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("doctor", help="check bundled tools and api keys")
+    d.add_argument("--check-mapping", action="store_true",
+                   help="verify each configured engine accepts our key AND our "
+                        "query syntax (one -limit 1 query per engine)")
+    d.add_argument("--yes-spend-quota", action="store_true",
+                   help="accepted for compatibility; --check-mapping no longer "
+                        "needs consent (runs unattended)")
+    d.add_argument("--domain", default="",
+                   help="the domain to probe in --check-mapping")
+    d.add_argument("--engines", default=None,
+                   help="limit --check-mapping to these engines")
+    _add_tool_timeout(d)
     d.add_argument("--offline", action="store_true",
                    help="inspect python/platform/paths/file metadata only: no tool "
                         "execution, no DNS, no HTTP, no key validation; egress and "
@@ -3605,6 +3753,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seed domain to map (repeatable)")
     mp.add_argument("--icp", action="append",
                     help="filing number to reverse-look-up (repeatable)")
+    mp.add_argument("--name", action="append",
+                    help="company name to search by (repeatable). This is the "
+                         "escape hatch when ENScan anchors a subject but files "
+                         "no domain: the engines are queried with the NAME "
+                         "(icp=\"<name>\", domain=\"<name>\") and whatever "
+                         "comes back can seed a run")
     mp.add_argument("--from-store", action="store_true",
                     help="take targets from the store (needs --scope)")
     mp.add_argument("--scope", action="append",
@@ -3614,6 +3768,9 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--remap", action="store_true",
                     help="ask again even when this task already paid for the "
                          "question (default: reuse the recorded answer)")
+    mp.add_argument("--kind", default="domain", choices=["domain", "icp"],
+                    help="how to ask about --name: domain=\"...\" or "
+                         "icp=\"...\" (default domain)")
     _add_tool_timeout(mp)
     mp.set_defaults(func=cmd_map)
 
@@ -3708,13 +3865,19 @@ def build_parser() -> argparse.ArgumentParser:
                          "required with --from-store (or --whole-store), so another "
                          "engagement's historical assets are never re-fetched")
     ex.add_argument("--url", action="append")
+    ex.add_argument("--fetch-limit", type=int, default=0,
+                    help="how many JS bundles THIS invocation scans (default: "
+                         "limits.js_fetch_limit = 2000). A work budget, not a "
+                         "discovery cap: every bundle stays queued, the rest "
+                         "are reported as js_pending")
     _add_whole_store(ex)
     _add_tool_timeout(ex)
     ex.set_defaults(func=cmd_extract)
 
     as_ = sub.add_parser("assets", help="list / export asset graph")
     as_.add_argument("--kind", default="all",
-                     choices=["all", "company", "icp", "domain", "ip", "url", "endpoint"])
+                     choices=["all", "company", "icp", "domain", "ip", "url",
+                              "endpoint", "app"])
     as_.add_argument("--min-conf", type=float, default=0.0)
     as_.add_argument("--limit", type=int, default=500)
     as_.add_argument("--match", action="append",
@@ -3923,6 +4086,20 @@ def main(argv: list[str]) -> int:
         payload = {"error": getattr(exc, "code", "") or "error", "message": str(exc)}
         if getattr(exc, "hint", ""):
             payload["hint"] = exc.hint
+        # A refusal names the scopes the store itself offers, so the caller does
+        # not have to guess a domain and re-run. `scope_source` says whether any
+        # read happened ("refused" = nothing was read or run).
+        cands = getattr(exc, "candidates", None)
+        if cands:
+            payload["candidates"] = list(cands)
+        if getattr(exc, "scope_source", ""):
+            payload["scope_source"] = exc.scope_source
+        # seed_domain_required carries ready-to-run engine queries: the caller
+        # anchored a company but has no domain, and the next step is a mapping
+        # search by name, not another guess at a seed.
+        _queries = getattr(exc, "queries", None)
+        if _queries:
+            payload["queries"] = list(_queries)
         out(payload)
         return 2
     except KeyboardInterrupt:

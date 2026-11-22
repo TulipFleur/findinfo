@@ -70,6 +70,7 @@ python findinfo.py --task myproj status --run <run_id>
 | An upstream answer was capped | `coverage.unavailable.truncated_sources` | More rows exist than were fetched (page budget / billed first page); list it as a gap |
 | New in-scope domains | `rounds[i].new_domains > 0` | `--rounds` already feeds them into the next round; no manual steering needed |
 | Related assets out of scope | `dropped_out_of_scope` / the brief's `leaks.domains` | Record as candidates only; never widen scope automatically |
+| `{"error":"scope_required"}` | `candidates`, `scope_source:"refused"` | The store mixes targets, so no scope could be inferred. Pick a name from `candidates` and re-run with `--scope`/`--domain`, or `--whole-store` on purpose. Policy: `scope.unscoped_reads` = `infer` (default) / `refuse` / `legacy` |
 | A tool failed | `stages[].failed` + `error` | Keep rc/error/existing artifacts; the stage does not count as completed |
 | Over the display cap | `truncated: true` | Display-only truncation; downstream uses the full set from the store |
 | Checkpoint hit | `skipped: true, resumed: true` | Downstream inputs were rebuilt from the store; do not skip later stages just because memory is empty |

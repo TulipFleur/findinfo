@@ -68,7 +68,9 @@ no run was read at all, **which does not mean there are no gaps**), `top_hosts` 
 error as rc=0 with no rows, so this is not proof that nothing exists); `unsupported_engines` — keyed engines that were
 not asked because no query is known for them (e.g. censys for subdomains, shodan for ICP); `truncated_sources` —
 `onepass:<id>` sources whose upstream holds more rows than were fetched (page budget spent, or a billed engine's first
-page). None of them fails a stage or changes the exit code; all of them belong in the delivery's gap list.
+page). `coverage.mapping` is the mapping ledger's own summary (`questions`, `by_engine`, `blocked_engines`), so a
+reused answer is visible as `reused` rather than counted as new collection. None of them fails a stage or changes the
+exit code; all of them belong in the delivery's gap list.
 
 **Display cap ≠ processing cap**: `assets` shows only 500 rows by default; the full set is in the store.
 Lists in tool stdout are display samples only; the full set actually processed by each stage goes into the store, and downstream stages
@@ -175,6 +177,29 @@ never per result row; free sources never touch it). Fields:
   `blocked_engines`/`ledger_path`; `brief --run <id>` summarises the same block
   from the persisted file, so a later session answers "what would another round
   cost" without the process that spent it.
+
+### 5.1 Task mapping ledger (`mapping_ledger` + `mapping_results`, same SQLite)
+
+`coverage.metered` says what one RUN spent. The mapping ledger answers a different
+question: **has this TASK already paid for this question?** It is the reason the
+same seed is no longer sent to FOFA three times in a run, nor again on the next
+run, nor by a standalone `map`:
+
+| Table | Row |
+|---|---|
+| `mapping_ledger` | one row per `(task, engine, kind, normalised value, query_hash)`: `status` (ok/empty/truncated/quota/auth/failed/uncertain), `rows`, `truncated`, `attempts`, `run_id`, `last_error`, `observed_at` |
+| `mapping_results` | the rows an answer produced, with the **original** `observed_at` — a later run attaches already-paid evidence instead of writing a fresh observation |
+
+- Keyed by TASK, not run: a ledger row never crosses tasks (that is what keeps one
+  engagement's paid answers out of another's).
+- `query_hash` includes the query template, so a corrected syntax is a NEW
+  question and is asked again (an old answer under the old syntax stays).
+- ICP `-1`/`-2` suffixes normalise to the principal filing number: one question.
+- Every outcome is recorded, including failures — a failed dispatch already spent
+  its unit. Nothing is retried automatically; `--remap` is the opt-in.
+- `mapping.blocked_engines()` reads the `auth` rows: once a provider rejects the
+  credential, that engine is dropped from dispatch for the rest of the task.
+  Missing key or dead key = SKIP, never an error and never a retry.
 
 ## 6. Reading conventions for old data
 
