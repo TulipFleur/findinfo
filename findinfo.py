@@ -2694,10 +2694,15 @@ def _run_pipeline(args) -> int:
                 summary.pop(_private, None)
             core.write_jsonl(run_dir / "summary.jsonl", [summary])
             store.finish_run(run_id, summary)
-            _write_status(run_dir, stage="done", state="completed",
+            # Same rule as the normal tail: the worker owns a background
+            # job's terminal state; a foreground run publishes its own.
+            _terminal = {}
+            if _worker_run_dir() is None:
+                _terminal = {"state": "completed", "exit_code": 5}
+            _write_status(run_dir, stage="done",
                           stage_state="done", counts=summary["counts"],
                           result=summary["result"], coverage=coverage,
-                          stage_index=1, stage_total=1)
+                          stage_index=1, stage_total=1, **_terminal)
             out(summary)
             return 5
         # Order matters: the domains the caller named come FIRST, then the ones
@@ -3526,11 +3531,27 @@ def _run_pipeline(args) -> int:
         # original plan, and percent > 100 reads as corruption.
         _done_count = len(done_stages) + len(skipped_stages)
         _stage_total = max(int(summary.get("_stage_total") or 0), _done_count)
-        _write_status(run_dir, stage="done", state="completed", stage_state="done",
+        # Terminal state: WHO writes it depends on how the run was started.
+        #
+        # Background: the worker writes `state=completed` together with
+        # `exit_code` in ONE locked write, and it is the only writer that knows
+        # the process exit code. Publishing completed here created a frame
+        # where `state == "completed"` had no `exit_code`; `wait` treats
+        # completed as terminal, returned that frame, and consumers saw a
+        # missing field that is always present in a real terminal state (a
+        # reproducible 1-in-6 flake in the worker e2e test).
+        #
+        # Foreground: nothing downstream publishes a terminal state, so this
+        # IS the terminal write -- and it states its exit code, the same
+        # `rc` main() returns.
+        _terminal = {}
+        if _worker_run_dir() is None:
+            _terminal = {"state": "completed", "exit_code": int(rc or 0)}
+        _write_status(run_dir, stage="done", stage_state="done",
                       counts=counts, endpoints=endpoints,
                       result=summary["result"], coverage=coverage,
                       stage_index=_done_count,
-                      stage_total=_stage_total)
+                      stage_total=_stage_total, **_terminal)
         out(summary)
         return rc
     except Exception as exc:
