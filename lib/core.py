@@ -348,12 +348,42 @@ class ScopeRequired(FindInfoError):
     omitted), so an unscoped read hands one target's assets to another
     target's stage. `code` is the stable error key on stdout; `hint` says
     how to scope the command.
+
+    `candidates` carries the scopes the store itself suggests, so a caller
+    being refused does not have to guess a name and re-run.
+    `scope_source` names how scope was decided: "explicit", "inferred",
+    "whole_store", or "refused" when no read happened at all.
     """
     code = "scope_required"
 
-    def __init__(self, message: str, hint: str = ""):
+    def __init__(self, message: str, hint: str = "",
+                 candidates: list | None = None,
+                 scope_source: str = "refused"):
         super().__init__(message)
         self.hint = hint
+        self.candidates = list(candidates or [])
+        self.scope_source = scope_source or "refused"
+
+
+class SeedDomainRequired(FindInfoError):
+    """The run anchored a subject but has no domain to seed discovery with.
+
+    Distinct from a plain refusal because the caller CAN act on it: the
+    company name is what the mapping engines want, so `queries` carries the
+    exact strings to try (`icp="<name>"`, `domain="<name>"`) and `candidates`
+    the names themselves. The operator rule this implements: when ENScan gives
+    an asset name and no domain, the agent goes to the internet engines -- it
+    is not left with "no seed".
+    """
+
+    code = "seed_domain_required"
+
+    def __init__(self, message: str, hint: str = "",
+                 candidates: list | None = None, queries: list | None = None):
+        super().__init__(message)
+        self.hint = hint
+        self.candidates = list(candidates or [])
+        self.queries = list(queries or [])
 
 
 class StageError(FindInfoError):
@@ -397,6 +427,10 @@ DEFAULT_CONFIG = {
         "doh_timeout": 8,
         "doh_retry": 1,
     },
+    # Mapping query templates, per question kind and engine. Only the entries
+    # listed here are dispatched: uncover passes -q through verbatim, so a
+    # guessed syntax yields a silent zero. Evidence: docs/MAPPING-QUERIES.md.
+    "mapping": {"queries": {"domain": {}, "icp": {}}},
     "limits": {
         "dns_concurrency": 100,
         "http_concurrency": 50,
@@ -404,7 +438,34 @@ DEFAULT_CONFIG = {
         "source_retries": 2,
         "vhost_threads": 20,
         "crawl_timeout": 2700,
+        # Rows requested per mapping dispatch. uncover paginates and the
+        # engine bills PER PAGE (quake: Size=100, 100 credits a page), so
+        # this is a SPEND ceiling, not a quality knob. The default takes the
+        # maximum in ONE dispatch rather than probing with small limits:
+        # a page costs the same regardless of how many rows it returns, so
+        # small limits only multiply round trips. 3000 = quake's free
+        # monthly balance at 1 credit/row. Per-engine override:
+        # limits.mapping_rows_<engine>.
+        "mapping_rows": 3000,
+        # Pages followed per onepass source that supports paging
+        # (VirusTotal links.next, urlscan search_after). onepass's own
+        # default is 4 and it clamps at 20; asking for the clamp means
+        # "collect everything the free source will give", and a source
+        # that still has more is reported truncated.
+        "mapping_pages": 20,
+        # JS bundles fetched and scanned per extract invocation. It is a
+        # WORK budget, not a discovery cap: every bundle is queued, the
+        # rest stay pending and are reported as such (js_pending /
+        # js_budget_hit). A real target easily has thousands, so the old
+        # hard-coded 40 scanned 24 of 3202 and called the stage partial.
+        "js_fetch_limit": 2000,
     },
+    # How a store-reading command with NO scope flag is resolved:
+    #   infer  (default) derive the scope when the store makes it unambiguous;
+    #   refuse          never infer (the strict behaviour);
+    #   legacy          read the whole store, loudly, for old scripts.
+    # Every choice is published as `scope_source` in the command's output.
+    "scope": {"unscoped_reads": "infer"},
     "paths": {"resolvers": "", "subwordlist": "", "vhostwordlist": ""},
 }
 
@@ -547,17 +608,50 @@ def engine_has_key(engine: str) -> bool:
 # fofa/quake/hunter mirror rust/onepass/src/sources.rs, which queries the same
 # APIs directly. An engine missing from a table is never asked: guessing its
 # syntax would only manufacture another silent zero.
-UNCOVER_DOMAIN_QUERY = {
+# Per-engine query templates. EVIDENCE for each default (docs/MAPPING-QUERIES.md):
+#   * strings of bin/windows/uncover.exe show the field tokens the agents build
+#     with: `domain=`, `domain:"..."`, `hostname:"..."`, `icp:"..."`;
+#   * GitHub projectdiscovery/uncover agents/* construct exactly these forms.
+# uncover hands -q to the engine VERBATIM -- it does not translate between
+# query languages -- so one template per engine is mandatory; an engine with no
+# template is never asked (a guessed syntax yields a silent zero).
+# Overridable via config `mapping.queries.<kind>.<engine>`; a template MUST
+# contain the placeholder `{value}` (validated on load).
+_DEFAULT_DOMAIN_QUERY = {
     "fofa": 'domain="{value}"',
     "quake": 'domain:"{value}"',
     "hunter": 'domain="{value}"',
     "shodan": 'hostname:"{value}"',
 }
-UNCOVER_ICP_QUERY = {
+_DEFAULT_ICP_QUERY = {
     "fofa": 'icp="{value}"',
     "quake": 'icp:"{value}"',
     "hunter": 'icp.number="{value}"',
 }
+
+
+def _query_table(kind: str) -> dict:
+    """The effective templates for one question kind: config over defaults."""
+    defaults = (_DEFAULT_DOMAIN_QUERY if kind == "domain"
+                else _DEFAULT_ICP_QUERY)
+    out = dict(defaults)
+    raw = ((CFG.get("mapping") or {}).get("queries") or {}).get(kind) or {}
+    if isinstance(raw, dict):
+        for engine, tpl in raw.items():
+            e = str(engine).strip().lower()
+            t = str(tpl or "")
+            if not e or not t:
+                continue
+            if "{value}" not in t:
+                raise FindInfoError(
+                    "mapping.queries." + kind + "." + e +
+                    " must contain the {value} placeholder: " + t[:80])
+            out[e] = t
+    return out
+
+
+UNCOVER_DOMAIN_QUERY = _DEFAULT_DOMAIN_QUERY
+UNCOVER_ICP_QUERY = _DEFAULT_ICP_QUERY
 _QUERY_TABLES = {"domain": UNCOVER_DOMAIN_QUERY, "icp": UNCOVER_ICP_QUERY}
 
 
@@ -568,7 +662,7 @@ def uncover_query(kind: str, engine: str, value: str) -> str | None:
     inside a quoted term, and a stray quote would turn one term into a
     different query.
     """
-    tpl = _QUERY_TABLES.get(kind, {}).get((engine or "").strip().lower())
+    tpl = _query_table(kind).get((engine or "").strip().lower())
     if not tpl:
         return None
     clean = str(value or "").replace('"', "").replace("\\", "").strip()
@@ -581,7 +675,7 @@ def uncover_query_identity(kind: str, engines: list[str]) -> dict:
     Part of a stage's checkpoint inputs: when a template changes, a stage that
     asked the old question re-runs instead of hitting its checkpoint.
     """
-    table = _QUERY_TABLES.get(kind, {})
+    table = _query_table(kind)
     return {e: table[e] for e in engines if e in table}
 
 
@@ -1507,6 +1601,33 @@ def is_ip(value: str) -> bool:
     return canon_ip(value) is not None
 
 
+# A path that came out of a JS string concatenation is not a URL: katana sees
+# `'/_upload/tpl/' + tecUrl + '/x.js'` inside a bundle and reports the pieces
+# as paths. A real target produced 25k such fragments, burying the 492 real
+# API endpoints. These patterns say "this is source code, not a location".
+_PATH_JUNK_PATTERNS = (
+    r"\+\s*[A-Za-z_$][\w$]*\s*\+",     # 'a' + name + 'b'
+    r"%27", r"%22",                       # encoded quote = literal text
+    r"\$\{[^}]*\}",                      # JS template interpolation
+    r"\{\{[^}]*\}\}",                     # framework template
+    r"['\"]\s*\+",                      # quote then concatenation
+)
+_PATH_JUNK_RE = re.compile("|".join(_PATH_JUNK_PATTERNS), re.I)
+
+
+def is_junk_path(path: str) -> bool:
+    """True when a claimed path is really a fragment of JavaScript source.
+
+    Used before anything is stored as an endpoint: a path like
+    `/_upload/tpl/{n}/template1/js/'+tecUrl+'` can never be requested, and
+    storing thousands of them makes the endpoint table useless for triage.
+    """
+    p = str(path or "")
+    if not p or p == "/":
+        return False
+    return bool(_PATH_JUNK_RE.search(p))
+
+
 def path_template(path: str) -> str:
     segs = []
     for s in path.split("/"):
@@ -1667,6 +1788,64 @@ def in_scope(host: str | None, scope: list[str] | None) -> bool:
         if s2 and (h == s2 or h.endswith("." + s2)):
             return True
     return False
+
+
+# --- scope of an unscoped store read ----------------------------------
+# The store is shared, so a read with no scope flag used to be either a
+# silent whole-store read (old behaviour) or a hard refusal. Neither is
+# right for every caller: a single-target store reads fine without a flag,
+# and an old script must still be able to say "all of it".
+# `scope.unscoped_reads` picks the policy, and every read publishes how its
+# scope was decided as `scope_source` so a caller can never mistake an
+# inferred scope for an explicit one.
+SCOPE_MODES = ("infer", "refuse", "legacy")
+
+
+def scope_mode() -> str:
+    """The configured policy for a store read that carries no scope flag.
+
+    Unknown values fall back to "infer" with a log line rather than raising:
+    a typo in a config file must not make every command fail, and the
+    fallback is the SAFE one (never a silent whole-store read).
+    """
+    raw = str(((CFG.get("scope") or {}).get("unscoped_reads")) or "").strip().lower()
+    if raw in SCOPE_MODES:
+        return raw
+    if raw:
+        log("scope.unscoped_reads=" + raw + " is not one of " +
+            "/".join(SCOPE_MODES) + "; using infer")
+    return "infer"
+
+
+def scope_candidates(store, kind: str = "domain", limit: int = 12) -> list[str]:
+    """Registrable domains the store itself contains, most-supported first.
+
+    This is what a refusal offers instead of "guess a name and re-run". It
+    reads only the local database and never widens anything by itself.
+    """
+    counts: dict[str, int] = {}
+    try:
+        rows = store.get_assets(kind=kind)
+    except Exception:
+        return []
+    for a in rows:
+        base = registrable_domain(a.get("canonical") or "")
+        if base:
+            counts[base] = counts.get(base, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [name for name, _n in ordered[:max(1, limit)]]
+
+
+def infer_scope(store, kind: str = "domain") -> list[str]:
+    """The ONE registrable domain this store holds, or [] when ambiguous.
+
+    "Unambiguous" means every stored domain collapses to the same base
+    domain. Two or more bases means the store mixes targets, and guessing
+    would hand one target's assets to another -- exactly what the scope
+    gate exists to prevent. So the caller refuses instead.
+    """
+    names = scope_candidates(store, kind=kind, limit=2)
+    return names if len(names) == 1 else []
 
 
 # ---------------------------------------------------------------- provenance

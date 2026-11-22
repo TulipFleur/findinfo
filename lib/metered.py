@@ -62,7 +62,21 @@ def status_of(outcome: str, rc=None, count: int | None = None,
         return oc
     if "quota" in err or "exceed" in err or "limit" in err:
         return ST_QUOTA
-    if rc == 401 or rc == 403 or "unauthor" in err or "api key" in err:
+    # A credential the provider refuses is a SKIP, not a failure: retrying it
+    # cannot help and (on a paid plan) only burns time. Providers word this
+    # several ways -- uncover says "requires keys but no keys were found" for a
+    # missing variable, a relay says "key does not exist or has been deleted",
+    # an HTTP API answers 401/403. All of them mean the same thing here.
+    # "Requires membership or higher" is the same class: the credential is
+    # recognised, the ACCOUNT is not entitled to search. Retrying cannot fix
+    # it and recording it as `empty` would publish a paid-plan limitation as
+    # "this target has no assets" -- exactly the confusion this project bans.
+    if rc == 401 or rc == 403 or any(k in err for k in (
+            "unauthor", "api key", "requires keys", "no keys were found",
+            "invalid key", "key not found", "forbidden", "unauthorized",
+            "membership", "requires membership", "not entitled", "no credits",
+            "no query credits", "insufficient credits",
+            "密钥", "未授权", "无权", "权限")):
         return ST_AUTH
     if rc == 124 or "timeout" in err or "timed out" in err:
         return ST_FAILED

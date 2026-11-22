@@ -50,7 +50,7 @@ Every command writes **one JSON line to stdout** (for agents); progress and warn
 
 **Passive before active** (quota-free, zero target contact), **vhost before ports**, **run only with a clear target** (it is an orchestrator; re-running wastes quota).
 
-**⚠ Shared asset-graph isolation**: without `--task` the store is shared across targets, so a store read **must be scoped**: `--scope <domain>` for `subs`/`passive`/`icp`/`dns`/`probe`/`ipagg`/`ports`, `--domain <domain>` for `crawl`/`extract`/`vhost`. Unscoped it exits 2 `scope_required` (`--whole-store` reads all, on purpose); `ports` skips private/unowned IPs (pass them via `--ip`).
+**⚠ Shared asset-graph isolation**: the store is shared, so scope store reads with `--scope X` (`subs`/`passive`/`icp`/`dns`/`probe`/`ipagg`/`ports`) or `--domain X` (`crawl`/`extract`/`vhost`). No flag: `scope.unscoped_reads` `infer` (default) takes the store's single domain else exits 2 `scope_required`+`candidates`; `--whole-store` takes all; output says `scope_source` ([TOOLS](docs/TOOLS.md)).
 
 ## 1.5 A complete collection session (agent loop)
 
@@ -140,7 +140,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 | Symptom | Fix |
 |---|---|
 | `{"error":"tool_missing"}` | Tool missing from `bin/<platform>/` (no PATH fallback): Linux `scripts/setup-linux.sh`, Windows drop `bin/windows/*.exe`; do not install yourself |
-| `{"error":"scope_required"}` | Store read without scope: add `--scope`/`--domain` (§1) or `--whole-store` |
+| `{"error":"scope_required"}` | Store read with no scope: add `--scope`/`--domain` (§1), pick `candidates`, or `--whole-store` |
 | `subs` thin / keys missing | Coverage gap — **deliver as-is, do not `--resume`** (see `docs/API-KEYS.md`) |
 | `entity` empty | aiqicha Cookie missing/expired; or seed with `--domain` directly |
 | `vhost` 0 hits | Single site per IP, or a proxy blocks direct IP access |

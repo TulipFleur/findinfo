@@ -45,6 +45,10 @@ class _Run:
                 continue
         return out
 
+    def uncover(self):
+        """Only the uncover invocations (a dispatch also polls a credit balance)."""
+        return [c for c in self.calls if "-q" in c["cmd"] and "-e" in c["cmd"]]
+
 
 def _key(cfg_mod, engine, value: str) -> None:
     """Set one engine's credential to a TEST value and nothing else.
@@ -57,6 +61,10 @@ def _key(cfg_mod, engine, value: str) -> None:
     apis.setdefault(engine, {})["key"] = value
     if engine == "fofa":
         apis["fofa"]["email"] = "probe@example.com"
+        # No relay: a configured base routes fofa to the gateway protocol
+        # (POST /api/v1/query + X-Ak) instead of uncover, and a test that then
+        # asserts on uncover's argv would be asserting about the wrong path.
+        apis["fofa"]["base"] = ""
 
 
 def _patch_run(monkey, fake):
@@ -96,7 +104,7 @@ def test_remap_is_the_explicit_opt_in_to_ask_again():
         r = mapdispatch.ask(s, "RUN1", "fofa", "domain", "mt-a.example.com",
                             remap=True)
         assert r["reused"] is False
-        assert len(fake.calls) == 2
+        assert len(fake.uncover()) == 2
         assert mapping.lookup(s, mapping.question(
             "fofa", "domain", "mt-a.example.com",
             core.uncover_query("domain", "fofa", "mt-a.example.com")))["attempts"] == 2
@@ -119,7 +127,7 @@ def test_each_engine_is_asked_in_its_own_syntax_once():
         assert sorted(fake.engines()) == ["fofa", "quake"], fake.engines()
         assert res["dispatched"] == 2, res
         # the query text differs per engine (uncover does not translate)
-        qs = [c["cmd"][c["cmd"].index("-q") + 1] for c in fake.calls]
+        qs = [c["cmd"][c["cmd"].index("-q") + 1] for c in fake.uncover()]
         assert len(set(qs)) == 2, qs
     finally:
         core.run = real
@@ -238,6 +246,9 @@ def test_a_rejected_key_is_skipped_for_the_rest_of_the_task():
         _key(core, "quake", "test-quake-key")
         # fofa's key is refused
         def refuse_fofa(cmd, **kw):
+            # a dispatch also polls a credit balance; only uncover has -e
+            if "-e" not in cmd:
+                return 0, "", ""
             eng = cmd[cmd.index("-e") + 1]
             if eng == "fofa":
                 return 1, "", "401 unauthorized: invalid key"
@@ -251,7 +262,8 @@ def test_a_rejected_key_is_skipped_for_the_rest_of_the_task():
         core.run = fake
         r = mapdispatch.ask_all(s, "RUNQ", "domain", ["second.example.com"],
                                 engines="fofa,quake")
-        engines_asked = [c["cmd"][c["cmd"].index("-e") + 1] for c in fake.calls]
+        engines_asked = [c["cmd"][c["cmd"].index("-e") + 1]
+                         for c in fake.calls if "-e" in c["cmd"]]
         assert "fofa" not in engines_asked, (
             "a rejected key must not be retried", engines_asked)
         assert any(x["engine"] == "fofa" and "rejected" in x["reason"]

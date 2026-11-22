@@ -89,3 +89,69 @@ def test_brief_lists_truncated_sources():
     cov = report._brief_coverage(coverage={"known": True, "unavailable": gap})
     kinds = {(u["kind"], u.get("reason")) for u in cov["unavailable"]}
     assert ("truncated_sources", "onepass:virustotal") in kinds, kinds
+
+def test_onepass_is_asked_for_every_page_a_source_will_give():
+    """The CLI default is 4 pages and the binary clamps at 20.
+
+    onepass is a free-source collector here: a paged source (VirusTotal,
+    urlscan) costs nothing extra per page, so "collect everything" means
+    asking for the clamp -- leaving it at 4 drops rows for no saving. The
+    command line, not the collector's default, decides.
+    """
+    core = fresh_core()
+    tools = fresh_tools(core)
+    seen = []
+    store = core.Store()
+    try:
+        with mock.patch.object(core, "tool", lambda n: "/fake/" + n),              mock.patch.object(core, "run",
+                               lambda cmd, *a, **kw: (seen.append(list(cmd)),
+                                                      (0, _onepass_line(), ""))[1]):
+            tools.t_onepass(store, "example.com")
+    finally:
+        store.close()
+    cmd = seen[0]
+    assert "--max-pages" in cmd, cmd
+    assert cmd[cmd.index("--max-pages") + 1] == "20", cmd
+
+
+def test_a_configured_page_budget_is_respected():
+    core = fresh_core()
+    tools = fresh_tools(core)
+    core.CFG.setdefault("limits", {})["mapping_pages"] = 7
+    seen = []
+    store = core.Store()
+    try:
+        with mock.patch.object(core, "tool", lambda n: "/fake/" + n),              mock.patch.object(core, "run",
+                               lambda cmd, *a, **kw: (seen.append(list(cmd)),
+                                                      (0, _onepass_line(), ""))[1]):
+            tools.t_onepass(store, "example.com")
+    finally:
+        store.close()
+    cmd = seen[0]
+    assert cmd[cmd.index("--max-pages") + 1] == "7", cmd
+
+def test_js_fetch_budget_defaults_to_the_configured_maximum():
+    """The old hard-coded 40 scanned 24 of 3202 bundles on a real target.
+
+    It is a WORK budget (the rest stay queued and are reported pending), so a
+    default of 40 threw away almost all of the JS surface for no saving.
+    """
+    from lib import core as _core
+    import lib.tools as _tools
+    import importlib
+    core_ = fresh_core()
+    tools = fresh_tools(core_)
+    assert int((core_.CFG.get("limits") or {}).get("js_fetch_limit") or 0) == 2000
+    seen = {}
+    import unittest.mock as _mock
+    store = core_.Store()
+    try:
+        def fake_claim(limit, allow_urls=None):
+            seen["limit"] = limit
+            return []
+        with _mock.patch.object(store, "js_claim", fake_claim):
+            tools.t_extract(store, [], urls=["https://a.mt-a.example.com/x.js"],
+                            scope=["mt-a.example.com"])
+    finally:
+        store.close()
+    assert seen.get("limit") == 2000, seen
