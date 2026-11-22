@@ -253,7 +253,7 @@ def test_no_mapping_blocks_name_fallback_and_remap_reaches_enabled_fallback():
             calls.append(kw)
             return {"domains": [], "answered": 1}
 
-        with mock.patch.object(fi, "_stage", stage), \
+        with mock.patch.object(fi.pipeline, "_stage", stage), \
                 mock.patch.object(fi.tools, "t_enscan", lambda *a, **kw: {
                     "anchor_failed": True, "companies": [], "domains": [], "rc": 0}), \
                 mock.patch.object(fi.tools, "resolve_entity_identity", lambda **kw: {
@@ -293,7 +293,7 @@ def test_no_icp_skips_filing_questions_but_keeps_domain_mapping():
             calls.append((kind, list(values)))
             return {"results": [], "dispatched": 0, "reused": 0}
 
-        with mock.patch.object(fi, "_stage", stage), \
+        with mock.patch.object(fi.pipeline, "_stage", stage), \
                 mock.patch.object(fi.mapdispatch, "ask_all", ask), \
                 mock.patch.object(fi.mapdispatch, "engines_for", lambda *a: (["fofa"], [])), \
                 mock.patch.object(fi.core, "run", _dispatch_forbidden), \

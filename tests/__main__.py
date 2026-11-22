@@ -89,6 +89,7 @@ MODULES = [
     "tests.test_onepass_truncation",
     "tests.test_seed_expansion",
     "tests.test_wait_cursor",
+    "tests.test_pipeline_module",
 ]
 
 

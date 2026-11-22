@@ -176,7 +176,7 @@ def test_subs_timeout_is_recorded_as_timeout_not_done():
     done: the breakpoint would then hide the gap for the rest of the run."""
     core = _oc()
     assert core.combine_outcome(core.OUTCOME_TIMEOUT) == core.OUTCOME_TIMEOUT
-    src = Path(str(Path(core.ROOT) / "findinfo.py")).read_text(encoding="utf-8")
+    src = Path(str(Path(core.ROOT) / "lib" / "pipeline.py")).read_text(encoding="utf-8")
     assert "if oc in (core.OUTCOME_FAILED, core.OUTCOME_TIMEOUT):" in src, (
         "the subs stage must refuse to checkpoint a timeout")
 

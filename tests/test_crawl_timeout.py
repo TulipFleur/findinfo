@@ -24,8 +24,8 @@ def test_crawl_timeout_default_is_bounded():
 
 
 def test_crawl_call_uses_the_configured_ceiling():
-    """cmd_run must derive a positive crawl timeout, not pass tool_timeout blindly."""
-    src = (ROOT / "findinfo.py").read_text(encoding="utf-8")
+    """The run must derive a positive crawl timeout, not pass tool_timeout blindly."""
+    src = (ROOT / "lib" / "pipeline.py").read_text(encoding="utf-8")
     assert "crawl_timeout" in src, "crawl timeout is not derived in cmd_run"
     m = re.search(r"crawl_timeout\s*=\s*tool_timeout\s+or\s+int\(", src)
     assert m, "crawl_timeout must fall back to the configured default"
@@ -34,6 +34,6 @@ def test_crawl_call_uses_the_configured_ceiling():
 
 
 def test_crawl_timeout_is_reported_when_hit():
-    src = (ROOT / "findinfo.py").read_text(encoding="utf-8")
+    src = (ROOT / "lib" / "pipeline.py").read_text(encoding="utf-8")
     assert "rc\") == 124" in src or "rc\") == 124" in src or "124" in src
     assert "ceiling" in src, "a hit ceiling must be logged, not silent"

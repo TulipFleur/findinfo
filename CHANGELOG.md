@@ -7,7 +7,15 @@
 
 ## [Unreleased]
 
-### 能力评审修复（docs/CAPABILITY-REVIEW-2026-11-22.md）
+### 结构调整
+
+- **run 流水线移到 `lib/pipeline.py`**。findinfo.py 只保留命令行层（参数解析、各子命令、
+  后台启动与续跑）；`_run_pipeline` 以及只有它用到的检查点、心跳、状态写入、成员关系、
+  计划与覆盖率/判定辅助函数原样搬入 `lib/pipeline.py`。findinfo 继续导出这些名字（就是
+  同一个对象），`python findinfo.py …` 的用法、输出和 `__worker` 入口都不变；要改流水线
+  行为，打桩点是 `lib.pipeline`。
+
+### 能力评审修复（`716b622`，docs/CAPABILITY-REVIEW-2026-11-22.md）
 
 - **`--no-mapping` / `--remap` 在每个入口都生效**。两者成为 `RunSpec` 字段：后台
   worker 的 argv 重放、`run --resume`、离线 `--dry-run` 预览都会带上，重放时不再
