@@ -438,15 +438,14 @@ DEFAULT_CONFIG = {
         "source_retries": 2,
         "vhost_threads": 20,
         "crawl_timeout": 2700,
-        # Rows requested per mapping dispatch. uncover paginates and the
-        # engine bills PER PAGE (quake: Size=100, 100 credits a page), so
-        # this is a SPEND ceiling, not a quality knob. The default takes the
-        # maximum in ONE dispatch rather than probing with small limits:
-        # a page costs the same regardless of how many rows it returns, so
-        # small limits only multiply round trips. 3000 = quake's free
-        # monthly balance at 1 credit/row. Per-engine override:
-        # limits.mapping_rows_<engine>.
-        "mapping_rows": 3000,
+        # NOT set by default: each engine has its own ceiling in
+        # mapdispatch.ENGINE_LIMITS, because uncover pages at 100 rows on
+        # every engine and the cost of "one page" differs wildly (fofa bills
+        # per query with a 10000-row page; quake bills 100 credits a page and
+        # its whole free month is 3000 credits). Setting a global default here
+        # would override every engine with one number. Operators who want a
+        # single cap for all of them can still write
+        # "limits": {"mapping_rows": N} in config.json.
         # Pages followed per onepass source that supports paging
         # (VirusTotal links.next, urlscan search_after). onepass's own
         # default is 4 and it clamps at 20; asking for the clamp means

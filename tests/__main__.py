@@ -81,6 +81,8 @@ MODULES = [
     "tests.test_mapping_ledger",
     "tests.test_mapping_dispatch",
     "tests.test_mapping_queries",
+    "tests.test_cert_assets",
+    "tests.test_filing_assets",
     "tests.test_mapping_run_contract",
     "tests.test_title_encoding",
     "tests.test_engine_queries",

@@ -1268,7 +1268,10 @@ def _stage_mapping(ctx: RunContext) -> None:
         # Attach what the mapping learned to THIS run's membership --
         # including rows that were REUSED from an earlier run (original
         # observation time preserved by the ledger).
-        for kind, val in all_results:
+        for row in all_results:
+            # rows are (kind, value, context): the context names the question
+            # that produced it (see mapdispatch.store_results).
+            kind, val = row[0], row[1]
             _attach(store, summary, kind, val, producer="mapping",
                     upstream="mapping", route=None)
         failures = list(dom.get("failures") or []) + \

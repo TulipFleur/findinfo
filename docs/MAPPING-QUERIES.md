@@ -48,6 +48,49 @@ uncover 把 `-q` **原样**交给引擎，不做跨引擎翻译；因此每个�
 
 **值的安全处理**：`uncover_query` 会剥离值内的 `"` 与 `\`，避免一个值把单个引用词变成另一个查询。
 
+## 3.5 三次采集：域名 / 证书 / 备案号
+
+操作员要求「域名、证书、备案号分三次测绘」。**这里必须说清一件事：测绘平台只能做第一次。**
+
+uncover 的 `sources/result.go` 定义输出只有：
+
+```go
+type Result struct {
+    Timestamp  Source  IP  Port  Host  Url   // Raw 不输出
+}
+```
+
+每个引擎的响应结构体也只带这三样：
+
+| 引擎 | 请求字段（硬编码） | 响应结构体 |
+|---|---|---|
+| quake | `Include: ["ip","port","hostname"]` | `hostname` / `ip` / `port` |
+| fofa | `Fields = "ip,port,host"`（`Size = 100` 固定） | `[][]string` 三列 |
+| shodan | 无字段参数 | `ip` / `port` / `hostnames` |
+| hunter | 无字段参数 | `ip` / `port` / `domain` |
+| zoomeye | `pagesize: 100` | `ip` / `port` / `hostname` |
+
+所以**证书和备案号在 uncover 这一层就被截断了**，不是本项目丢的。三次采集的实际分工：
+
+| 次序 | 数据 | 入口 | 来源 |
+|---|---|---|---|
+| ① 域名 | host / IP | `map --domain X` | uncover（付费） |
+| ② 证书 | 签发者 / 序列号 / 有效期 / SAN | `certs --domain X` | crt.sh → CertSpotter（免费） |
+| ③ 备案号 | 备案号 → 域名/IP | `map --icp "京ICP备…"` 或 `entity` | uncover / ENScan |
+
+方向差异：测绘平台**不能返回某域名的备案号**，只能**用备案号反查域名**。「这个域名属于哪个备案」要走 `entity`（ENScan 的 `icp` 字段）或工信部查询。
+
+### 每类的落库形态
+
+| kind | canonical | parent | attrs |
+|---|---|---|---|
+| `domain` | 主机名 | 备案号（若是 ICP 反查所得） | url/status/title |
+| `ip` | 地址 | 同上 | — |
+| `cert` | `签发者\|序列号`（无序列号时用 CN） | 被查询的域名 | `cn` / `issuer` / `serial` / `not_before` / `not_after` / `entry` / `san` |
+| `icp` | 备案号 | — | — |
+
+证书此前**只提取其中的域名，证书本身被丢弃**；现在每张证书是一行 `kind=cert` 资产，`certs` 的返回值也带 `certs` 计数。
+
 ## 4. `-limit` 是**花费上限**，不是越大越好
 
 - uncover 的 `-limit` 默认 **100**（`uncover -h` 原文：`limit the number of results to return (default 100)`）。
@@ -74,18 +117,34 @@ uncover 对各引擎的行为不同，**翻页的直接账单差异**已在真�
 即 `-limit 10000` 让 uncover 连翻 7 页、每页都计费。南开大学任务里看到的「9 次」就是
 9 页，不是 9 个不同的问题——**账本只记了 1 个问题**。
 
-**结论：一次拉满，不要小批量试探。**
+**结论：一次拉满，不要小批量试探——但每个引擎的"满"不一样。**
 
-小 limit 不省钱——一页的成本与返回 10 条还是 100 条无关，小 limit 只是把同一次
-花费拆成多次往返、增加拿不全的概率。所以默认值取 **3000**（= quake 免费额度
-3000 credit ÷ 1 credit/行），一个问题一次问完、一次付清、不重复。
+uncover 在**所有**引擎上都是 100 行一页（源码核实），所以 `-limit` 是**页数预算**。
+而一页的代价不同：fofa 按查询计费、quake 每页 100 credit 且免费月额度就是 3000。
+用同一个数字套所有引擎，不是让一个引擎少拿，就是让另一个引擎烧光。
+
+因此**没有全局默认**，每个引擎有自己的上限（`mapdispatch.ENGINE_LIMITS`）：
+
+| 引擎 | 默认上限 | 页数 | 依据 |
+|---|---|---|---|
+| quake | 3000 | 30 | 免费月额度 3000 credit ÷ 1 credit/行 |
+| fofa | 1000 | 10 | 按查询计费，uncover 固定 100/页 |
+| shodan | 1000 | 10 | 付费计划按查询计费 |
+| hunter | 1000 | 10 | 付费计划按页计费 |
+
+覆盖顺序（`mapdispatch.mapping_limit(engine)`）：
+
+1. `limits.mapping_rows_<engine>` —— 只影响该引擎
+2. `limits.mapping_rows` —— 显式给所有引擎同一个上限
+3. 该引擎自己的 `ENGINE_LIMITS`
+4. `DEFAULT_LIMIT`（3000），仅当引擎不在表里
 
 ```json
-{"limits": {"mapping_rows": 3000, "mapping_rows_quake": 3000}}
+{"limits": {"mapping_rows_quake": 5000, "mapping_rows_fofa": 2000}}
 ```
 
-`mapping_rows_<engine>` 只作用于该引擎（`mapdispatch.mapping_limit(engine)`）；
-额度更少时应按余额下调，而不是靠反复小批量试探。
+额度更少时应按余额**下调**，而不是靠反复小批量试探——小 limit 不省钱，只把同一次
+花费拆成多次往返并增加拿不全的概率。
 
 - 每次派发都会记录 `pages` 与 `credits`（quake 有免费额度查询接口，派发前后各读一次余额，
   实测值覆盖估算值），`metered.jsonl` 的 `requested` 记的就是页数，不再是恒定的 1。

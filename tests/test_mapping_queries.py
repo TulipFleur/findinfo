@@ -376,36 +376,56 @@ def test_brief_carries_the_mapping_ledger_summary():
     assert out["metered"]["by_engine"]["quake"]["requests"] == 1, out
 
 # ------------------------------------------- pagination is a spend ceiling
-def test_limit_defaults_to_the_maximum_in_one_dispatch():
-    """Ask ONCE for everything, not five times for a slice each.
+def test_each_engine_gets_its_own_row_ceiling():
+    """One global number cannot be right for every engine.
 
-    Measured on a real quake account: `-limit 1` cost 100 credits and
-    `-limit 100` also cost 100 -- a page costs the same however many rows it
-    returns (uncover's quake agent posts Size=100 and loops on a Start offset,
-    so `-limit` is a page budget). Small limits therefore save nothing and
-    only multiply round trips; the default asks for a full run in one go,
-    3000 = quake's whole free monthly balance at 1 credit/row.
+    Every engine pages at 100 rows per request (verified in the bundled uncover
+    sources: quake Size=100, fofa Size=100, shodan page=..., hunter Size=100,
+    zoomeye pagesize=100), so `-limit` is a PAGE BUDGET. But what one page
+    COSTS differs: fofa bills the query, quake bills 100 credits a page and its
+    whole free month is 3000. A single default therefore either underspends on
+    one engine or drains another, so each engine carries its own ceiling.
     """
     fresh_core()
-    assert core.CFG["limits"]["mapping_rows"] == 3000
-    assert mapdispatch.mapping_limit("quake") == 3000
+    assert "mapping_rows" not in (core.CFG.get("limits") or {}), (
+        "a global default would override every engine's own ceiling")
+    assert mapdispatch.mapping_limit("quake") == 3000      # one free month
+    assert mapdispatch.mapping_limit("fofa") == 1000
+    assert mapdispatch.mapping_limit("shodan") == 1000
+    assert mapdispatch.mapping_limit("hunter") == 1000
 
 
 def test_a_per_engine_page_budget_can_be_raised_on_request():
-    """`limits.mapping_rows_<engine>` is how a task spends more on one engine."""
+    """`limits.mapping_rows_<engine>` overrides that engine only."""
     fresh_core()
-    core.CFG["limits"]["mapping_rows_quake"] = 500
+    core.CFG.setdefault("limits", {})["mapping_rows_quake"] = 500
     assert mapdispatch.mapping_limit("quake") == 500
-    # every other engine keeps the default: a quake budget is not global
-    assert mapdispatch.mapping_limit("fofa") == 3000
+    # every other engine keeps its own ceiling: not global
+    assert mapdispatch.mapping_limit("fofa") == 1000
 
 
-def test_billed_pages_are_counted_for_a_paginating_engine():
-    """One dispatch of N pages must not be recorded as one request."""
+def test_a_global_cap_still_wins_when_the_operator_sets_one():
+    """An operator who wants ONE cap for all engines can still say so."""
+    fresh_core()
+    core.CFG.setdefault("limits", {})["mapping_rows"] = 200
+    assert mapdispatch.mapping_limit("quake") == 200
+    assert mapdispatch.mapping_limit("fofa") == 200
+
+
+def test_billed_pages_are_counted_for_every_paginating_engine():
+    """One dispatch of N pages must not be recorded as one request.
+
+    uncover pages on ALL of these engines at 100 rows a page (verified in the
+    bundled sources), so a 3000-row quake question is 30 billed round trips.
+    """
     assert mapdispatch.pages_spent("quake", 50, 100) == 1
     assert mapdispatch.pages_spent("quake", 250, 500) == 5
-    # an engine that answers in one response is always one unit
-    assert mapdispatch.pages_spent("fofa", 5000, 10000) == 1
+    assert mapdispatch.pages_spent("quake", 0, 3000) == 30
+    assert mapdispatch.pages_spent("fofa", 0, 1000) == 10
+    assert mapdispatch.pages_spent("shodan", 0, 1000) == 10
+    assert mapdispatch.pages_spent("hunter", 0, 1000) == 10
+    # asking for less than one page is still one page
+    assert mapdispatch.pages_spent("quake", 10, 10) == 1
 
 
 # ------------------------------------------------- name as a search value

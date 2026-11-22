@@ -52,15 +52,50 @@ SUPPORTED_ENGINES = {
 #     engine's minimum page).
 #   * fofa/shodan/hunter: one request, rows up to the engine's own page cap.
 #
-# The operator's rule (decided after the 9-page incident): take the MAXIMUM in
-# ONE dispatch instead of probing with small limits. Small limits do not save
-# credits -- a page costs the same whether it returns 10 rows or 100 -- they
-# only multiply round trips and the chance of a partial answer. So the default
-# is a full run: 3000 rows, which is quake's whole free monthly balance at
-# 1 credit/row (100 credits per 100-row page). One question, one bill, no
-# repeat. Raise it per engine with limits.mapping_rows_<engine> if a paid plan
-# allows more; lower it only to protect a balance you want to keep.
+# EVERY engine pages at 100 rows per request (verified in the bundled uncover
+# sources: quake Size=100, fofa Size=100, shodan page=..., hunter Size=100,
+# zoomeye pagesize=100). `-limit` is therefore a PAGE BUDGET, and the only
+# question is how many pages one dispatch may buy.
+#
+# No single number is right for every engine: fofa bills per query and its own
+# single-page ceiling is 10000, while quake bills 100 credits per 100-row page
+# and its whole free month is 3000. The operator's rule is "collect
+# everything, ask once", so each engine gets its OWN ceiling (ENGINE_LIMITS),
+# and a per-engine config always wins.
 DEFAULT_LIMIT = 3000
+
+# Rows per PAGE per engine, from the bundled uncover sources. Turns a row
+# ceiling into an honest page/billing estimate.
+PAGED_ENGINES = {
+    "quake": 100, "fofa": 100, "shodan": 100,
+    "hunter": 100, "zoomeye": 100, "censys": 100,
+}
+
+# Row ceiling of ONE upstream page, as uncover actually requests it. fofa's
+# API accepts size=10000, but uncover hard-codes `Size = 100` (fofa.go:22) and
+# never raises it, so a fofa dispatch also brings back 100 rows per request.
+# The page count below must use what the TOOL asks for, not what the API
+# would allow: 10000 rows of fofa is 100 requests, not one.
+ENGINE_PAGE_MAX = {
+    "quake": 100, "fofa": 100, "shodan": 100,
+    "hunter": 100, "zoomeye": 100, "censys": 100,
+}
+
+# Engine-specific default row ceiling -- what "everything" costs there.
+ENGINE_LIMITS = {
+    # quake: 100 credits per 100-row page; the free month is 3000 credits, so
+    # 3000 rows is one whole month in a single question.
+    "quake": 3000,
+    # fofa: uncover asks 100 rows a page and fofa bills the QUERY, so a wide
+    # ceiling is one query per page either way. 1000 rows = 10 queries.
+    "fofa": 1000,
+    # shodan: free plans cannot search at all; paid plans bill per query.
+    "shodan": 1000,
+    # hunter: free accounts have no openApi; paid plans bill per page.
+    "hunter": 1000,
+    # no query template by default; kept for completeness.
+    "zoomeye": 1000, "censys": 1000,
+}
 
 
 def mapping_limit(engine: str = "") -> int:
@@ -70,9 +105,10 @@ def mapping_limit(engine: str = "") -> int:
     task says "spend more on quake" without changing every other engine.
     """
     limits = core.CFG.get("limits") or {}
+    name = (engine or "").strip().lower()
     keys = []
-    if engine:
-        keys.append("mapping_rows_" + str(engine).strip().lower())
+    if name:
+        keys.append("mapping_rows_" + name)
     keys.append("mapping_rows")
     for key in keys:
         try:
@@ -81,6 +117,10 @@ def mapping_limit(engine: str = "") -> int:
             v = 0
         if v > 0:
             return v
+    # No explicit config: the engine's own ceiling (see ENGINE_LIMITS). Every
+    # engine pages at 100 rows, so this is a page budget, not a sample size.
+    if name and name in ENGINE_LIMITS:
+        return ENGINE_LIMITS[name]
     return DEFAULT_LIMIT
 
 
@@ -296,12 +336,6 @@ def _parse_uncover_rows(out: str) -> list:
     return out_rows
 
 
-# Engines whose native agent PAGINATES, and the fixed page size it requests.
-# Evidence (upstream sources): quake posts Size=100 and loops on Start until
-# `numberOfResults > limit`, so N pages are N billed round trips. fofa, shodan
-# and hunter issue one request and let the engine cap the rows.
-PAGED_ENGINES = {"quake": 100}
-
 
 def pages_spent(engine: str, rows: int, cap: int) -> int:
     """Billed round trips a dispatch of this size implies (best estimate).
@@ -316,12 +350,15 @@ def pages_spent(engine: str, rows: int, cap: int) -> int:
     conditions (limit reached, or no more data) and only the provider knows
     which one fired.
     """
-    size = PAGED_ENGINES.get((engine or "").strip().lower())
-    if not size:
+    name = (engine or "").strip().lower()
+    # How many rows ONE round trip can bring back: the engine page ceiling,
+    # never more than what was asked for.
+    page = min(max(1, cap), ENGINE_PAGE_MAX.get(name) or max(1, cap))
+    if not page:
         return 1
-    # uncover checks the limit AFTER each page, so it fetches one page for a
-    # zero-row answer too; beyond that it is ceil(limit / page_size).
-    return max(1, -(-max(1, cap) // size))
+    # uncover checks the limit AFTER each page, so it fetches one page even for
+    # a zero-row answer; beyond that it is ceil(ceiling / rows-per-page).
+    return max(1, -(-max(1, cap) // page))
 
 
 def engine_credit(engine: str, timeout: int = 15) -> int | None:
@@ -532,7 +569,13 @@ def ask_all(store, run_id: str, kind: str, values, *,
                               "status": r["status"], "reason": r["reason"]})
             if r["truncated"]:
                 truncated.append("uncover:" + r["engine"])
-            results.extend(r["results"])
+            # Each row remembers the question that produced it: a domain
+            # returned by an ICP reverse lookup belongs to that filing
+            # number, and dropping the link made the report unable to say
+            # which filing a host came from.
+            _ctx = {"engine": r["engine"], "kind": kind,
+                    "asked": r["value"]}
+            results.extend(tuple(x) + (_ctx,) for x in r["results"])
     return {"kind": kind, "dispatched": len(usable) * len(list(values)),
             "reused": reused, "failures": asked,
             "truncated_sources": sorted(set(truncated)),
@@ -541,16 +584,34 @@ def ask_all(store, run_id: str, kind: str, values, *,
 
 
 def store_results(store, results) -> dict:
-    """Write mapping rows as assets (one source token per engine answer)."""
+    """Write mapping rows as assets, keeping the question that produced them.
+
+    Each row is (kind, value[, context]). The context names the engine and the
+    value that was asked; for an ICP reverse lookup that value IS the filing
+    number, so the returned domain is stored with `parent=<filing>` and the
+    report can say which filing a host belongs to. Without it the link was
+    lost: every mapped domain looked like a direct answer about the seed.
+    """
     n = {"domain": 0, "ip": 0}
-    for kind, val in results:
+    for row in results:
+        if len(row) >= 3:
+            kind, val, ctx = row[0], row[1], row[2] or {}
+        else:
+            kind, val, ctx = row[0], row[1], {}
+        asked_kind = str(ctx.get("kind") or "")
+        asked = str(ctx.get("asked") or "")
+        # A domain/IP answered by an ICP question belongs to that filing.
+        parent = asked if asked_kind == "icp" and asked else None
+        tag = "mapping:" + ("icp" if asked_kind == "icp" else "domain")
         try:
             if kind == "domain":
-                store.upsert_asset("domain", val, source="mapping",
-                                   confidence=0.75, passivity="passive")
+                store.upsert_asset("domain", val, source=tag,
+                                   confidence=0.75, passivity="passive",
+                                   parent=parent)
             else:
-                store.upsert_asset("ip", val, source="mapping",
-                                   confidence=0.6, passivity="passive")
+                store.upsert_asset("ip", val, source=tag,
+                                   confidence=0.6, passivity="passive",
+                                   parent=parent)
             n[kind] = n.get(kind, 0) + 1
         except Exception:
             continue

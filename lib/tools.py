@@ -868,6 +868,7 @@ def t_certs(store, domain: str, timeout: int = 0) -> dict:
     else:
         ok = True
     names: list[str] = []
+    certs: list[dict] = []
     if isinstance(data, list):
         for item in data:
             if not isinstance(item, dict):
@@ -879,12 +880,76 @@ def t_certs(store, domain: str, timeout: int = 0) -> dict:
             for dn in item.get("dns_names", []) or []:
                 if isinstance(dn, str):
                     names.append(dn)
+            # The CERTIFICATE itself used to be thrown away: only the names it
+            # contained were kept. A certificate is an asset with its own
+            # identity (issuer, validity, serial), and it is the second of the
+            # three collection passes. crt.sh and CertSpotter spell the same
+            # facts differently, so both are read.
+            _serial = str(item.get("serial_number") or item.get("id") or "").strip()
+            _iss = item.get("issuer") or {}
+            _issuer = str(item.get("issuer_name") or
+                          (_iss.get("name") if isinstance(_iss, dict) else "")
+                          or (_iss.get("O") if isinstance(_iss, dict) else "")
+                          or "").strip()
+            _cn = str(item.get("common_name") or "").strip()
+            if not _cn:
+                _dns = [str(x).strip() for x in (item.get("dns_names") or [])
+                        if str(x).strip()]
+                _cn = _dns[0] if _dns else ""
+            if _serial or _cn:
+                certs.append({
+                    "serial": _serial, "cn": _cn, "issuer": _issuer,
+                    "not_before": str(item.get("not_before") or "").strip(),
+                    "not_after": str(item.get("not_after") or "").strip(),
+                    "entry": str(item.get("entry_timestamp") or "").strip(),
+                    # CertSpotter publishes no issuer at all; it publishes the
+                    # certificate and public-key fingerprints instead. Those
+                    # are kept because they are what actually de-duplicates a
+                    # certificate across sources.
+                    "cert_sha256": str(item.get("cert_sha256") or "").strip(),
+                    "tbs_sha256": str(item.get("tbs_sha256") or "").strip(),
+                    "revoked": bool(item.get("revoked")),
+                    "san": [str(x).strip() for x in (item.get("dns_names") or [])
+                            if str(x).strip()][:50],
+                })
     out = []
     for n in names:
         d = core.canon_domain(n.strip())
         if d and (d == domain or d.endswith("." + domain)):
             out.append(d)
     out = _uniq(out)
+    # One asset row per certificate, keyed by issuer+serial (a source with no
+    # serial falls back to the common name). `parent` is the queried domain so
+    # the report can group them.
+    cert_rows = 0
+    for c in certs:
+        # The identity has to be readable AND unique. Prefer the certificate
+        # fingerprint (globally unique, and what de-duplicates across sources),
+        # then issuer|serial, then the common name. A bare "|serial" was a
+        # hash without a name: unreadable in a report.
+        if c.get("cert_sha256"):
+            key = c["cn"] + "|" + c["cert_sha256"][:16]
+        elif c["serial"] and c["issuer"]:
+            key = c["cn"] + "|" + c["issuer"] + "|" + c["serial"]
+        elif c["serial"]:
+            key = c["cn"] + "|" + c["serial"]
+        else:
+            key = c["cn"]
+        if not key:
+            continue
+        try:
+            store.upsert_asset(
+                "cert", key[:300], source="certs:" + upstream,
+                confidence=0.6, passivity="passive", parent=domain,
+                attrs={"cn": c["cn"], "issuer": c["issuer"],
+                       "serial": c["serial"], "not_before": c["not_before"],
+                       "not_after": c["not_after"], "entry": c["entry"],
+                       "cert_sha256": c["cert_sha256"],
+                       "tbs_sha256": c["tbs_sha256"], "revoked": c["revoked"],
+                       "san": c["san"]})
+            cert_rows += 1
+        except Exception:
+            continue
     for d in out:
         # collector "certs" is findinfo's own CT lookup; the upstream that
         # actually answered is named explicitly so it groups with the same
@@ -893,7 +958,8 @@ def t_certs(store, domain: str, timeout: int = 0) -> dict:
         store.upsert_asset("domain", d, source="certs:" + upstream,
                            confidence=0.5, passivity="passive", parent=domain)
     return {"domain": domain, "count": len(out), "records": len(data or []),
-            "domains": out, "upstream": upstream, "ok": ok}
+            "domains": out, "upstream": upstream, "ok": ok,
+            "certs": cert_rows}
 
 
 # ---------------------------------------------------------------- 2.5 third-party FOFA gateway

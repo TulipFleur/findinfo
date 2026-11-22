@@ -35,6 +35,11 @@ SHEETS = (
     # they were parsed but never stored, so this sheet had nothing to show.
     ("app", "APP/小程序", ("canonical", "parent", "confidence", "sources",
                            "first_seen", "last_seen")),
+    # Certificates carry their own identity (issuer, validity, serial,
+    # fingerprints, SAN) -- the middle pass of the three-pass collection.
+    ("cert", "证书", ("canonical", "cn", "issuer", "serial", "not_before",
+                     "not_after", "revoked", "san", "cert_sha256", "parent",
+                     "sources", "first_seen", "last_seen")),
 )
 ENDPOINT_SHEET = ("endpoint", "端点",
                   ("asset", "method", "path", "params", "status", "title",

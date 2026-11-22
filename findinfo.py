@@ -2037,7 +2037,7 @@ def build_parser() -> argparse.ArgumentParser:
     as_ = sub.add_parser("assets", help="list / export asset graph")
     as_.add_argument("--kind", default="all",
                      choices=["all", "company", "icp", "domain", "ip", "url",
-                              "endpoint", "app"])
+                              "endpoint", "app", "cert"])
     as_.add_argument("--min-conf", type=float, default=0.0)
     as_.add_argument("--limit", type=int, default=500)
     as_.add_argument("--match", action="append",

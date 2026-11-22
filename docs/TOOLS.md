@@ -174,11 +174,23 @@ Reports `key_accepted` / `syntax_accepted` / `rows` / `error` per engine and wri
 no consent flag: this skill is driven by an agent, and the cost is bounded by construction (one row per engine).
 `--yes-spend-quota` is still accepted for compatibility.
 
-**How much it spends**: `-limit` is explicit on every dispatch (`limits.mapping_rows`, default **3000**). uncover
-paginates on quake (fixed `Size=100`, looping on a `Start` offset) and the engine bills per page — but a page costs the
-same however many rows it returns, so a small limit saves nothing and only multiplies round trips. The default asks for
-everything in one dispatch (3000 = quake's free monthly balance at 1 credit/row); override per engine with
-`limits.mapping_rows_<engine>`. Each dispatch reports its `pages`; a page that fills the ceiling is `truncated`.
+**How much it spends**: uncover pages at 100 rows on EVERY engine (verified in the bundled sources), so `-limit` is a
+page budget, and one page does not cost the same everywhere. There is no global default: each engine carries its own
+ceiling (`mapdispatch.ENGINE_LIMITS`) — quake 3000 (its whole free month at 1 credit/row), fofa/shodan/hunter 1000,
+i.e. 30 / 10 / 10 pages. Override with `limits.mapping_rows_<engine>` (that engine only) or `limits.mapping_rows`
+(one cap for all). A small limit saves nothing and only multiplies round trips. Each dispatch reports its `pages`; a
+page that fills the ceiling is `truncated`.
+
+**Collect all three kinds of asset in three passes** (a mapping platform cannot do all of them):
+
+| # | Asset | Command | Source |
+|---|---|---|---|
+| 1 | domains + IPs | `map --domain X` | uncover (paid) |
+| 2 | certificates (issuer / serial / validity / SAN) | `certs --domain X` | crt.sh → CertSpotter (free) |
+| 3 | filings → domains/IPs | `map --icp "京ICP备…"` or `entity` | uncover / ENScan |
+
+uncover's `Result` is `timestamp/source/ip/port/host/url` only — certificates and filing numbers are cut off at that
+layer, so they cannot come from `map`. See [docs/MAPPING-QUERIES.md](MAPPING-QUERIES.md) §3.5.
 
 ---
 

@@ -55,6 +55,29 @@
   对 onepass 是 `HUNTER_KEY` 等）。`uncover` 显式设置 `-limit`，满页标记截断。
   缺 key 或凭据被拒的引擎默认跳过并记为能力缺口，不报错、不反复重试。
 
+### 三次采集：域名 / 证书 / 备案号
+
+- **测绘平台只能做第一次**。读随包 uncover 源码确认：`sources/result.go` 的 `Result` 只有
+  `timestamp/source/ip/port/host/url`；各 agent 的请求字段也写死（quake `Include: ip,port,hostname`、
+  fofa `Fields: ip,port,host`、hunter 只映射 `ip/port/domain`）。**证书与备案号在 uncover 这一层
+  就被截断**，不可能从 `map` 拿到。因此三次采集分工：① 域名+IP 走 `map`（付费）；② 证书走
+  `certs`（crt.sh→CertSpotter，免费）；③ 备案号走 `map --icp` / `entity`（备案号→域名的反向
+  查询，而非「查域名的备案号」）。
+- **证书成为一等资产**（原实现只取证书里的域名，证书本身丢弃）。`certs` 现在为每张证书写一行
+  `assets(kind=cert)`，canonical 为 `CN|证书指纹前16位`（无指纹时退化为 CN|issuer|serial），
+  attrs 带 `cn/issuer/serial/not_before/not_after/cert_sha256/tbs_sha256/revoked/san`，parent 为
+  被查询域名；`certs` 返回值新增 `certs` 计数；`assets --kind cert` 与 xlsx 的「证书」sheet 均可查。
+  CertSpotter 不发布 issuer，改存 `cert_sha256`/`tbs_sha256`/`revoked`（这三项才是跨源去重的依据）。
+- **备案反查保留归属**。`store_results` 过去把域名/IP 写成无 parent 的行，报告无法说明某个主机属于
+  哪个备案号；现在 mapping 结果携带「问句上下文」，ICP 反查所得以 `parent=<备案号>` 落库，
+  source 也区分 `mapping:icp` / `mapping:domain`。
+- **每个引擎单独定上限**（原为全局 3000）。uncover 在所有引擎上都是 100 行/页，所以 `-limit` 是
+  页数预算；而一页的代价不同（fofa 按查询计费、quake 每页 100 credit）。移除全局默认，改为
+  `mapdispatch.ENGINE_LIMITS`：quake 3000（= 免费月额度）、fofa/shodan/hunter 1000；覆盖顺序
+  `mapping_rows_<engine>` > `mapping_rows` > 引擎自有上限 > `DEFAULT_LIMIT`。
+- **页数估算按工具实际请求大小**。fofa 的 API 允许 `size=10000`，但 uncover 硬编码 `Size=100`，
+  按 API 上限估算会把 10000 行算成 1 页；改用 `ENGINE_PAGE_MAX` 记录工具真正请求的行数。
+
 ### 实体与 APP 面补全
 
 - **ENScan 的 APP / 小程序不再被丢弃**。`app` / `wx_app` / `wechat` 字段一直被解析并
