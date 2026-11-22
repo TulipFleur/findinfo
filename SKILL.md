@@ -1,6 +1,6 @@
 ---
 name: findinfo
-description: Asset reconnaissance and mapping pipeline. From a company name or a domain it chains entity anchoring (ENScan equity/ICP), full subdomain collection (certificate transparency, mapping platforms, multi-source aggregation), liveness probing with CDN removal, Host-header collision for internal-service discovery, and page/JS leak reflow, producing an evidence-backed asset graph with provenance and confidence. Use when the user asks for information gathering, asset mapping, attack-surface inventory, subdomain enumeration, ICP reverse lookup, internal-service discovery, or hands over a company/domain and wants to know what assets exist.
+description: Asset reconnaissance from a company name or approved domains. Chains ENScan/AQC anchoring, passive sources and mapping, DNS/HTTP verification, optional ports/Host routing, and Web/JS clues into an asset graph. Use for asset inventories, domain discovery, ICP lookup, or attack-surface mapping.
 license: MIT
 ---
 
@@ -8,11 +8,11 @@ license: MIT
 
 Give it a name, get an **evidence-backed asset graph**: an idempotent, resumable, multi-stage pipeline with confidence scoring — not "run subfinder once".
 
-This file is the agent entry point (when to use / command loop / hard rules / reading results). Parameters and subcommands → [docs/TOOLS.md](docs/TOOLS.md); data model and scoring → [docs/DATA-MODEL.md](docs/DATA-MODEL.md); failures and result progression → [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+Agent entry point. [Commands](docs/TOOLS.md), [data/scoring](docs/DATA-MODEL.md), [failures/recovery](docs/TROUBLESHOOTING.md).
 
 ## 0. 30-second start
 
-The directory holding this file is `<skill>`; run commands from there. Code locates `bin/` from its own path (per-client install locations: [docs/CLIENTS.md](docs/CLIENTS.md)).
+Run from this directory; code resolves its bundled tools from here. [Client paths](docs/CLIENTS.md).
 
 ```bash
 python findinfo.py doctor                                    # 1) always first: tools/keys/python/egress
@@ -48,7 +48,7 @@ Every command writes **one JSON line to stdout** (for agents); progress and warn
 | Endpoints for vuln hunting | `crawl`/`extract --from-store --domain X` → `assets --export` |
 | Just query existing assets | `assets --kind domain --min-conf 0.7` (generates no traffic) |
 
-**Passive before active** (quota-free, zero target contact), **vhost before ports**, **run only with a clear target** (it is an orchestrator; re-running wastes quota).
+**Keyless discovery -> paid mapping -> active verification.** Optional order: `ports -> vhost`. Start one scoped run; keep its run_id.
 
 **⚠ Shared asset-graph isolation**: the store is shared, so scope store reads with `--scope X` (`subs`/`passive`/`icp`/`dns`/`probe`/`ipagg`/`ports`) or `--domain X` (`crawl`/`extract`/`vhost`). No flag: `scope.unscoped_reads` `infer` (default) takes the store's single domain else exits 2 `scope_required`+`candidates`; `--whole-store` takes all; output says `scope_source` ([TOOLS](docs/TOOLS.md)).
 
@@ -79,11 +79,12 @@ Single Python processes, no shell features. Differences: interpreter name (`pyth
 
 ```
 Stage 1A entity    python findinfo.py entity --name "Example Corp"     # ENScan -> entity tree/ICP/domains/apps
-Stage 1B passive   python findinfo.py passive --domain example.com     # onepass 15 sources in parallel, fastest cold start
+Stage 1B passive   python findinfo.py passive --domain example.com     # onepass: 8 keyless sources usable by default
         certs      python findinfo.py certs --domain example.com       # certificate transparency: free, zero contact, run first
-        subs       python findinfo.py subs --domain example.com        # subfinder/chaos/uncover
-        icp        python findinfo.py icp --from-store --scope example.com
-Stage 1C dns       python findinfo.py dns --from-store --scope example.com   # resolve + wildcard filtering (mandatory)
+        subs       python findinfo.py subs --domain example.com        # keyless subfinder; paid engines are separate
+Stage 1C mapping   python findinfo.py map --domain example.com --engines fofa,quake,hunter,shodan
+        mapping   python findinfo.py map --icp "ICP filing value" --engines fofa,quake,hunter
+Stage 1D dns       python findinfo.py dns --from-store --scope example.com   # resolve + wildcard filtering (mandatory)
 Stage 2   probe    python findinfo.py probe --from-store --scope example.com
         ipagg      python findinfo.py ipagg --scope example.com        # group by IP, drop CDN
         ports      python findinfo.py ports --ip 1.2.3.4 --top-ports 1000
@@ -92,9 +93,11 @@ Stage 3   crawl    python findinfo.py crawl --from-store --domain example.com
         extract    python findinfo.py extract --url <js-url>          # JS/page leaks, then reflow
 ```
 
+Standalone equivalents above: `run` invokes adapters itself. `--max-seed 0` expands all seeds; positive N caps onepass/certs/subs/brute, not mapping. [Company branches and engine syntax](docs/DIDI-COLLECTION-WORKFLOW.md).
+
 **Key points**: eyeball the ENScan entity tree once; `passive`+`certs` is the fastest first pass; `dns` is mandatory (unfiltered wildcards turn 300 rows into 30k fake assets); **vhost has the best ROI** — Jenkins/GitLab/Swagger hide behind Host-header collisions; new domains/IPs from `crawl`+`extract` flow back in.
 
-Convergence: stable domain count is **not** convergence while `coverage.work_queue.outstanding > 0` (still `partial`/`work_pending`). Succeeded bundles never re-open; HTML is never JS work. Counts are this run's only; reuse keeps the original `observed_at`.
+Stable domains with `coverage.work_queue.outstanding > 0` still mean partial/work_pending. Succeeded bundles stay closed; HTML is not JS work. Counts may include cumulative scope data; reused mapping answers may acquire current graph observation times. Neither proves a new finding.
 
 ## 3. Command quick reference
 
@@ -131,7 +134,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 6. **External-tool argument changes must be verified against real output** (an unsupported katana `-fs rdn:` once filtered everything, silently).
 7. **ENScan is serial (enforced in code)**: concurrency gets the Cookie banned, and two simultaneous enscan.exe runs return the same entity. In-process mutex + cross-process file lock (`<home>/enscan.lock`).
 8. **Do not trade `--depth` for "more coverage"**: noise and runtime scale linearly; `d 3` is enough.
-9. **Only certificate transparency (CT) responses are cached** (`cache/certs/`, 7 days); every other stage re-probes on re-run.
+9. **CT cache: 7 days. Mapping: task ledger, re-asked with `--remap`.** Other collectors re-probe when not checkpoint-skipped.
 10. **Active scope recognises only `--domain`/entity anchors**: out-of-scope domains found via ICP reverse lookup, JS leaks or the crawler are stored and labelled "related assets" but never automatically enter dns/probe/ports/vhost/crawl;
     bringing one into active scope requires an explicit `--domain`.
 
@@ -152,7 +155,7 @@ Full failure table, `wait` reading, result progression and per-source branching 
 ## 7. Cross-client install
 
 One directory serves every client: `python scripts/install.py` (Windows junction / Linux symlink), `--status` (where/whether installed), `--verify` (runs doctor on each client path).
-Per-client mechanics and Codex `config.toml` registration → [docs/CLIENTS.md](docs/CLIENTS.md).
+Client mechanics → [docs/CLIENTS.md](docs/CLIENTS.md).
 
 ## 8. Hand-off to other skills
 

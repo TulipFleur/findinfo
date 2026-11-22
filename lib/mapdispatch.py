@@ -464,7 +464,8 @@ def ask(store, run_id: str, engine: str, kind: str, value: str,
 
 
 def resolve_by_name(store, run_id: str, name: str, *,
-                    engines: str | None = None, timeout: int = 0,
+                    engines: str | None = None, remap: bool = False,
+                    timeout: int = 0,
                     ledger=None, kind: str = "domain") -> dict:
     """Find a company's MAIN DOMAIN by asking the engines for its NAME.
 
@@ -492,7 +493,7 @@ def resolve_by_name(store, run_id: str, name: str, *,
     results: list = []
     for engine in usable:
         out["attempted"] += 1
-        r = ask(store, run_id, engine, kind, label, timeout=timeout,
+        r = ask(store, run_id, engine, kind, label, remap=remap, timeout=timeout,
                 ledger=ledger)
         if r.get("status") in (metered.ST_OK, metered.ST_EMPTY,
                                metered.ST_TRUNCATED):

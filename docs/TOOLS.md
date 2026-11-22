@@ -611,21 +611,21 @@ until `state=completed` (terminal states are only `completed`/`failed`/`cancelle
 
 ```bash
 python findinfo.py wait --run <run_id> --timeout 30
-python findinfo.py wait --run <run_id> --timeout 30 --since 12   # only react to seq changes
+python findinfo.py wait --run <run_id> --timeout 30 --since 12   # use the previous response's cursor
 ```
 
 | Parameter | Description |
 |---|---|
 | `--run` | required; the run_id from the background launch (also accepts a run dir or prefix) |
 | `--timeout` | per-call wait ceiling in seconds, default 30; returning on time is not failure |
-| `--since` | compare against a given `seq`; without it the baseline is the state at wait entry |
+| `--since` | compare against the previous response's `cursor` (`progress_seq`); without it wait for substantive progress after this call starts |
 | `--full` | return the full payload (incl. coverage/run_dir); default is trimmed to cut polling tokens and latency |
 
 **Return** (one JSON line, trimmed default ~340 bytes)
 
 ```json
 {"run_id":"20261118-010612-example.com","state":"running","changed":true,"timed_out":false,
- "terminal":false,"alive":true,"interrupted":false,"stalled":false,"reaped_by_host":false,"seq":7,"waited_sec":0.2,
+ "terminal":false,"alive":true,"interrupted":false,"stalled":false,"reaped_by_host":false,"seq":8,"progress_seq":7,"cursor":7,"waited_sec":0.2,
  "stage":"probe","stage_state":"running","stage_index":4,"stage_total":9,"percent":44.4,
  "counts":{"domain":128,"ip":64},"endpoints":37}
 ```
@@ -638,9 +638,10 @@ running any Python (empty stderr.log) — background mode is unusable in that en
 
 - `timed_out: true` → **only this wait window ended**; keep waiting on the same run_id.
 - `changed: true` / `terminal: true` → returned early (progress or terminal).
+- Pass the returned `cursor` as the next `--since`, including after a timeout. It acknowledges the latest substantive progress in that response, so the next call does not repeat it. `seq` also counts heartbeat writes; a heartbeat alone does not set `changed`. Existing callers may pass a raw `seq`: only a later progress marker counts as new progress.
 - `percent` being `null` = the stage's total is unknown (brute/crawl); never convert it to a percentage.
 - Exit code is always `0` (a wait timeout is not an error); `2` when the run_id does not exist.
-- Implementation: polls `seq` every 50ms and **returns the instant it moves** — no fixed sleeps, so frequent short waits never slow the flow.
+- Implementation: polls the persisted `progress_seq` every 50ms and returns on newer substantive progress or a terminal state. Legacy status files without that marker fall back to `seq`.
 
 ---
 
@@ -684,7 +685,10 @@ python findinfo.py run --domain example.com --active --ports
 | `--domain` | seed domains directly (repeatable; skips ENScan) |
 | `--active` | enable the traffic-generating stages |
 | `--ports` / `--vhost` / `--crawl` / `--brute` | append stages (imply `--active`; `--brute` needs Npcap) |
-| `--max-seed` | cap on seed domains for certs/subs expansion (default 5) |
+| `--max-seed` | seed-domain cap for onepass/certs/subs/brute; default `0` expands all approved seeds, positive N selects the first N; mapping/DNS/probe remain scoped independently |
+| `--no-mapping` | disable paid mapping, including the entity name fallback; preserved in background jobs |
+| `--no-icp` | skip ICP mapping questions while keeping domain mapping |
+| `--remap` | explicitly re-ask stored mapping questions, including name fallback; preserved on worker replay; resume keeps the stored source policy |
 | `--top-ports` | port-scan range (default 1000) |
 | `--max-vhost-ips` | cap on candidate IPs to collide (default 10) |
 | `--dry-run` | compile the plan only: `run_id: null`, no db/home/process/credential, works with `--background`/`--resume` read-only |

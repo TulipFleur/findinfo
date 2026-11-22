@@ -214,3 +214,176 @@ def test_brief_bytes_field_matches_the_file():
     assert brief["brief_bytes"] == len(raw), (
         "brief_bytes " + str(brief["brief_bytes"]) + " != file " + str(len(raw)))
     assert brief["brief_max_bytes"] == 32 * 1024
+
+
+def _long_brief_input():
+    """Legal coverage prose can be much larger than the brief itself."""
+    data = {"counts": {"domains_in_scope": 7},
+            "scope": {"match": ["example.com"], "target": "示例公司"},
+            "environment": {"warnings": []}, "hosts": [],
+            "internal_services": [], "leaks": {}, "next_steps": [],
+            "generated_at": "2026-11-22T00:00:00Z"}
+    coverage = {
+        "known": True, "source": "run-long-errors", "complete": False,
+        "requested_complete": False, "_result_status": "partial",
+        "failed_stages": [{"stage": "crawl", "error": "收集失败：" * 4000}],
+        "partial_stages": [{"stage": "extract", "outcome": "partial",
+                            "reason": "仍有待处理任务：" * 4000}],
+        "stage_states": {"crawl": "failed", "extract": "partial"},
+        "unavailable": {}, "stop_reason": "work_pending"}
+    return data, coverage
+
+
+def test_brief_bounds_long_stage_errors_with_the_final_stdout_encoder():
+    fresh_core()
+    from lib import core, report
+    for ascii_safe in (True, False):
+        data, coverage = _long_brief_input()
+        before = json.dumps(coverage, ensure_ascii=False)
+        brief = report.build_brief(data, coverage=coverage, ascii_safe=ascii_safe)
+        # cmd_brief merges more fields after build_brief, then fits again.
+        brief["note"] = "最后合并的提示" * 5000
+        report.fit_brief(brief, 32768, ascii_safe=ascii_safe)
+        raw = core.encode_json_line(brief, ascii_safe).encode("utf-8")
+        assert len(raw) == brief["brief_bytes"] <= 32768
+        assert brief["coverage"]["source"] == "run-long-errors"
+        assert brief["coverage"]["failed_stages"][0]["stage"] == "crawl"
+        assert brief["coverage"]["partial_stages"][0]["stage"] == "extract"
+        assert brief["coverage"]["complete"] is False
+        assert brief["coverage"]["result_status"] == "partial"
+        marker = brief["truncated"]["byte_budget"]
+        assert marker["shortened_strings"] >= 2
+        assert "status --run" in marker["hint"]
+        assert json.dumps(coverage, ensure_ascii=False) == before
+
+
+def test_brief_bounds_long_scope_and_records_original_array_totals():
+    fresh_core()
+    from lib import core, report
+    for ascii_safe in (True, False):
+        data, coverage = _long_brief_input()
+        data["scope"]["match"] = ["host" + str(i) + ".example.com"
+                                  for i in range(5000)]
+        # A valid domain may exceed the prose limit. Never clip an identity
+        # into an unusable '...'-suffixed domain while shortening its array.
+        first_domain = ("a" * 63 + ".") * 3 + "a" * 61
+        data["scope"]["match"][0] = first_domain
+        data["scope"]["target"] = "长范围说明" * 5000
+        coverage["failed_stages"] = [
+            {"stage": "stage-" + str(i), "error": "出错" * 2000}
+            for i in range(80)]
+        brief = report.build_brief(data, coverage=coverage, max_bytes=6000,
+                                   ascii_safe=ascii_safe)
+        raw = core.encode_json_line(brief, ascii_safe).encode("utf-8")
+        assert len(raw) == brief["brief_bytes"] <= 6000
+        assert brief["counts"] == data["counts"]
+        assert brief["scope"]["match"][0] == first_domain
+        assert len(data["scope"]["match"]) == 5000
+        assert brief["coverage"]["failed_stages"][0]["stage"] == "stage-0"
+        for path, total in (("scope.match", 5000),
+                            ("coverage.failed_stages", 80)):
+            cut = brief["truncated"][path]
+            assert cut["total"] == total and 0 < cut["kept"] < total
+        report.fit_brief(brief, 6000, ascii_safe=ascii_safe)
+        assert brief["truncated"]["scope.match"]["total"] == 5000
+
+
+def test_brief_file_uses_the_same_bounded_encoder_without_the_newline():
+    fresh_core()
+    from lib import report
+    data, coverage = _long_brief_input()
+    with tempfile.TemporaryDirectory() as directory:
+        result = report.write_brief(data, directory, max_bytes=6000,
+                                    coverage=coverage)
+        raw = Path(result["path"]).read_bytes()
+        brief = json.loads(raw)
+        assert len(raw) == result["bytes"] == brief["brief_bytes"] <= 6000
+        assert raw == report._encode_brief(
+            brief, ascii_safe=False, trailing_newline=False).encode("utf-8")
+        assert not raw.endswith(b"\n")
+
+
+def test_brief_refuses_when_required_identity_cannot_fit():
+    fresh_core()
+    from lib import core, report
+    data, coverage = _long_brief_input()
+    coverage["source"] = "run-" + "x" * 40000
+    try:
+        report.build_brief(data, coverage=coverage)
+    except core.FindInfoError as exc:
+        assert "max_bytes" in str(exc) and "identity" in str(exc)
+    else:
+        raise AssertionError("oversized required identity returned a successful brief")
+
+
+def test_brief_cli_long_errors_emit_one_bounded_measured_json_line():
+    """Exercise the real final merge -> fit -> emit path, not only the helper."""
+    import os
+    import subprocess
+    import sys
+    fresh_core()
+    from tests.util import ROOT
+    for utf8 in (False, True):
+        with tempfile.TemporaryDirectory(prefix="fi-brief-hard-limit-") as home:
+            rid = "20261122-000000-example.com"
+            rd = Path(home) / "runs" / rid
+            rd.mkdir(parents=True)
+            _, coverage = _long_brief_input()
+            coverage["source"] = rid
+            state = {"run_id": rid, "state": "completed", "seq": 1,
+                     "attempt": 1, "coverage": coverage,
+                     "result": {"status": "partial", "reason": "failed_stages:crawl"}}
+            (rd / "status.json").write_text(json.dumps(state), encoding="utf-8")
+            env = dict(os.environ, FINDINFO_HOME=home, FINDINFO_TASK="",
+                       FINDINFO_EMIT_UTF8="1" if utf8 else "0")
+            env.pop("FINDINFO_RUN_DIR", None)
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "findinfo.py"), "--home", home,
+                 "brief", "--run", rid], capture_output=True, env=env,
+                cwd=str(ROOT), timeout=60)
+            assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+            brief = json.loads(proc.stdout)
+            assert proc.stdout.count(b"\n") == 1
+            assert len(proc.stdout) == brief["brief_bytes"] <= 32768
+            assert brief["coverage"]["source"] == rid
+            assert brief["coverage"]["complete"] is False
+            assert brief["coverage"]["failed_stages"][0]["stage"] == "crawl"
+            assert brief["coverage"]["partial_stages"][0]["stage"] == "extract"
+
+
+def test_brief_final_cuts_keep_original_totals_after_arrays_are_emptied():
+    fresh_core()
+    from lib import core, report
+    for ascii_safe in (True, False):
+        data, coverage = _long_brief_input()
+        data["hosts"] = [
+            {"host": "host" + str(i) + ".example.com", "priority": "high",
+             "score": 10, "reasons": ["reason"] * 5,
+             "provenance": ["source"] * 5} for i in range(3)]
+        data["leaks"]["private_ips"] = ["10.0.0." + str(i) for i in range(100)]
+        data["next_steps"] = ["step " + str(i) for i in range(12)]
+        # The explicit leak example cap must remember 100, not the 20 rows
+        # seen later by fit_brief. No byte-pressure cut has happened yet.
+        capped = report.build_brief(data, coverage={"known": True},
+                                    ascii_safe=ascii_safe)
+        assert capped["truncated"]["leaks.private_ips"] == {"kept": 20, "total": 100}
+
+        brief = report.build_brief(data, coverage=coverage, ascii_safe=ascii_safe)
+        assert brief["top_hosts"] == []
+        assert brief["leaks"]["private_ips"] == []
+        assert len(brief["next_steps"]) == 2
+        expected = {"top_hosts": {"kept": 0, "total": 3},
+                    "leaks.private_ips": {"kept": 0, "total": 100},
+                    "next_steps": {"kept": 2, "total": 12}}
+        for path, cut in expected.items():
+            actual = brief["truncated"][path]
+            assert actual["kept"] == cut["kept"]
+            assert actual["total"] == cut["total"]
+        brief["note"] = "another final merge" * 10000
+        report.fit_brief(brief, 32768, ascii_safe=ascii_safe)
+        for path, cut in expected.items():
+            actual = brief["truncated"][path]
+            assert actual["kept"] == cut["kept"]
+            assert actual["total"] == cut["total"]
+        raw = core.encode_json_line(brief, ascii_safe).encode("utf-8")
+        assert len(raw) == brief["brief_bytes"] <= 32768

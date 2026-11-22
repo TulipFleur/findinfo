@@ -160,6 +160,12 @@ def _run_offline(sub: str, argv: list[str]) -> int:
     # importing the runtime. The planner needs only flag logic.
     args = _parse_offline_args(argv)
     rs = spec_mod.from_cli(args)
+    effective = None
+    if _prescan_option(argv, "--resume"):
+        effective = _offline_resume_preview(argv, spec_mod)
+        effective_rs = effective.pop("_effective_spec", None)
+        if effective_rs is not None:
+            rs = effective_rs
     active = bool(rs.active or rs.ports or rs.vhost or rs.crawl or rs.brute)
     planned = _plan_stages_pure(rs, active)
     identity_questions = []
@@ -171,11 +177,6 @@ def _run_offline(sub: str, argv: list[str]) -> int:
         identity_questions.append(
             "explicit domains seed the run directly; the brand is only extra "
             "context for related-asset evidence")
-    effective = None
-    if rs.task and False:      # untouched: resume preview needs the job spec
-        effective = None
-    if _prescan_option(argv, "--resume"):
-        effective = _offline_resume_preview(argv, spec_mod)
     payload = offline_mod.plan_preview(
         run_spec=rs, planned_stages=planned, active=active,
         disabled=[x for x in ("entity", "onepass", "icp", "brute")
@@ -240,10 +241,12 @@ def _parse_offline_args(argv: list[str]):
         entity_timeout=_val("--entity-timeout", 1200, int),
         engines=_val("--engines", "fofa,quake,hunter,shodan,censys"),
         top_ports=_val("--top-ports", 1000, int),
-        max_seed=_val("--max-seed", 5, int),
+        max_seed=_val("--max-seed", 0, int),
         max_vhost_ips=_val("--max-vhost-ips", 10, int),
         no_icp=_flag_present(argv, "--no-icp"),
         no_onepass=_flag_present(argv, "--no-onepass"),
+        no_mapping=_flag_present(argv, "--no-mapping"),
+        remap=_flag_present(argv, "--remap"),
         force_stage=_flag_present(argv, "--force-stage"),
         rounds=_val("--rounds", 1, int),
         time_budget=_val("--time-budget", 0.0, float),
@@ -310,29 +313,10 @@ def _offline_resume_preview(argv: list[str], spec_mod) -> dict:
         # Reconstruct the effective identity from the stored spec (its
         # run_spec block, else a parse of the stored argv) and report the
         # target/scope/stages/limits a resume would actually run.
-        from lib import spec as _spec
-        import argparse as _ap
-        rs = None
-        if spec_blob.get("run_spec"):
-            rs = _spec.RunSpec.from_json(_json.dumps(spec_blob["run_spec"]))
-        elif spec_blob.get("argv"):
-            # the offline path has no full parser; read the identity flags
-            av = list(spec_blob["argv"])
-            def _get(flag):
-                for i, a in enumerate(av):
-                    if a == flag and i + 1 < len(av):
-                        return av[i + 1]
-                return None
-            doms = [av[i + 1] for i, a in enumerate(av)
-                    if a == "--domain" and i + 1 < len(av)]
-            rs = _spec.RunSpec(
-                name=_get("--name") or "", domain=tuple(doms),
-                active="--active" in av,
-                ports="--ports" in av, vhost="--vhost" in av,
-                crawl="--crawl" in av, brute="--brute" in av,
-                no_icp="--no-icp" in av, no_onepass="--no-onepass" in av,
-                rounds=int(_get("--rounds") or 1))
+        rs = spec_mod.from_stored(spec_blob, _parse_offline_args)
         if rs is not None:
+            rs = spec_mod.resume_from_cli(
+                rs, _parse_offline_args(argv), argv=argv)
             active = bool(rs.active or rs.ports or rs.vhost or rs.crawl
                           or rs.brute)
             out.update({
@@ -344,7 +328,11 @@ def _offline_resume_preview(argv: list[str], spec_mod) -> dict:
                            "task_timeout_sec": rs.task_timeout,
                            "tool_timeout_sec": rs.tool_timeout,
                            "engines": rs.engines},
+                "argv": rs.to_worker_argv(),
             })
+            out["_effective_spec"] = rs
+    except ValueError as exc:
+        out.update(source="rejected", error="resume rejected: " + str(exc))
     except Exception as exc:
         out["effective_error"] = str(exc)[:200]
     return out
@@ -1841,7 +1829,7 @@ def _dedupe_payload(args) -> dict:
     Display/budget-only switches are excluded so re-asking for the same target
     reuses the in-flight job instead of starting a second collection.
     """
-    return {
+    payload = {
         "engagement": ENGAGEMENT,
         "task": os.environ.get("FINDINFO_TASK", ""),
         "home": str(core.HOME),
@@ -1857,6 +1845,12 @@ def _dedupe_payload(args) -> dict:
         "no_icp": bool(args.no_icp), "no_onepass": bool(args.no_onepass),
         "brute_wordlist": args.brute_wordlist, "brute_bandwidth": args.brute_bandwidth,
     }
+    # Missing flags on pre-RunSpec jobs meant False. Omit those defaults so
+    # adding these fields does not invalidate an otherwise identical old key.
+    for field in ("no_mapping", "remap"):
+        if getattr(args, field, False):
+            payload[field] = True
+    return payload
 
 
 
@@ -1874,7 +1868,8 @@ _TRACKED_FLAGS = {
 # candidate (RunSpec.resume_patch raises), never a silent repoint of the same
 # run id at a different target.
 _IDENTITY_FLAGS = ("--name", "--domain", "--engines", "--no-icp",
-                   "--no-onepass", "--active", "--ports", "--vhost",
+                   "--no-onepass", "--no-mapping", "--remap",
+                   "--active", "--ports", "--vhost",
                    "--crawl", "--brute")
 
 
@@ -1903,18 +1898,11 @@ def _spec_from_stored(spec: dict) -> "spec_mod.RunSpec":
     flag keep that flag's parser default -- the same semantics the worker
     replay itself would give it.
     """
-    rs = None
-    if spec.get("run_spec"):
-        try:
-            rs = spec_mod.RunSpec.from_json(json.dumps(spec["run_spec"]))
-        except (ValueError, TypeError):
-            rs = None
-    if rs is None and spec.get("argv"):
-        parsed = build_parser().parse_args(list(spec["argv"]))
-        rs = spec_mod.from_cli(parsed)
-    if rs is None:
-        raise core.FindInfoError("stored job spec has no runnable identity")
-    return rs
+    try:
+        return spec_mod.from_stored(
+            spec, lambda argv: build_parser().parse_args(argv))
+    except (ValueError, TypeError) as exc:
+        raise core.FindInfoError(str(exc)) from None
 
 
 def _run_paths(rd: Path) -> dict:
@@ -2051,10 +2039,10 @@ def _start_background_locked(args, payload, key) -> int:
 def _resume_effective_spec(stored_spec: dict, args) -> dict:
     """The effective RunSpec a resume would run with (ONE pure function).
 
-    Both the real resume and `run --resume ... --dry-run` call this, so the
-    preview cannot describe a different target/scope/limits than the resume
-    actually applies (F16). Pure: reads the stored spec dict and the parsed
-    args, returns {argv, budget, task_timeout, run_spec, effective} or raises
+    This runtime wrapper and the cold `run --resume ... --dry-run` path both
+    use spec.resume_from_cli, so explicit identity and limit patches have the
+    same semantics (F16). Reads the stored spec dict and the parsed args,
+    returns {argv, budget, task_timeout, run_spec, effective} or raises
     FindInfoError for an identity/schema violation. It does not touch state.
 
     Rules (docs par.4): only explicitly typed limit flags may patch the stored
@@ -2062,57 +2050,19 @@ def _resume_effective_spec(stored_spec: dict, args) -> dict:
     stored one is refused.
     """
     spec = dict(stored_spec or {})
-    explicit = set(getattr(args, "_explicit", ()) or ())
-    ident_typed = set(getattr(args, "_explicit_identity", ()) or ())
-    # Defence in depth: a caller that did not go through main() (an embedding,
-    # a test harness) may not have run _mark_explicit. The parsed namespace
-    # still carries the typed values, so fall back to "the value differs from
-    # the parser default" for the limit fields -- an explicit `--rounds 3` must
-    # never be dropped because bookkeeping was skipped.
-    _LIMIT_DEFAULTS = {"rounds": 1, "time_budget": 0.0, "task_timeout": 0.0,
-                       "tool_timeout": 0, "force_stage": False}
-    for f, default in _LIMIT_DEFAULTS.items():
-        val = getattr(args, f, None)
-        if val is not None and val != default:
-            explicit.add(f)
-    effective_rs = None
-    if explicit or ident_typed:
-        stored = _spec_from_stored(spec)
-        if ident_typed:
-            from_cli_spec = spec_mod.from_cli(args)
-            changed = {f: (getattr(from_cli_spec, f, None),
-                           getattr(stored, f, None))
-                       for f in spec_mod.RunSpec.IDENTITY_FIELDS
-                       if getattr(from_cli_spec, f, None) !=
-                       getattr(stored, f, None)}
-            if changed and any(f in ("name", "domain") or
-                               getattr(args, f, None) not in
-                               (None, False, "", (), [])
-                               for f in changed):
-                raise core.FindInfoError(
-                    "resume rejected: identity/scope flags changed for an "
-                    "existing job (start a new run instead): " +
-                    json.dumps({k: v for k, v in changed.items()}, default=str))
-        if explicit:
-            requested = dataclasses.replace(
-                stored,
-                **{f: getattr(args, f, None) for f in explicit
-                   if getattr(args, f, None) is not None})
-            try:
-                effective_rs = stored.resume_patch(requested)
-            except ValueError as exc:
-                raise core.FindInfoError("resume rejected: " + str(exc)) from None
-    if effective_rs is not None:
-        spec["argv"] = effective_rs.to_worker_argv()
-        spec["budget"] = {"rounds": effective_rs.rounds,
-                          "time_budget_sec": effective_rs.time_budget,
-                          "task_timeout_sec": effective_rs.task_timeout,
-                          "tool_timeout_sec": effective_rs.tool_timeout}
-        spec["task_timeout"] = effective_rs.task_timeout
-        if spec.get("run_spec") is not None:
-            spec["run_spec"] = json.loads(effective_rs.to_json())
-    spec["_effective_spec"] = (effective_rs if effective_rs is not None
-                               else _spec_from_stored(spec))
+    try:
+        effective_rs = spec_mod.resume_from_cli(_spec_from_stored(spec), args)
+    except ValueError as exc:
+        raise core.FindInfoError("resume rejected: " + str(exc)) from None
+    spec["argv"] = effective_rs.to_worker_argv()
+    spec["budget"] = {"rounds": effective_rs.rounds,
+                      "time_budget_sec": effective_rs.time_budget,
+                      "task_timeout_sec": effective_rs.task_timeout,
+                      "tool_timeout_sec": effective_rs.tool_timeout}
+    spec["task_timeout"] = effective_rs.task_timeout
+    if spec.get("run_spec") is not None:
+        spec["run_spec"] = json.loads(effective_rs.to_json())
+    spec["_effective_spec"] = effective_rs
     return spec
 
 
@@ -2373,6 +2323,9 @@ def _current_attempt() -> int:
 
 def _run_pipeline(args) -> int:
     """The collection pipeline itself (foreground, or inside a worker)."""
+    max_seed = int(getattr(args, "max_seed", 0))
+    if max_seed < 0:
+        raise core.FindInfoError("--max-seed must be >= 0 (0 means all seed domains)")
     store = core.Store()
     try:
         work.ensure_schema(store)
@@ -2449,7 +2402,7 @@ def _run_pipeline(args) -> int:
                         result={"companies": len(r.get("companies", [])),
                                 "icp": len(r.get("icp", [])),
                                 "domains": len(r.get("domains", []))})
-                if r.get("anchor_failed"):
+                if r.get("anchor_failed") and not getattr(args, "no_mapping", False):
                     # ENScan could NOT anchor the target (aiqicha has no such
                     # keyword, or answered with lookalikes only). The operator's
                     # rule: do not stop here -- the NAME is still the best
@@ -2465,6 +2418,7 @@ def _run_pipeline(args) -> int:
                     _probe = mapdispatch.resolve_by_name(
                         store, summary.get("_run_public_id") or "",
                         args.name, engines=getattr(args, "engines", None),
+                        remap=bool(getattr(args, "remap", False)),
                         timeout=tool_timeout or 0,
                         ledger=summary.get("_ledger"))
                     r = dict(r)
@@ -2544,9 +2498,14 @@ def _run_pipeline(args) -> int:
                                 "identity_ambiguous": True,
                                 "subject_candidates": (r.get("companies") or [])[:10]})
                 return r
+            _entity_inputs = {"name": args.name, "invest": args.invest,
+                              "deep": args.deep}
+            for _flag in ("no_mapping", "remap"):
+                if getattr(args, _flag, False):
+                    _entity_inputs[_flag] = True
             _ok_entity, _entity_res = _stage(
                 store, run_dir, summary, "entity",
-                {"name": args.name, "invest": args.invest, "deep": args.deep},
+                _entity_inputs,
                 args, _entity,
                 lambda r: {"companies": len(r.get("companies", [])),
                            "icp": len(r.get("icp", [])),
@@ -2745,11 +2704,9 @@ def _run_pipeline(args) -> int:
                           stage_index=1, stage_total=1, **_terminal)
             out(summary)
             return 5
-        # Order matters: the domains the caller named come FIRST, then the ones
-        # entity anchoring discovered. certs/subs/brute only walk the first
-        # --max-seed entries, and a company anchor can surface hundreds of
-        # unrelated domains (ICP rows, CDN hosts) -- without this ordering a run
-        # with --domain example.com would spend its cert budget on app.chaoxing.com.
+        # Explicit seeds come first, followed by the approved entity anchors.
+        # By default every seed is expanded; an explicit positive --max-seed
+        # opts into a breadth budget while preserving this priority order.
         named = [core.canon_domain(d) for d in (args.domain or [])]
         named = [d for d in named if d]
         discovered = [d for d in domains if d not in named]
@@ -2788,11 +2745,11 @@ def _run_pipeline(args) -> int:
                                passivity="passive", parent=d)
             _attach(store, summary, "domain", d, producer="seed:user",
                     upstream="seed:user", route=work.ROUTE_DNS)
-        seeds = domains[: args.max_seed]
-        if len(named) > args.max_seed:
+        seeds = domains[:max_seed] if max_seed else list(domains)
+        if max_seed and len(named) > max_seed:
             core.log("notice: " + str(len(named)) + " named domains but --max-seed " +
                      str(args.max_seed) + "; only the first " + str(args.max_seed) +
-                     " get certs/subs (raise --max-seed to widen)")
+                     " get onepass/certs/subs/brute (use --max-seed 0 for all)")
 
         # ACTIVE SCOPE MODEL: only what the caller asked for (--domain args plus
         # the company anchor's ENScan domains) is actively probed. Assets merely
@@ -2950,7 +2907,7 @@ def _run_pipeline(args) -> int:
                 icp = {"dispatched": 0, "reused": 0, "failures": [],
                        "truncated_sources": [], "skipped_engines": [],
                        "results": []}
-                if icp_codes:
+                if icp_codes and not getattr(args, "no_icp", False):
                     icp = mapdispatch.ask_all(
                         store, summary["_run_public_id"], "icp", icp_codes,
                         engines=_map_engines, remap=_remap, timeout=tool_timeout,
@@ -3017,7 +2974,9 @@ def _run_pipeline(args) -> int:
                 return res
 
             _stage(store, run_dir, summary, "mapping",
-                   {"seeds": list(named) + list(scope), "codes": list(icp_codes),
+                   {"seeds": list(named) + list(scope),
+                    "codes": ([] if getattr(args, "no_icp", False)
+                              else list(icp_codes)),
                     "engines": args.engines, "remap": _remap},
                    args, _mapping,
                    lambda r: {k: r[k] for k in
@@ -3639,11 +3598,7 @@ def cmd_dry_run(args) -> int:
                 rs = eff_rs
                 active = bool(rs.active or rs.ports or rs.vhost or rs.crawl
                               or rs.brute)
-                planned = _plan_stages(spec_mod.RunSpec(
-                    name=rs.name, domain=rs.domain, task=rs.task,
-                    active=active, ports=rs.ports, vhost=rs.vhost,
-                    crawl=rs.crawl, brute=rs.brute, no_icp=rs.no_icp,
-                    no_onepass=rs.no_onepass), active)
+                planned = _plan_stages(rs, active)
             effective = {"source": "job.json",
                          "run_id": spec_blob.get("run_id"),
                          "attempt": spec_blob.get("attempt"),
@@ -4079,7 +4034,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: an answered question is reused, never re-billed)")
     rn.add_argument("--no-onepass", action="store_true", help="skip the onepass stage")
     rn.add_argument("--top-ports", type=int, default=1000)
-    rn.add_argument("--max-seed", type=int, default=5)
+    rn.add_argument("--max-seed", type=int, default=0,
+                    help="seed-domain expansion cap (0 = all, default; positive = first N)")
     rn.add_argument("--max-vhost-ips", type=int, default=10)
     rn.add_argument("--force-stage", action="store_true",
                     help="ignore finished-stage checkpoints and re-run every stage")

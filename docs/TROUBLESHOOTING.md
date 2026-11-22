@@ -31,6 +31,7 @@
 |---|---|---|
 | `timed_out: true` + `state: running` | Only **this wait window** ended; the job is still running | Keep `wait`ing on the same run_id; **do not restart, do not paste the same status again** |
 | `changed: true` + `state: running` | Progress happened | You may give the user a one-line stage summary (stage name/counts), then keep waiting |
+| Repeated `wait --since` calls | Continue from the returned `cursor`, rather than reusing the previous request's value | Pass each response's `cursor` into the next `--since`; heartbeat-only `seq` changes are not progress |
 | `state: completed` | Finished | Read `result`/`coverage`, move to delivery |
 | `state: failed` | Failed | Read `coverage.failed_stages` + `last_error`, retry with `run --resume <run_id>` |
 | `state: cancelled` | Cancelled | State what was already collected; do not restart |

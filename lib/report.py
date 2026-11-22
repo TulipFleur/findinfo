@@ -1411,7 +1411,21 @@ BRIEF_MAX_COVERAGE = 40
 BRIEF_MIN_BYTES = 512
 
 
-def fit_brief(brief: dict, max_bytes, ascii_safe=None) -> dict:
+def _brief_arrays(value, path=()):
+    """Walk retained arrays; omitted parent rows need only their parent cut."""
+    if isinstance(value, list):
+        yield path, value
+        for index, item in enumerate(value):
+            yield from _brief_arrays(item, path + (str(index),))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not path and key == "truncated":
+                continue
+            yield from _brief_arrays(item, path + (str(key),))
+
+
+def fit_brief(brief: dict, max_bytes, ascii_safe=None, *,
+              trailing_newline=True) -> dict:
     """Final fit+measure of a COMPLETE brief, using the stdout encoder.
 
     Call this after every section (coverage, metered, note) has been merged:
@@ -1430,19 +1444,71 @@ def fit_brief(brief: dict, max_bytes, ascii_safe=None) -> dict:
         ascii_safe = core.emit_ascii_default()
     brief.setdefault("truncated", {})
     brief["brief_max_bytes"] = max_bytes
-    brief["truncated"].update(_shrink_brief(brief, max_bytes, ascii_safe))
-    # Fixpoint: the size number is part of the document, so writing it can
-    # change its own digit count. Iterate until the value is stable AND fits.
+    # Save totals BEFORE any fit pass mutates arrays. Earlier explicit caps
+    # and earlier fit_brief calls may already have recorded a larger total.
+    totals = {path: len(array) for path, array in _brief_arrays(brief)}
+    for path, total in (
+            (("top_hosts",), brief.get("top_hosts_total")),
+            (("internal_services",), brief.get("internal_services_total")),
+            (("leaks", "domains"), brief.get("leaks", {}).get("domains_total")),
+            (("leaks", "ips"), brief.get("leaks", {}).get("ips_total")),
+            (("coverage", "unavailable"),
+             brief.get("coverage", {}).get("unavailable_total"))):
+        if isinstance(total, int):
+            totals[path] = max(totals.get(path, 0), total)
+    for path in totals:
+        previous = brief["truncated"].get(".".join(path))
+        if isinstance(previous, dict) and isinstance(previous.get("total"), int):
+            totals[path] = max(totals[path], previous["total"])
+
+    def record_array_cuts():
+        # Every successful payload describes its FINAL arrays, even if a
+        # later shrink pass emptied a list that an earlier pass kept at one.
+        retained = dict(_brief_arrays(brief))
+        for path in totals:
+            if path not in retained:
+                # The parent array's cut accounts for the whole omitted row.
+                brief["truncated"].pop(".".join(path), None)
+        for path, array in retained.items():
+            total = totals.get(path, len(array))
+            if len(array) < total:
+                key = ".".join(path)
+                previous = brief["truncated"].get(key)
+                cut = dict(previous) if isinstance(previous, dict) else {}
+                cut.update(kept=len(array), total=total)
+                brief["truncated"][key] = cut
+
+    brief["truncated"].update(_shrink_brief(
+        brief, max_bytes, ascii_safe, trailing_newline))
+
+    def measure():
+        # The size number is part of the document. Settle its digit count
+        # before testing the ceiling, including the truncation metadata.
+        for _ in range(8):
+            size = _brief_size(brief, ascii_safe, trailing_newline)
+            if brief.get("brief_bytes") == size:
+                return size
+            brief["brief_bytes"] = size
+        raise core.FindInfoError("could not measure brief_bytes consistently")
+
+    # Truncation metadata consumes bytes too. Reconcile it before measuring
+    # and repeat the tail fit if those truthful counters cross the ceiling.
     for _ in range(8):
-        size = _brief_size(brief, ascii_safe)
-        if brief.get("brief_bytes") == size and size <= max_bytes:
-            break
-        brief["brief_bytes"] = size
-        if size > max_bytes:
-            brief["truncated"].update(_shrink_brief(brief, max_bytes,
-                                                    ascii_safe))
-    else:
-        brief["brief_bytes"] = _brief_size(brief, ascii_safe)
+        record_array_cuts()
+        size = measure()
+        if size <= max_bytes:
+            return brief
+        _shrink_brief_overflow(brief, max_bytes, ascii_safe, trailing_newline)
+    record_array_cuts()
+    size = measure()
+    if size > max_bytes:
+        # Identity, exact counts and the remaining stage verdict must not be
+        # silently corrupted to manufacture a successful bounded response.
+        raise core.FindInfoError(
+            "max_bytes cannot hold the required brief identity, counts and "
+            "coverage (required " + str(size) + ", max_bytes " + str(max_bytes)
+            + "); raise --max-bytes or narrow --match; use status --run <run_id> "
+            "for stage details")
     return brief
 
 
@@ -1627,8 +1693,9 @@ def build_brief(data, top=None, leak_limit=None, max_bytes=None,
         brief["truncated"]["internal_services"] = {
             "kept": len(brief["internal_services"]), "total": len(internal),
             "hint": "the full list is in report --with-json, or assets --export"}
-    for key in ("domains", "ips"):
-        total = brief["leaks"][key + "_total"]
+    for key in ("domains", "ips", "private_ips"):
+        total = (len(leaks.get(key) or []) if key == "private_ips"
+                 else brief["leaks"][key + "_total"])
         kept = len(brief["leaks"][key])
         if total > kept:
             brief["truncated"]["leaks." + key] = {"kept": kept, "total": total}
@@ -1646,17 +1713,23 @@ def build_brief(data, top=None, leak_limit=None, max_bytes=None,
     return fit_brief(brief, max_bytes, ascii_safe)
 
 
-def _brief_size(brief, ascii_safe=None) -> int:
+def _encode_brief(brief, ascii_safe=None, trailing_newline=True) -> str:
+    blob = core.encode_json_line(brief, ascii_safe)
+    return blob if trailing_newline else blob[:-1]
+
+
+def _brief_size(brief, ascii_safe=None, trailing_newline=True) -> int:
     """Real stdout bytes of this brief (the SAME encoder emit() uses).
 
     Includes the separators and the trailing newline, and honours the
     ASCII/UTF-8 emission mode: brief_bytes is the true byte count an agent
     reads on stdout, not a differently-encoded approximation (F14).
     """
-    return len(core.encode_json_line(brief, ascii_safe).encode("utf-8"))
+    return len(_encode_brief(brief, ascii_safe, trailing_newline).encode("utf-8"))
 
 
-def _shrink_brief(brief, max_bytes, ascii_safe=None) -> dict:
+def _shrink_brief(brief, max_bytes, ascii_safe=None,
+                  trailing_newline=True) -> dict:
     """Cut the cheapest things first until the brief fits, recording each cut.
 
     Order matters: prose goes before findings, findings go before counts, and
@@ -1666,24 +1739,25 @@ def _shrink_brief(brief, max_bytes, ascii_safe=None) -> dict:
     cuts = {}
 
     def fits():
-        return _brief_size(brief, ascii_safe) <= max_bytes
+        return _brief_size(brief, ascii_safe, trailing_newline) <= max_bytes
 
     if fits():
         return cuts
 
     # 1. prose first
-    brief.pop("note", None)
-    if fits():
+    if "note" in brief:
+        brief.pop("note")
         cuts["note"] = "prose omitted to fit the byte ceiling"
+    if fits():
         return cuts
 
     # 2. leak examples -- cut by count first, the counts are never lost
     for key, total_key in (("domains", "domains_total"), ("ips", "ips_total"),
                            ("private_ips", None)):
         arr = list(brief["leaks"].get(key) or [])
+        brief["leaks"][key] = arr
         while arr and not fits():
             arr.pop()
-        brief["leaks"][key] = arr
         if total_key:
             # only a real drop counts: a total shared with another array
             # would otherwise mark an array that lost nothing
@@ -1765,6 +1839,88 @@ def _shrink_brief(brief, max_bytes, ascii_safe=None) -> dict:
     return cuts
 
 
+def _shrink_brief_overflow(brief, max_bytes, ascii_safe, trailing_newline):
+    """Bound variable prose/arrays left after the normal finding-first fit.
+
+    Stage names, run/source identity and exact counts survive. A long or
+    unexpected required field can still make the envelope impossible; the
+    final encoder check in fit_brief then refuses instead of emitting it.
+    Rebuild nested values so fitting does not shorten the persisted coverage
+    snapshot or the caller's report data through shared references.
+    """
+    cuts = brief["truncated"]
+    marker = cuts.setdefault("byte_budget", {
+        "hint": "stage details: status --run <run_id>; full data: report --with-json or assets --export"})
+    shortened = 0
+    identity = {"schema", "generated_at", "source", "run_id", "stage", "host",
+                "ip", "domain", "engagement", "match", "domains", "ips",
+                "private_ips", "not_run_stages", "skipped_stages"}
+
+    def shorten(value, key=""):
+        nonlocal shortened
+        if isinstance(value, str):
+            if key not in identity and len(value) > 160:
+                shortened += 1
+                return value[:157] + "..."
+            return value
+        if isinstance(value, dict):
+            return {k: shorten(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [shorten(v, key) for v in value]
+        return value
+
+    for key in ("scope", "environment", "coverage", "top_hosts",
+                "internal_services", "leaks", "next_steps", "metered"):
+        if key in brief:
+            brief[key] = shorten(brief[key])
+    if shortened:
+        marker["shortened_strings"] = marker.get("shortened_strings", 0) + shortened
+
+    def fits():
+        return _brief_size(brief, ascii_safe, trailing_newline) <= max_bytes
+
+    # Keep at least one scope/stage identity. Every shortened array records
+    # the original total, including when fit_brief is called a second time.
+    for section, key, minimum in (
+            ("scope", "match", 1),
+            ("coverage", "failed_stages", 1),
+            ("coverage", "partial_stages", 1),
+            ("coverage", "not_run_stages", 1),
+            ("coverage", "skipped_stages", 1),
+            ("coverage", "unavailable", 0),
+            ("environment", "warnings", 0),
+            (None, "top_hosts", 1),
+            (None, "internal_services", 0),
+            (None, "next_steps", 1)):
+        container = brief.get(section, {}) if section else brief
+        arr = container.get(key)
+        if not isinstance(arr, list):
+            continue
+        path = (section + "." if section else "") + key
+        previous = cuts.get(path)
+        total = max(len(arr), previous.get("total", 0)
+                    if isinstance(previous, dict) else 0)
+        while len(arr) > minimum and not fits():
+            del arr[max(minimum, len(arr) // 2):]
+            cuts[path] = {"kept": len(arr), "total": total}
+        if fits():
+            return
+
+    # Optional detailed maps can grow independently of their row counts.
+    # Their omission is a display cut, never a change to the run verdict.
+    for container, key, path in (
+            (brief.get("metered", {}), "by_engine", "metered.by_engine"),
+            (brief.get("metered", {}), "blocked_engines", "metered.blocked_engines"),
+            (brief.get("coverage", {}), "mapping", "coverage.mapping"),
+            (brief.get("coverage", {}).get("metered", {}), "by_engine",
+             "coverage.metered.by_engine")):
+        if fits():
+            return
+        if isinstance(container, dict) and key in container:
+            container.pop(key)
+            cuts[path] = "detail omitted; see status --run <run_id>"
+
+
 def write_brief(data, base, top=None, leak_limit=None, max_bytes=None,
                 coverage=None) -> dict:
     """Write report.brief.json next to report.json; returns path + stats.
@@ -1776,15 +1932,9 @@ def write_brief(data, base, top=None, leak_limit=None, max_bytes=None,
     brief = build_brief(data, top=top, leak_limit=leak_limit,
                         max_bytes=max_bytes, coverage=coverage, ascii_safe=False)
     p = Path(base) / "report.brief.json"
-    # The FILE has no trailing newline, so it is measured without one; stdout
-    # (brief command) adds the newline and reports that byte count instead.
-    blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
-    for _ in range(8):
-        size = len(blob.encode("utf-8"))
-        if brief.get("brief_bytes") == size:
-            break
-        brief["brief_bytes"] = size
-        blob = json.dumps(brief, ensure_ascii=False, separators=(",", ":"))
+    # The file shares the stdout encoder, but has no trailing newline.
+    fit_brief(brief, max_bytes, ascii_safe=False, trailing_newline=False)
+    blob = _encode_brief(brief, ascii_safe=False, trailing_newline=False)
     p.write_text(blob, encoding="utf-8")
     return {"path": str(p), "bytes": len(blob.encode("utf-8")),
             "truncated": brief["truncated"]}

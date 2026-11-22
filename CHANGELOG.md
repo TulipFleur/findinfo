@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### 能力评审修复（docs/CAPABILITY-REVIEW-2026-11-22.md）
+
+- **`--no-mapping` / `--remap` 在每个入口都生效**。两者成为 `RunSpec` 字段：后台
+  worker 的 argv 重放、`run --resume`、离线 `--dry-run` 预览都会带上，重放时不再
+  丢失；按名称兜底同样遵守 `--no-mapping`，并把 `--remap` 传给付费派发。
+- **`--max-seed` 默认 0，展开全部已批准种子**。正数仍是显式预算；旧任务里没有记录
+  该字段的 spec 按当时的隐含上限 5 读取，升级不会扩大已有任务的范围。
+- **`wait` 每次返回最新进度标记作为 `cursor`**，只有大于基线的标记才算新进展；
+  心跳推进的 seq 不再被当成变化。
+- **brief 用最终 stdout 编码器测量并裁剪**：长阶段错误、长 scope 也保证单行不超过
+  上限，被清空的数组仍保留原始总数。
+- 文档：SKILL.md 描述与流程、TOOLS / API-KEYS / TROUBLESHOOTING、AGENT.txt 的付费
+  测绘步骤；新增能力评审报告与滴滴收集流程说明。
+
 ### 测绘每任务只做一次
 
 - **测绘阶段合并、任务级账本、子进程免 key**（`6e190dc`）。来源：`37953fd`
@@ -27,7 +41,7 @@
   `assets(kind=app)` 落库（含归属主体），`assets --kind app`、xlsx 的「APP/小程序」
   sheet 均可查。存储逻辑抽成 `tools.store_approved_entities()`，不必启动 ENScan
   二进制即可测试。
-- **ENScan 锚不到目标时，改由引擎按名称收集主域名**。过去 `anchor_failed`（aqicha
+- **ENScan 锚不到目标时，改由引擎按名称收集主域名**（`425355c`）。过去 `anchor_failed`（aqicha
   无此关键词，或只返回同名干扰项）直接抛 `StageError` 结束，把唯一可用的事实
   （公司名）丢掉。现在不终止：用名称向各引擎发 `domain="<名称>"`，答案以
   `mapping:name` 落库并挂在由名称派生的主体引用下，再由正常种子流程接管；阶段结果
@@ -103,6 +117,7 @@
   一个真实终态里必然存在的字段缺失（worker e2e 约 1/6 复现）。现在后台由 worker
   单次围栏写入终态，前台由 pipeline 自己写并给出退出码。修复后连跑 18 次 0 失败。
 - 文档示例全部补齐范围参数，并新增测试保证文档中的读库命令都带 scope。
+- changelog 补引见 `2b79f90`。
 
 ## [0.8.1] - 2026-11-21
 

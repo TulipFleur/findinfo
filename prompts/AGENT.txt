@@ -66,6 +66,11 @@ python findinfo.py --task {{TASK}} passive --domain {{TARGET}} --tool-timeout 18
 # 3) multi-source passive subdomains
 python findinfo.py --task {{TASK}} subs --domain {{TARGET}} --tool-timeout 180
 
+# 3b) PAID mapping: the ONLY quota-spending step. Returns DOMAINS + IPs only --
+# certificates come from (1) and filings from 4.1; it does not replace them.
+# One question per task: re-running reuses the ledger, `--remap` pays again.
+python findinfo.py --task {{TASK}} map --domain {{TARGET}} --engines fofa,quake,hunter,shodan
+
 # 4) resolve + wildcard filtering (mandatory; skipping it turns 300 rows into 30k fake assets)
 python findinfo.py --task {{TASK}} dns --from-store --scope {{TARGET}} --tool-timeout 300
 

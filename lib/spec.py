@@ -61,15 +61,21 @@ class RunSpec:
     entity_timeout: int = 1200
     engines: str = "fofa,quake,hunter,shodan,censys"
     top_ports: int = 1000
-    max_seed: int = 5
+    max_seed: int = 0  # 0 = expand every approved seed; positive values opt into a cap
     max_vhost_ips: int = 10
     no_icp: bool = False
     no_onepass: bool = False
+    no_mapping: bool = False
+    remap: bool = False
     force_stage: bool = False
     rounds: int = 1
     time_budget: float = 0.0
     task_timeout: float = 0.0
     tool_timeout: int = 0
+
+    def __post_init__(self):
+        if self.max_seed < 0:
+            raise ValueError("max_seed must be >= 0 (0 means all seed domains)")
 
     # ---------------------------------------------------------------- identity
     @property
@@ -102,6 +108,7 @@ class RunSpec:
                   "branch", "depth",
                   "invest", "deep", "entity_timeout", "engines", "top_ports",
                   "max_seed", "max_vhost_ips", "no_icp", "no_onepass",
+                  "no_mapping", "remap",
                   "rounds", "time_budget", "task_timeout", "tool_timeout",
                   "force_stage"):
             a, b = getattr(self, f), getattr(other, f)
@@ -148,6 +155,10 @@ class RunSpec:
             argv.append("--no-icp")
         if self.no_onepass:
             argv.append("--no-onepass")
+        if self.no_mapping:
+            argv.append("--no-mapping")
+        if self.remap:
+            argv.append("--remap")
         if self.force_stage:
             argv.append("--force-stage")
         if self.rounds != 1:
@@ -168,6 +179,7 @@ class RunSpec:
         "force_stage"))
     IDENTITY_FIELDS = frozenset((
         "name", "domain", "task", "engines", "no_icp", "no_onepass",
+        "no_mapping", "remap",
         "active", "ports", "vhost", "crawl", "brute"))
 
     def resume_patch(self, requested: "RunSpec") -> "RunSpec":
@@ -248,13 +260,73 @@ def from_cli(args) -> RunSpec:
         engines=getattr(args, "engines",
                         "fofa,quake,hunter,shodan,censys"),
         top_ports=int(getattr(args, "top_ports", 1000)),
-        max_seed=int(getattr(args, "max_seed", 5)),
+        max_seed=int(getattr(args, "max_seed", 0)),
         max_vhost_ips=int(getattr(args, "max_vhost_ips", 10)),
         no_icp=bool(getattr(args, "no_icp", False)),
         no_onepass=bool(getattr(args, "no_onepass", False)),
+        no_mapping=bool(getattr(args, "no_mapping", False)),
+        remap=bool(getattr(args, "remap", False)),
         force_stage=bool(getattr(args, "force_stage", False)),
         rounds=int(_explicit_or(args, "rounds", 1)),
         time_budget=float(_explicit_or(args, "time_budget", 0)),
         task_timeout=float(_explicit_or(args, "task_timeout", 0)),
         tool_timeout=int(_explicit_or(args, "tool_timeout", 0)),
     )
+
+
+def resume_from_cli(stored: RunSpec, args, *, argv=None) -> RunSpec:
+    """Apply only explicitly requested resume fields, without runtime imports.
+
+    The cold offline preview and the real resume share this conversion. An
+    absent identity flag keeps its stored value; parser defaults must never
+    make a same-domain resume look like a change of brand or source policy.
+    """
+    requested = from_cli(args)
+    if argv is None:
+        limits = set(getattr(args, "_explicit", ()) or ())
+        identity = {str(f).removeprefix("--").replace("-", "_")
+                    for f in (getattr(args, "_explicit_identity", ()) or ())}
+    else:
+        flags = {a.split("=", 1)[0] for a in argv}
+        limits = {f for f in RunSpec.RESUMABLE_LIMITS
+                  if "--" + f.replace("_", "-") in flags}
+        identity = {f for f in RunSpec.IDENTITY_FIELDS
+                    if "--" + f.replace("_", "-") in flags}
+    # Preserve the documented embedding fallback when _mark_explicit was not
+    # called. Non-default limits are an intentional request, never identity.
+    defaults = RunSpec()
+    limits.update(f for f in RunSpec.RESUMABLE_LIMITS
+                  if getattr(args, f, None) is not None
+                  and getattr(requested, f) != getattr(defaults, f))
+    fields = ((limits & RunSpec.RESUMABLE_LIMITS)
+              | (identity & RunSpec.IDENTITY_FIELDS))
+    patch = {f: getattr(requested, f) for f in fields
+             if getattr(args, f, None) is not None}
+    return stored.resume_patch(dataclasses.replace(stored, **patch))
+
+
+def from_stored(job: dict, parse_argv) -> RunSpec:
+    """Load a job without expanding the breadth of a legacy capped run.
+
+    New invocations use the current defaults. A stored spec/argv that omitted
+    max_seed was created when the implicit cap was five, so only this legacy
+    conversion supplies five. Explicit stored zero/five/other caps survive.
+    ``parse_argv`` is the entry point's parser; no runtime is imported here.
+    """
+    if job.get("run_spec"):
+        try:
+            payload = dict(job["run_spec"])
+            payload.setdefault("max_seed", 5)
+            return RunSpec.from_json(json.dumps(payload))
+        except (ValueError, TypeError):
+            pass
+    if job.get("argv"):
+        argv = list(job["argv"])
+        args = parse_argv(argv)
+        if not any(a == "--max-seed" or a.startswith("--max-seed=")
+                   for a in argv):
+            args.max_seed = 5
+        if not getattr(args, "task", "") and job.get("task"):
+            args.task = job["task"]
+        return from_cli(args)
+    raise ValueError("stored job spec has no runnable identity")

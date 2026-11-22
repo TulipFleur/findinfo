@@ -905,6 +905,8 @@ def _wait_payload(st, changed, timed_out, waited, start) -> dict:
         "changed": bool(changed), "timed_out": bool(timed_out),
         "waited_sec": waited, "seq": st.get("seq"),
         "progress_seq": st.get("progress_seq"),
+        "cursor": (st.get("progress_seq") if st.get("progress_seq") is not None
+                   else st.get("seq")),
         "alive": st.get("alive"), "interrupted": st.get("interrupted"),
         "stalled": st.get("stalled"),
         "reaped_by_host": st.get("reaped_by_host"),
@@ -935,7 +937,10 @@ def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict
     * without `--since`, the call blocks until a substantive change happens
       after it started.
 
-    A heartbeat bumps seq but neither the marker nor `changed`.
+    Every response returns the latest observed marker as `cursor`; pass that
+    value to the next call. A heartbeat bumps seq but neither the marker nor
+    `changed`. Accept an older caller's raw seq too: only a marker GREATER than
+    its baseline is new progress, never one left behind by heartbeats.
     """
     rd = resolve(ref)
     timeout = max(0.0, float(timeout if timeout is not None else 30.0))
@@ -959,25 +964,22 @@ def wait(ref, timeout: float = 30.0, since_seq=None, poll: float = 0.05) -> dict
         if marker is None:
             marker = st.get("seq")
         changed = (marker is not None and cursor is not None
-                   and marker != cursor)
+                   and marker > cursor)
         if st.get("terminal"):
             out = _wait_payload(st, changed, False,
                                 round(time.time() - start, 1), start)
             if legacy_marker:
                 out["note"] = ("this job predates the persisted progress cursor; "
                                "the comparison used seq as a one-time fallback")
-            out["cursor"] = cursor
             out["resync_recommended"] = bool(legacy_marker)
             return out
         if changed:
             out = _wait_payload(st, True, False,
                                 round(time.time() - start, 1), start)
-            out["cursor"] = cursor
             return out
         if time.time() - start >= timeout:
             out = _wait_payload(st, False, True,
                                 round(time.time() - start, 1), start)
-            out["cursor"] = cursor
             out["note"] = ("wait timeout means this wait window ended, not that "
                            "the job failed; keep waiting on the same run_id")
             return out

@@ -119,15 +119,12 @@ Each dispatch reports its `pages`. A response that fills the ceiling is reported
 - Mapping APIs (FOFA/Quake/Hunter/ZoomEye) share `MAPPING_API_INTERVAL_MS`, default 1500ms
 - Each (engine, question) is asked **once per task** (the `mapping` ledger). A second run, a later seed or a standalone
   `map` reuses the paid answer; `--remap` is the only way to ask again
-- `uncover` is always given an explicit `-limit` (`limits.mapping_rows`, default **10000**). Its own default of 100
-  silently truncated every query. The billing unit is the QUERY, not the row, so one full page costs the same as 100
-  rows while collecting far more; a page that fills the ceiling is reported as `truncated_sources`, never as a
-  complete answer
+- Central mapping always gives `uncover` an explicit `-limit` (`limits.mapping_rows`, default **3000**, with per-engine overrides). A full ceiling is reported as `truncated_sources`, never as a complete answer. The row ceiling is not a guarantee of one upstream request or a fixed bill: engine pagination and account rules differ; page counts are estimates unless credit measurement is enabled.
 - A missing key, or a key the provider rejects (401/403), **skips that engine** for the rest of the task. It is never an
   error, never exit 5, and never retried
 - On rate limiting (HTTP 429 / "frequently"): the source is marked `degraded` and the others continue; **quota is never burned on retries**
-- Recommended per-run cap: `--max-seed 5` (number of seed domains), so one run cannot drain the quota over hundreds of domains
-- Only **certificate transparency (CT)** responses are cached locally (`cache/certs/`, 7 days): re-runs of crt.sh / CertSpotter do not re-spend requests. Other stages (probe/subs/dns...) have no response cache; re-runs re-request
+- Seed expansion defaults to `--max-seed 0` (all approved seeds). A positive cap limits onepass/certs/subs/brute only; it does not cap paid mapping, which asks all scope seeds. Use `--no-mapping` to disable paid mapping; `limits.mapping_rows` controls each query's row ceiling.
+- **CT** responses are cached locally (`cache/certs/`, 7 days), and paid mapping answers persist in the task ledger for reuse. Other collectors (probe/subs/dns...) have no equivalent response cache; a stage that is not checkpoint-skipped re-requests.
 
 ## 7. Security checklist
 
