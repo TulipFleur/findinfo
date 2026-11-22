@@ -32,3 +32,21 @@ _rel/
 .tmprun/
 .playwright-mcp/
 .pytest_cache/
+
+# ProjectDiscovery binaries write a per-tool config.yaml into the CWD on first
+# run; a checkout that ran `httpx -version` once grew nine such directories and
+# they were committed by accident. They hold no credentials (every provider is
+# an empty list) and are regenerated on demand, so they must never be tracked.
+# `bin/config.yaml` (the aiqicha Cookie) is a SECRET and is already ignored.
+/cdncheck/
+/chaos/
+/dnsx/
+/httpx/
+/katana/
+/naabu/
+/subfinder/
+/uncover/
+
+# A shell wrote the literal text `%SystemDrive%` as a path (the variable was
+# never expanded), producing this empty tree in the checkout.
+/%SystemDrive%/
