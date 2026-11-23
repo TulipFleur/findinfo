@@ -142,3 +142,56 @@ def test_version_is_bumped_and_matches_skill_md():
     assert "## [" + version + "]" in cl, (
         "CHANGELOG has no section for VERSION " + version)
     assert "## [0.8.0]" in cl, "the 0.8.0 section must stay for history"
+
+
+# ------------------------------------------------- agent-facing docs only
+# Reviews, plans and dated snapshots describe the code AT A COMMIT. An agent
+# that finds "60/100, F01..F16" in the bundle takes fixed defects for the
+# present and stops trusting wait/pipeline. They stay in the source repo.
+DEV_ONLY_DOCS = (
+    "docs/REVIEW-2026-11-21.md", "docs/CAPABILITY-REVIEW-2026-11-22.md",
+    "docs/AUTOMATION-REPAIR.md", "docs/NON-DNS-REPAIR.md",
+    "docs/RELIABILITY-PLAN.md", "docs/DEVELOPMENT.md",
+    "docs/DIDI-COLLECTION-WORKFLOW.md", "CHANGELOG.md",
+)
+
+
+def test_reviews_plans_and_dated_docs_never_ship():
+    sh = _shipped()
+    import re
+    for platform in ("windows", "linux"):
+        files = set(sh.shipped_files(platform, ROOT))
+        leaked = [d for d in DEV_ONLY_DOCS if d in files]
+        assert not leaked, platform + " ships developer docs " + repr(leaked)
+        dated = [f for f in files if f.startswith("docs/")
+                 and re.search(r"\d{4}-\d{2}-\d{2}", f)]
+        assert not dated, platform + " ships dated docs " + repr(dated)
+    # the rule, not just today's list: a future dated review stays out too
+    assert sh.is_dev_doc("docs/REVIEW-2027-01-31.md")
+    assert sh.is_dev_doc("docs/CAPABILITY-REVIEW-2027-02-01.md")
+    assert not sh.is_dev_doc("docs/TOOLS.md")
+
+
+def test_every_link_in_the_bundle_resolves_inside_the_bundle():
+    """A shipped doc must not send the agent to a file the bundle lacks."""
+    import posixpath
+    import re
+    sh = _shipped()
+    link = re.compile(r"\]\(([^)\s#]+)(?:#[^)]*)?\)")
+    for platform in ("windows", "linux"):
+        files = set(sh.shipped_files(platform, ROOT))
+        broken = []
+        for doc in sorted(files):
+            if not (doc.endswith(".md") or doc.endswith(".txt")):
+                continue
+            text = (ROOT / doc).read_text(encoding="utf-8", errors="replace")
+            # a prompt template is pasted into a session that has cd'ed into
+            # the skill root, so its links are root-relative by design
+            base = "" if doc.startswith("prompts/") else posixpath.dirname(doc)
+            for target in link.findall(text):
+                if re.match(r"[a-z]+:", target):        # http:, https:, mailto:
+                    continue
+                path = posixpath.normpath(posixpath.join(base, target))
+                if path not in files and not (ROOT / path).is_dir():
+                    broken.append(doc + " -> " + target)
+        assert not broken, platform + " bundle has dangling links " + repr(broken)

@@ -8,7 +8,7 @@ license: MIT
 
 Give it a name, get an **evidence-backed asset graph**: an idempotent, resumable, multi-stage pipeline with confidence scoring — not "run subfinder once".
 
-Agent entry point. [Commands](docs/TOOLS.md), [data/scoring](docs/DATA-MODEL.md), [failures/recovery](docs/TROUBLESHOOTING.md).
+Agent entry point. [Commands](docs/TOOLS.md), [data/scoring](docs/DATA-MODEL.md), [failures/recovery](docs/TROUBLESHOOTING.md). Dated reviews and plans in the source repo are history, not current behaviour.
 
 ## 0. 30-second start
 
@@ -54,22 +54,19 @@ Every command writes **one JSON line to stdout** (for agents); progress and warn
 
 ## 1.5 A complete collection session (agent loop)
 
-**The full loop is in [prompts/AGENT.txt](prompts/AGENT.txt)** (a template for a fresh session; fill `{{TARGET}}`/`{{NAME}}`: self-check → authorisation → job → bounded waits → delivery → recovery). Essentials:
+**The one step-by-step loop is [prompts/AGENT.txt](prompts/AGENT.txt)** (self-check → authorisation → job → bounded waits → delivery → recovery); it is not repeated elsewhere. The four things not to get wrong:
 
-1. **First results, then depth**: `passive → certs → dns` yields a first pass in minutes, then deepen with `--active --vhost --crawl`.
-2. **Never block on the foreground**: long commands go `--background` + loop `wait --run <id> --timeout 30`; a timeout only ends that wait window — do not restart, do not declare completion early.
-   When `interrupted:true` comes back, check `reaped_by_host`: `true` = the host kills detached processes (background mode unusable here — switch to foreground with `--task-timeout` or hold the worker under a live parent; do not retry background); `false` = an ordinary crash, `run --resume`.
-3. **Trust only run_id**: across sessions/handovers use `runs` to find the run_id → `status --run <id>`; never rely on "the latest".
-4. **Exactly three terminal states**: `completed` (still check coverage for full vs partial) / `failed` / `cancelled`; there is no `done`. Exit code 5 = finished with failed stages, not success.
+1. **Never block on the foreground**: long work is `run --background`, then `wait --run <id> --timeout 30` until a terminal state; a timeout only ends that wait window — wait again on the same run_id, never restart.
+2. **Trust only run_id**: across sessions use `runs` → `status --run <id>`, never "the latest".
+3. **Three terminal states**: `completed` (check coverage: full vs partial) / `failed` / `cancelled`; exit code 5 = finished with failed stages. `interrupted:true` → AGENT.txt §6 (`reaped_by_host`).
+4. **Explicit authorisation before any active stage** (`probe`/`ports`/`vhost`/`crawl`/`brute`, `run --active`): without it run passive stages only and say so in the delivery.
 
 ```bash
-python findinfo.py --task myproj doctor                                                       # 1) self-check
-python findinfo.py --task myproj run --domain example.com --active --vhost --crawl --background --rounds 3   # 2) start, get run_id
-python findinfo.py --task myproj wait --run <run_id> --timeout 30                             # 3) bounded wait
-python findinfo.py --task myproj status --run <run_id>                                        # 4) result/coverage/next_steps
+python findinfo.py --task myproj doctor
+python findinfo.py --task myproj run --domain example.com --background
+python findinfo.py --task myproj wait --run <run_id> --timeout 30
+python findinfo.py --task myproj status --run <run_id>
 ```
-
-**Explicit authorisation before any active stage**: `probe`/`ports`/`vhost`/`crawl`/`brute` and `run --active` send real traffic to the target. Without confirmation run passive stages only and state in the delivery: "active stages not run: no authorisation confirmed".
 
 ## 1.7 Windows PowerShell vs POSIX
 
@@ -93,11 +90,11 @@ Stage 3   crawl    python findinfo.py crawl --from-store --domain example.com
         extract    python findinfo.py extract --url <js-url>          # JS/page leaks, then reflow
 ```
 
-Standalone equivalents above: `run` invokes adapters itself. `--max-seed 0` expands all seeds; positive N caps onepass/certs/subs/brute, not mapping. [Company branches and engine syntax](docs/DIDI-COLLECTION-WORKFLOW.md).
+Standalone equivalents above: `run` invokes adapters itself. `--max-seed 0` expands all seeds; positive N caps onepass/certs/subs/brute, not mapping. Engine query syntax: [docs/MAPPING-QUERIES.md](docs/MAPPING-QUERIES.md).
 
 **Key points**: eyeball the ENScan entity tree once; `passive`+`certs` is the fastest first pass; `dns` is mandatory (unfiltered wildcards turn 300 rows into 30k fake assets); **vhost has the best ROI** — Jenkins/GitLab/Swagger hide behind Host-header collisions; new domains/IPs from `crawl`+`extract` flow back in.
 
-Stable domains with `coverage.work_queue.outstanding > 0` still mean partial/work_pending. Succeeded bundles stay closed; HTML is not JS work. Counts may include cumulative scope data; reused mapping answers may acquire current graph observation times. Neither proves a new finding.
+A run is not finished while `coverage.work_queue.outstanding > 0` (partial/work_pending), even with a stable domain count; how to read counts and coverage: [docs/DATA-MODEL.md](docs/DATA-MODEL.md) §3.
 
 ## 3. Command quick reference
 
@@ -117,7 +114,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 
 `brief` is the single agent read API (≤32 KB, writes no files): counts / coverage gaps / top_hosts / internal_services / leaks / next_steps; truncated arrays report kept and total in `truncated`. `report.md` is a 5-minute human read, `report.html` a self-contained dashboard, `report.json` (`--with-json`) runs 600 KB+ on large targets — **do not read it into context**.
 
-**`truncated` / `coverage.known=false` never mean "data is complete"**: the former is display truncation, the latter means no run was read at all (**not** "no gaps"). `coverage.unavailable` also lists `unconfirmed_empty` (empty, maybe an error), `unsupported_engines` (not asked) and `truncated_sources` (upstream holds more rows). State conclusions with the gaps they describe; rules in [docs/DATA-MODEL.md](docs/DATA-MODEL.md).
+**Neither `truncated` nor `coverage.known=false` means "complete"**: state conclusions with the gaps `coverage` lists; the reading rules are [docs/DATA-MODEL.md](docs/DATA-MODEL.md) §3.
 
 ## 5. Hard rules (violating them is a bug)
 

@@ -63,6 +63,8 @@ no run was read at all, **which does not mean there are no gaps**), `top_hosts` 
 `next_steps`. Truncated arrays state their `kept` and `total` in `truncated` —
 **seeing truncated does not mean the data is complete; conclusions must be phrased around the gaps it reports**.
 
+**Counts are not news**: `counts` in `brief`/`report` cover the scope's cumulative store, not only what this run found; a mapping answer reused from the task ledger can carry the current observation time once it is re-attached to the graph. Neither a count nor a timestamp alone proves a new finding. A run is not finished while `coverage.work_queue.outstanding > 0` (`partial` / `work_pending`), however stable the domain count looks.
+
 **Source gaps in `coverage.unavailable`** (non-blocking; each lists ids, flattened into the brief's `unavailable` rows):
 `unconfirmed_empty` — `uncover:<engine>` dispatches that returned no rows (uncover reports an upstream syntax/auth
 error as rc=0 with no rows, so this is not proof that nothing exists); `unsupported_engines` — keyed engines that were
@@ -147,6 +149,8 @@ Reading rules:
   holder can neither write a result nor acknowledge. `commit_result` writes the
   result's membership + observations + the ack in one transaction under a
   valid lease.
+- A JS bundle that already succeeded is never re-opened, and an HTML page never
+  becomes pending JS work: only bundles count as JS obligations.
 - `stage_invocations` gets one row per dispatch (`dispatch_seq` orders them).
   A retry APPENDS; it never replaces the previous attempt's row, so history
   stays auditable. `effective_invocations` reads the latest dispatch of the

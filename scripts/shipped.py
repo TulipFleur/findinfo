@@ -12,6 +12,9 @@ Rules live here and nowhere else:
   * plus this platform's bin/<platform>/* (binaries are not tracked)
   * minus developer-only material (tests/, agent-records/, rust/ sources,
     the agent-record tool)
+  * minus reviews, plans and dated snapshots (is_dev_doc): they describe the
+    code at a commit, and an agent reading them takes fixed defects for the
+    present
   * minus files that only apply to the other platform (PLATFORM_ONLY)
   * minus secrets (SECRETS), always
 
@@ -21,6 +24,7 @@ both scripts can import it (file names contain dashes; they use importlib).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -46,6 +50,30 @@ DEV_DIRS = (
     "rust/",           # onepass sources; rebuild from the repo, not the bundle
     "deploy/",         # systemd units are per-platform (see PLATFORM_ONLY)
 )
+
+# Documents for the people who build findinfo, not for the agent that uses it.
+# Reviews and plans are snapshots of the code at a commit ("60/100, F01..F16",
+# "75/100"); in the agent's view they read as the present and steer it wrong
+# (distrusting wait, bypassing the pipeline). They stay in the source repo.
+DEV_DOCS = (
+    "CHANGELOG.md",                     # history; the release notes carry it
+    "docs/DEVELOPMENT.md",              # building and testing the skill
+    "docs/RELIABILITY-PLAN.md",         # design plan, partly superseded
+    "docs/AUTOMATION-REPAIR.md",        # repair plan snapshot
+    "docs/NON-DNS-REPAIR.md",           # repair plan snapshot
+    "docs/DIDI-COLLECTION-WORKFLOW.md",  # one target's walk-through
+)
+# Any review, and any doc whose NAME carries a date, is a snapshot by
+# convention: it never ships, so a new one cannot slip into the bundle.
+_DEV_DOC_PATTERNS = (re.compile(r"^docs/(?:[A-Z-]*REVIEW[A-Z-]*)[^/]*\.md$"),
+                     re.compile(r"^docs/[^/]*\d{4}-\d{2}-\d{2}[^/]*$"))
+
+
+def is_dev_doc(rel: str) -> bool:
+    """A developer document: listed in DEV_DOCS, a review, or dated."""
+    rel = rel.replace("\\", "/")
+    return rel in DEV_DOCS or any(p.match(rel) for p in _DEV_DOC_PATTERNS)
+
 
 # Single developer files.
 DEV_FILES = (
@@ -153,7 +181,7 @@ def shipped_files(platform: str, root: Path = ROOT) -> list:
     for rel in sorted(keep):
         if rel in excluded:
             continue
-        if _under(rel, DEV_DIRS):
+        if _under(rel, DEV_DIRS) or is_dev_doc(rel):
             continue
         # never ship the other platform's binaries even if they were tracked
         parts = rel.split("/")

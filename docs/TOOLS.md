@@ -950,33 +950,6 @@ and `provenance` normalizes it into a tool list with labels; onepass's many upst
 
 ---
 
-## Combined usage (the recommended agent workflow)
+## Combined usage
 
-```bash
-# 1. self-check
-python findinfo.py --task example-com doctor
-
-# 2. passive expansion (no target contact, run it fully first)
-python findinfo.py --task example-com entity --name "Example Corp"
-python findinfo.py --task example-com passive --from-store --scope example.com   # 15 sources in parallel
-python findinfo.py --task example-com certs --domain example.com
-python findinfo.py --task example-com icp --from-store --scope example.com
-python findinfo.py --task example-com subs --from-store --scope example.com
-python findinfo.py --task example-com dns --from-store --scope example.com
-
-# 3. glance at the asset graph, decide whether to continue
-python findinfo.py --task example-com assets --kind domain --limit 20
-
-# 4. active (only after authorisation is confirmed)
-python findinfo.py --task example-com probe --from-store --scope example.com --min-conf 0.7
-python findinfo.py --task example-com ipagg --scope example.com
-python findinfo.py --task example-com vhost --ip <candidate-ip> --from-store --domain example.com
-
-# 5. reflow
-python findinfo.py --task example-com crawl --from-store --domain example.com
-python findinfo.py --task example-com extract --from-store --domain example.com
-
-# 6. delivery (brief for the agent to read; report emits md/html for humans)
-python findinfo.py --task example-com brief --match example.com
-python findinfo.py --task example-com report --match example.com
-```
+The recommended agent workflow is written once, in [prompts/AGENT.txt](../prompts/AGENT.txt) ([SKILL.md](../SKILL.md) §1.5 has its four essentials). It is not repeated here: the copy that used to be here had drifted into foreground single-stage commands that SKILL.md §5 forbids.

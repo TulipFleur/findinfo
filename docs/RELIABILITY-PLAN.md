@@ -1,5 +1,7 @@
 # Reliable execution and delivery for agent consumers
 
+> **Design record, not a description of today's code.** Written on baseline `8ad6493` (2026-11-21) to explain why the run is shaped the way it is. Where it and the code disagree, the code, `SKILL.md` and the reference docs under `docs/` win; later changes are in `CHANGELOG.md`. Kept in the source repo only, not in the release bundle.
+
 Status: **implemented**. Batches A-G (typed results, RunSpec, work tables,
 identity, job fencing, metered ledger, registry/docs) landed on baseline
 `20dfca3`; the wiring batches that followed connected the runtime to every

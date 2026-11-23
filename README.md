@@ -221,7 +221,7 @@ Two externally visible behaviours changed in 0.8.0:
 
 Also, since 0.8.0 `doctor` reports missing keys as gaps instead of failures — stages with missing keys are coverage
 gaps, the run still completes and delivers; do **not** loop `--resume` on them (adding the key and re-running is what
-helps). Full history in [CHANGELOG.md](CHANGELOG.md).
+helps). Full history: `CHANGELOG.md` in the source repository (the release bundle does not carry it).
 
 ## Documentation
 
@@ -234,7 +234,7 @@ helps). Full history in [CHANGELOG.md](CHANGELOG.md).
 | docs/CLIENTS.md | Cross-client (DSH / Claude Code / Codex) loading mechanics and pitfalls |
 | docs/DATA-MODEL.md | **Data model**: asset fields, confidence rules, report field semantics, legacy migration |
 | docs/TROUBLESHOOTING.md | **Failures and result progression**: common failures, reading `wait`, per-source branching, red lines |
-| docs/DEVELOPMENT.md | **Development**: directory layout, how to run the regression suite (not needed for daily use) |
+| docs/DEVELOPMENT.md | **Development** (source repository only, not in the release bundle): directory layout, how to run the regression suite |
 | prompts/AGENT.txt | **The complete workflow prompt to copy to an agent** (manual copy-paste, not auto-loaded) |
 | CHANGELOG.md | Version history (incl. 0.7.x upgrade notes) |
 

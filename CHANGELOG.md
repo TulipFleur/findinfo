@@ -7,7 +7,24 @@
 
 ## [Unreleased]
 
-### 一次真实运行暴露的问题（2026-11-23 报告）
+### 发布包只装 agent 需要的文档
+
+- **评审、方案和带日期的快照不进发布包**。`scripts/shipped.py` 新增 `is_dev_doc`：REVIEW-\*、
+  CAPABILITY-REVIEW-\*、AUTOMATION-REPAIR、NON-DNS-REPAIR、RELIABILITY-PLAN、DEVELOPMENT、
+  DIDI-COLLECTION-WORKFLOW 和 CHANGELOG 只留在源码仓库；`docs/` 下文件名带日期的文档一律不打包，
+  以后新增的评审也不会混进来。这些文档描述的是某次提交时的代码，agent 读到“60/100、F01–F16”
+  会把已修复的问题当成现状。仓库里它们顶部都加了“历史快照，不代表现状”的标注（本机安装直接读
+  仓库，只排除发布包管不到）。README 不再链接包内没有的文件；新测试保证包内文档的相对链接都能
+  在包内解析。
+- **作业循环只写一份**。`prompts/AGENT.txt` 是唯一的分步循环；SKILL.md §1.5 只留四条要点和最小
+  命令块；AGENT.txt 不再转述硬规则（改为指向 SKILL.md §0 / §1 / §5，转述迟早会和原文不一致），
+  因此回到 12 KB 预算以内。TOOLS.md 末尾的 “Combined usage” 已经漂移成前台串行执行长命令
+  （违反 SKILL.md §5 第 1 条），换成一行链接；滴滴流程文档里的循环副本同样换成指针。
+- **SKILL.md 的判读细节移到 DATA-MODEL.md**：累计计数、复用答案的观测时间、JS 包与 HTML 的区别
+  进入 §3 / §4；入口只留“`work_queue.outstanding > 0` 不算完成”和“truncated / known=false 不等于
+  完整”两句并指向 DATA-MODEL。§2 的测绘语法链接改指 `docs/MAPPING-QUERIES.md`。
+
+### 一次真实运行暴露的问题（2026-11-23 报告，`3e2abdd`）
 
 - **ENScan 报告按真实结构解析**。一份 aqc 报告就是一家被查公司：`enterprise_info` 是主体，
   icp / app / wx_app / wechat / copyright 是它自己的资产，invest / partner 等是别的公司。

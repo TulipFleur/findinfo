@@ -1,5 +1,7 @@
 # 滴滴资产收集：当前生产流程、工具调用与测绘语法
 
+> **历史快照，不代表现状。** 2026-11-22 基于 v0.8.1 的离线推演。之后 ENScan 报告改为按结构解析、简称改为按自身资产证据锚定（`3e2abdd`），第 3、4 节描述的锚定与名称兜底已不是当前行为。测绘语法以 `docs/MAPPING-QUERIES.md` 为准，作业循环以 `prompts/AGENT.txt` 为准。本文只在源码仓库保留，不进发布包。
+
 核对日期：2026-11-22。基于 v0.8.1 工作树，包含本轮全根域默认及 Agent 接口修复。本文是离线代码推演，没有查询滴滴、AQC 或测绘平台，也没有读取实际 Cookie/Key。
 
 ## 1. 输入与范围
@@ -21,13 +23,7 @@
 python findinfo.py --task didi run --name "滴滴" --engines fofa,quake,hunter,shodan --max-seed 0 --dry-run
 ```
 
-实际采集会产生外部请求；下列是流程示例，本次没有执行。
-
-```powershell
-python findinfo.py --task didi doctor
-python findinfo.py --task didi runs --active
-python findinfo.py --task didi run --name "滴滴" --engines fofa,quake,hunter,shodan --max-seed 0 --background
-```
+实际采集会产生外部请求。作业循环（doctor → `run --background` → 有界 `wait` → `status` → `brief`/`report`）只在 `prompts/AGENT.txt` 写一份，这里不再重复；本目标的启动参数见上面的 `--dry-run` 一行（去掉 `--dry-run`、加 `--background` 即为实际启动）。
 
 普通 doctor 包含工具/环境/出口检查。`doctor --check-mapping` 还会发小额测绘自检请求，不应把它当成零请求检查，也不应每轮 wait 都调用。
 
