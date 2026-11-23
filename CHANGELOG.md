@@ -15,7 +15,7 @@ ENScan 配置位置、测绘限流、certs 超时、CLI 易用性）。
 
 ### 发布包只装 agent 需要的文档
 
-- **评审、方案和带日期的快照不进发布包**。`scripts/shipped.py` 新增 `is_dev_doc`：REVIEW-\*、
+- **评审、方案和带日期的快照不进发布包**（`1cd76b4`）。`scripts/shipped.py` 新增 `is_dev_doc`：REVIEW-\*、
   CAPABILITY-REVIEW-\*、AUTOMATION-REPAIR、NON-DNS-REPAIR、RELIABILITY-PLAN、DEVELOPMENT、
   DIDI-COLLECTION-WORKFLOW 和 CHANGELOG 只留在源码仓库；`docs/` 下文件名带日期的文档一律不打包，
   以后新增的评审也不会混进来。这些文档描述的是某次提交时的代码，agent 读到“60/100、F01–F16”
