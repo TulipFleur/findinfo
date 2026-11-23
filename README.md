@@ -162,7 +162,7 @@ exit code stays ≠5. After adding a key, re-running the target really re-runs `
 
 | Purpose | Field | Where to get it | Free tier |
 |---|---|---|---|
-| aiqicha Cookie (entity anchoring, required by `entity`) | `bin/config.yaml` → `cookies.aiqicha` | log in at https://aiqicha.baidu.com → F12 → Network → copy the Cookie header | free |
+| aiqicha Cookie (entity anchoring, required by `entity`) | `bin/<platform>/config.yaml` (beside the binary; `bin/config.yaml` is copied there) → `cookies.aiqicha`, with `version: 0.7` | log in at https://aiqicha.baidu.com → F12 → Network → copy the Cookie header | free |
 | FOFA (ICP reverse lookup / subdomain expansion) | `FOFA_EMAIL` + `FOFA_KEY` | https://fofa.info/userInfo | 200–300/month |
 | 360 Quake (ICP reverse lookup / subdomain expansion) | `QUAKE_TOKEN` | https://quake.360.net/quake/#/personalInfo | 3000/month |
 | Hunter (ICP reverse lookup / subdomain expansion) | `HUNTER_KEY` | https://hunter.qianxin.com/home/userInfo | 100 credits/month |

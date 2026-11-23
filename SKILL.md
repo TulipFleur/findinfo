@@ -145,7 +145,7 @@ python findinfo.py assets --export runs/assets.jsonl                        # fu
 | `{"error":"tool_missing"}` | Tool missing from `bin/<platform>/` (no PATH fallback): Linux `scripts/setup-linux.sh`, Windows drop `bin/windows/*.exe`; do not install yourself |
 | `{"error":"scope_required"}` | Store read with no scope: add `--scope`/`--domain` (§1), pick `candidates`, or `--whole-store` |
 | `subs` thin / keys missing | Coverage gap — **deliver as-is, do not `--resume`** (see `docs/API-KEYS.md`) |
-| `entity` empty | aiqicha Cookie missing/expired; or seed with `--domain` directly |
+| `entity` empty/fails | Cookie missing/expired, or no `version: 0.7` config beside the binary (`doctor` → `enscan_config`); or seed with `--domain` |
 | `vhost` 0 hits | Single site per IP, or a proxy blocks direct IP access |
 | `wait` keeps `timed_out` | Job still running (normal); keep waiting on the same run_id |
 | `run` exit code 5 | Finished with failed stages (partial); do not resume key gaps |

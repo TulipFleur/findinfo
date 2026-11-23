@@ -134,6 +134,18 @@ def _offline_requested(argv: list[str]) -> tuple:
     return None, False
 
 
+def _split_domain_values(values) -> list:
+    """`--domain a.com,b.com` means two seeds, exactly like repeating the flag.
+
+    The comma form used to reach the worker as ONE value, fail its validation
+    there, and leave only "worker finished state=failed" on stderr.
+    """
+    out = []
+    for v in values or []:
+        out.extend(p for p in str(v).replace(",", " ").split() if p)
+    return out
+
+
 def _flag_present(argv: list[str], flag: str) -> bool:
     for a in argv:
         if a == flag or a.startswith(flag + "="):
@@ -222,6 +234,15 @@ def _parse_offline_args(argv: list[str]):
     domains = [argv[i + 1] for i, a in enumerate(argv)
                if a == "--domain" and i + 1 < len(argv)]
     domains += [a.split("=", 1)[1] for a in argv if a.startswith("--domain=")]
+    domains = _split_domain_values(domains)
+    top_ports = _val("--top-ports", 1000, int)
+    if top_ports not in (100, 1000):
+        # the same refusal the full parser gives: a plan must not accept what
+        # the run (and naabu: "invalid top ports option") would reject
+        _emit_offline({"error": "invalid_argument",
+            "message": "--top-ports must be 100 or 1000 (naabu presets), got " +
+                       str(top_ports)})
+        sys.exit(2)
     return _ap.Namespace(
         name=_val("--name", ""), domain=domains, task=_TASK or "",
         active=_flag_present(argv, "--active"),
@@ -237,7 +258,7 @@ def _parse_offline_args(argv: list[str]):
         deep=_val("--deep", 1, int),
         entity_timeout=_val("--entity-timeout", 1200, int),
         engines=_val("--engines", "fofa,quake,hunter,shodan,censys"),
-        top_ports=_val("--top-ports", 1000, int),
+        top_ports=top_ports,
         max_seed=_val("--max-seed", 0, int),
         max_vhost_ips=_val("--max-vhost-ips", 10, int),
         no_icp=_flag_present(argv, "--no-icp"),
@@ -1496,6 +1517,10 @@ def _start_background(args) -> int:
     collection, double quota, two graphs. A cross-process file lock (the same
     O_CREAT|O_EXCL primitive jobs._Lock uses for status.json) closes the window.
     """
+    # Refuse bad seeds HERE, synchronously: inside the worker the same error
+    # only showed up as "worker finished state=failed" after the run id was
+    # already handed out.
+    pipeline.check_user_domains(getattr(args, "domain", None) or [])
     payload = _dedupe_payload(args)
     key = jobs.dedupe_key(payload)
     lock = jobs.start_lock(key)
@@ -1981,7 +2006,8 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("--scope", "--domain", dest="scope", action="append",
                     help="without --ip: scan the public IPs owned by these "
                          "domains (repeatable); private/reserved ones are skipped")
-    po.add_argument("--top-ports", type=int, default=1000)
+    po.add_argument("--top-ports", type=int, default=1000, choices=(100, 1000),
+                    help="naabu top-ports preset: 100 or 1000 (naabu refuses any other number with 'invalid top ports option')")
     _add_whole_store(po)
     _add_tool_timeout(po)
     po.set_defaults(func=cmd_ports)
@@ -2177,7 +2203,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="re-ask mapping questions this task already paid for "
                          "(default: an answered question is reused, never re-billed)")
     rn.add_argument("--no-onepass", action="store_true", help="skip the onepass stage")
-    rn.add_argument("--top-ports", type=int, default=1000)
+    rn.add_argument("--top-ports", type=int, default=1000, choices=(100, 1000),
+                    help="naabu top-ports preset: 100 or 1000 (naabu refuses any other number with 'invalid top ports option')")
     rn.add_argument("--max-seed", type=int, default=0,
                     help="seed-domain expansion cap (0 = all, default; positive = first N)")
     rn.add_argument("--max-vhost-ips", type=int, default=10)
@@ -2227,6 +2254,8 @@ def main(argv: list[str]) -> int:
     except Exception:
         pass
     args = build_parser().parse_args(argv)
+    if isinstance(getattr(args, "domain", None), list):
+        args.domain = _split_domain_values(args.domain)
     if getattr(args, "task", ""):
         # keep it visible to child processes too (already set pre-import)
         os.environ["FINDINFO_TASK"] = args.task

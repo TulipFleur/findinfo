@@ -8,6 +8,8 @@ Every function:
 from __future__ import annotations
 
 import atexit
+import contextlib
+import contextvars
 import json
 import ipaddress
 import os
@@ -15,6 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 import re
+import shutil
 import socket
 import threading
 import time
@@ -201,6 +204,127 @@ def _own_assets(node: dict, depth: int = 0) -> dict:
     return out
 
 
+# ENScan report schema (aqc answer, observed on the bundled binary): one JSON
+# file is ONE queried company. `enterprise_info` holds that company; the asset
+# tables below are its own; every other table (invest, partner, ...) lists
+# OTHER companies. Each asset row carries a `name` -- an app's, a WeChat
+# account's, a copyright's -- and reading those as companies turned one real
+# report into 82 "subjects": the ICP table (whose `company_name` is empty) was
+# then owned by nobody, the anchored company seeded zero domains, and a 4+
+# character app name could pass the name gate and grant its app-store link.
+_REPORT_SUBJECT_TABLE = "enterprise_info"
+_REPORT_ASSET_TABLES = ("icp", "app", "wx_app", "wechat", "weibo", "copyright")
+_REPORT_APP_TABLES = ("app", "wx_app", "wechat")
+_REPORT_EVIDENCE_KEYS = ("name", "short_name", "website_name")
+
+
+def _is_enscan_report(obj: Any) -> bool:
+    rows = obj.get(_REPORT_SUBJECT_TABLE) if isinstance(obj, dict) else None
+    return isinstance(rows, list) and any(isinstance(r, dict) for r in rows)
+
+
+def _report_row_assets(table: str, row: dict) -> dict:
+    """What one asset-table row contributes: domains only from filings (an
+    app or WeChat row links to a store page, not to the company)."""
+    out = {"domains": [], "icp": [], "apps": [], "evidence_names": []}
+    if table == "icp":
+        for key in ("domain", "website"):
+            d = core.canon_domain(str(row.get(key) or ""))
+            if d and _looks_public(d):
+                out["domains"].append(d)
+                break
+        out["icp"].extend(ICP_RE.findall(str(row.get("icp") or "")))
+    if table in _REPORT_APP_TABLES:
+        nm = str(row.get("name") or "").strip()
+        if nm and len(nm) < 200:
+            out["apps"].append(nm)
+    for key in _REPORT_EVIDENCE_KEYS:
+        nm = str(row.get(key) or "").strip()
+        if nm and len(nm) < 200:
+            out["evidence_names"].append(nm)
+    return out
+
+
+def _harvest_enscan_report(doc: dict, depth: int) -> list:
+    """Subjects of one ENScan report, each with the asset tables it owns.
+
+    With exactly one `enterprise_info` subject the report's asset tables are
+    that subject's. With several, a row is attributed only when its
+    `company_name` names one of them; the rest stay unattributed (F06).
+    Tables outside the known schema keep the generic per-object reading.
+    """
+    subjects: list = []
+    nested: list = []
+    for row in doc.get(_REPORT_SUBJECT_TABLE) or []:
+        if not isinstance(row, dict):
+            continue
+        own = _entity_subject(row)
+        for ent in harvest_entities(row, depth + 1):
+            same = ((own["subject_id"] and ent.get("subject_id") == own["subject_id"]) or
+                    (not own["subject_id"] and own["legal_name"] and
+                     ent.get("legal_name") == own["legal_name"]))
+            if not same:
+                nested.append(ent)      # a company listed INSIDE the row
+                continue
+            ent = dict(ent)
+            ent["document_subject"] = True
+            ent.setdefault("evidence_names", [])
+            subjects.append(ent)
+    subjects = _merge_by_ref(subjects)
+    by_name = {s["legal_name"]: s for s in subjects if s.get("legal_name")}
+    for table in _REPORT_ASSET_TABLES:
+        rows = doc.get(table)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if len(subjects) == 1:
+                owner = subjects[0]
+            else:
+                owner = by_name.get(str(row.get("company_name") or "").strip())
+            if owner is None:
+                continue
+            got = _report_row_assets(table, row)
+            for kk in ("domains", "icp", "apps", "evidence_names"):
+                owner[kk] = _uniq(owner.get(kk, []) + got[kk])
+    others: list = []
+    for key, val in doc.items():
+        if key == _REPORT_SUBJECT_TABLE or key in _REPORT_ASSET_TABLES:
+            continue
+        if isinstance(val, (dict, list)):
+            others.extend(harvest_entities(val, depth + 1))
+    return _merge_by_ref(subjects + nested + others)
+
+
+def brand_evidence(entities: list, wanted: str, minimum: int = 2) -> dict | None:
+    """The one report subject whose OWN assets carry the brand, or None.
+
+    A short brand ("滴滴") never matches a legal name such as "北京小桔科技集团
+    有限公司", so the name gate alone rejects the right company. Its apps,
+    filed websites and WeChat accounts say who owns the brand: when exactly
+    one report subject has at least `minimum` distinct asset names containing
+    it, that subject is the brand's owner. aiqicha's lookalike answers carry
+    no such names, so they stay rejected.
+    """
+    key = norm_entity_name(wanted)
+    if len(key) < 2:
+        return None
+    hits = []
+    for ent in entities:
+        if not ent.get("document_subject") or not ent.get("legal_name"):
+            continue
+        names = sorted({n for n in (ent.get("evidence_names") or [])
+                        if key in norm_entity_name(n)})
+        if len(names) >= minimum:
+            hits.append((ent, names))
+    if len(hits) != 1:
+        return None
+    ent, names = hits[0]
+    return {"legal_name": ent["legal_name"], "subject_ref": ent["subject_ref"],
+            "evidence": names[:10]}
+
+
 def harvest_entities(obj: Any, depth: int = 0) -> list:
     """Every entity object that has a subject identity, with its own assets.
 
@@ -219,6 +343,8 @@ def harvest_entities(obj: Any, depth: int = 0) -> list:
     found: list = []
     if depth > 14:
         return found
+    if _is_enscan_report(obj):
+        return _harvest_enscan_report(obj, depth)
     if isinstance(obj, dict):
         subject = _entity_subject(obj)
         if subject["legal_name"] or subject["subject_id"]:
@@ -303,6 +429,11 @@ def _merge_by_ref(entities: list) -> list:
         cur = by_ref[key]
         for kk in ("domains", "icp", "apps", "aliases"):
             cur[kk] = _uniq(cur[kk] + ent[kk])
+        if "evidence_names" in cur or "evidence_names" in ent:
+            cur["evidence_names"] = _uniq(cur.get("evidence_names", []) +
+                                          ent.get("evidence_names", []))
+        if ent.get("document_subject"):
+            cur["document_subject"] = True
         if not cur.get("subject_id") and ent.get("subject_id"):
             cur["subject_id"] = ent["subject_id"]
     return [by_ref[k] for k in order]
@@ -546,6 +677,87 @@ def store_approved_entities(store, companies, approved) -> dict:
     return {"domains": _uniq(domains), "icp": _uniq(icp), "apps": _uniq(apps)}
 
 
+# The bundled ENScan's own default config starts with `version: 0.7` (a float:
+# "V0.7" fails with "cannot unmarshal !!str into float64", a missing version
+# reads as V0.0 and is refused). It reads config.yaml BESIDE its executable,
+# i.e. bin/<platform>/config.yaml -- not the bin/config.yaml the docs named.
+ENSCAN_CONFIG_VERSION = "0.7"
+_ENSCAN_CONFIG_HINTS = {
+    "missing": "copy bin/config.example.yaml there and paste the aiqicha Cookie",
+    "empty": "the file is empty (enscan -v writes a 0-byte file); copy "
+             "bin/config.example.yaml over it",
+    "version_mismatch": "set `version: " + ENSCAN_CONFIG_VERSION + "` (a number, "
+                        "no quotes) as bin/config.example.yaml does",
+    "no_cookie": "cookies.aiqicha is empty: paste the aiqicha Cookie",
+    "unreadable": "the file cannot be read",
+}
+
+
+def enscan_config_status(path) -> dict:
+    """Shape of an ENScan config file -- never a Cookie value.
+
+    state: ok / missing / empty / unreadable / version_mismatch / no_cookie.
+    """
+    p = Path(path)
+    out: dict = {"path": str(p), "state": "missing"}
+    if not p.is_file():
+        return out
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        out.update(state="unreadable", error=str(exc)[:120])
+        return out
+    if not text.strip():
+        out["state"] = "empty"
+        return out
+    m = re.search(r"(?m)^version:[ \t]*(\S+)", text)
+    raw = m.group(1) if m else ""
+    out["version"] = raw or None
+    try:
+        ok_version = (raw[:1] not in ("'", '"') and
+                      float(raw) == float(ENSCAN_CONFIG_VERSION))
+    except ValueError:
+        ok_version = False
+    if not ok_version:
+        out.update(state="version_mismatch", required_version=ENSCAN_CONFIG_VERSION)
+        return out
+    c = re.search(r"(?m)^[ \t]+aiqicha:[ \t]*(.*)$", text)
+    val = (c.group(1) if c else "").strip()
+    if val[:1] in ("'", '"'):
+        end = val.find(val[0], 1)
+        val = val[1:end] if end > 0 else val[1:]
+    else:
+        val = val.split(" #", 1)[0].strip()
+    out["aiqicha_cookie_set"] = bool(val.strip())
+    out["state"] = "ok" if out["aiqicha_cookie_set"] else "no_cookie"
+    return out
+
+
+def _enscan_config_ready(exe: str) -> dict:
+    """Make the config visible where ENScan reads it, and report its shape.
+
+    The documented place used to be bin/config.yaml while the binary reads
+    the file beside itself, so a correctly filled config failed with
+    "没有找到配置文件". A legacy bin/config.yaml is copied next to the binary
+    when that one is missing (both paths are git-ignored and never shipped).
+    """
+    cfg = Path(exe).parent / "config.yaml"
+    legacy = core.BIN / "config.yaml"
+    if not cfg.is_file() and legacy.is_file():
+        try:
+            shutil.copy2(legacy, cfg)
+            core.log("enscan: ENScan reads its config beside the binary; copied " +
+                     str(legacy) + " -> " + str(cfg))
+        except OSError as exc:
+            core.log("enscan: could not copy " + str(legacy) + " beside the binary: " +
+                     str(exc)[:160])
+    st = enscan_config_status(cfg)
+    if st["state"] != "ok":
+        core.log("enscan: config " + st["state"] + " at " + str(cfg) + " -- " +
+                 _ENSCAN_CONFIG_HINTS.get(st["state"], ""))
+    return st
+
+
 def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
              outdir: Path | None = None, timeout: int = 0,
              field: str = "icp,app,wx_app,wechat,copyright,invest,enterprise_info",
@@ -591,9 +803,12 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
         pass
     except OSError as exc:
         core.log("enscan: could not drop job cache: " + str(exc))
+    config = _enscan_config_ready(exe)
     # serialized: two enscan.exe at once return the first query's entity
     with _ENSCAN_LOCK, _FileLock(core.DATA / "enscan.lock", timeout=1800):
-        rc, out, err = core.run(cmd, timeout=timeout, cwd=str(core.BIN),
+        # run beside the binary: that is where ENScan reads config.yaml and
+        # keeps enscan.gob, whichever of cwd/exe dir a given build consults
+        rc, out, err = core.run(cmd, timeout=timeout, cwd=str(Path(exe).parent),
                                 progress=lambda secs: core.log(
                                     "enscan: still running (" + str(secs) + "s)"))
     # ENScan is a Go program that tears its own process down at the end of a page
@@ -608,7 +823,8 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
     table = bool((out or "").strip())
     blob = (out or "") + (err or "")
     if "cookie" in blob.lower() or "Cookie" in blob:
-        core.log("enscan: no cookie configured; put the aiqicha Cookie into bin/config.yaml")
+        core.log("enscan: no cookie configured; put the aiqicha Cookie into " +
+                 config["path"])
     merged = {"companies": [], "icp": [], "domains": [], "apps": []}
     entities: list = []
     files = 0
@@ -640,6 +856,10 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
             cur = by_ref[key]
             for kk in ("domains", "icp", "apps", "aliases"):
                 cur[kk] = _uniq(cur[kk] + ent[kk])
+            cur["evidence_names"] = _uniq(cur.get("evidence_names", []) +
+                                          ent.get("evidence_names", []))
+            if ent.get("document_subject"):
+                cur["document_subject"] = True
     entities = list(by_ref.values())
     # ANCHORING GATE. Only entities that really are the requested one may
     # contribute assets. aiqicha answers a MISS with a popular lookalike, so
@@ -649,6 +869,19 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
     company_names = [e["legal_name"] for e in entities if e["legal_name"]] \
         or merged["companies"]
     kept, rejected = filter_entities(company_names, name)
+    anchor_basis = "name" if kept else ""
+    evidence = None
+    if not kept:
+        # A brand the legal name does not contain: let the report subject's
+        # OWN asset names (apps, filed websites, WeChat) say who owns it.
+        evidence = brand_evidence(entities, name)
+        if evidence:
+            kept = [evidence["legal_name"]]
+            rejected = [x for x in rejected if x != evidence["legal_name"]]
+            anchor_basis = "brand_evidence"
+            core.log("enscan: anchored " + evidence["legal_name"] + " for brand '" +
+                     str(name) + "' by its own asset names: " +
+                     ", ".join(evidence["evidence"][:5]))
     if not kept:
         core.log("enscan: no entity matched " + str(name) +
                  "; discarding " + str(len(rejected)) + " unrelated result(s)" +
@@ -657,6 +890,7 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
         return {"rc": rc, "json_files": files, "stderr": err[-800:],
                 "table_only": files == 0 and table,
                 "anchor_failed": True, "rejected": rejected[:20],
+                "config_state": config["state"], "config_path": config["path"],
                 "companies": [], "icp": [], "domains": [], "apps": [],
                 "subjects": [], "candidates": [
                     {"name": e["legal_name"], "ref": e["subject_ref"],
@@ -691,19 +925,26 @@ def t_enscan(store, name: str, invest: int = 51, deep: int = 1,
         core.log("enscan: anchored " + kept[0] +
                  " but this source filed no domain -- the company is real, its "
                  "domain set is simply empty here")
-    return {"rc": rc, "json_files": files, "stderr": err[-800:],
-            "table_only": files == 0 and table,
-            "companies": merged["companies"][:200],
-            "icp": approved_icp, "domains": approved_domains,
-            "apps": approved_apps[:100],
-            "subjects": [{"ref": e["subject_ref"],
-                          "legal_name": e["legal_name"],
-                          "approved": True,
-                          "domains": len(e["domains"])} for e in approved],
-            "candidates": [{"ref": e["subject_ref"],
-                            "legal_name": e["legal_name"],
-                            "approved": False,
-                            "domains": len(e["domains"])} for e in candidates]}
+    out = {"rc": rc, "json_files": files, "stderr": err[-800:],
+           "table_only": files == 0 and table,
+           "companies": merged["companies"][:200],
+           "icp": approved_icp, "domains": approved_domains,
+           "apps": approved_apps[:100],
+           "anchor_basis": anchor_basis,
+           "config_state": config["state"], "config_path": config["path"],
+           "subjects": [{"ref": e["subject_ref"],
+                         "legal_name": e["legal_name"],
+                         "approved": True,
+                         "domains": len(e["domains"])} for e in approved],
+           "candidates": [{"ref": e["subject_ref"],
+                           "legal_name": e["legal_name"],
+                           "approved": False,
+                           "domains": len(e["domains"])} for e in candidates]}
+    if evidence:
+        # the agent (and the human reading the brief) must see WHY a legal
+        # name that does not contain the brand was accepted
+        out["brand_evidence"] = evidence["evidence"]
+    return out
 
 
 # Entity-name anchoring: what makes an ENScan hit THIS target and not
@@ -806,13 +1047,35 @@ def got_name(p: Path, fallback: str) -> str:
 
 
 # ---------------------------------------------------------------- 2. certificate transparency
-def t_certs(store, domain: str, timeout: int = 0) -> dict:
+# One CT breaker per certs stage, without widening t_certs' call contract
+# (collectors are replaced by callers and tests with their own signatures).
+_CERT_BREAKER: contextvars.ContextVar = contextvars.ContextVar(
+    "findinfo_cert_breaker", default=None)
+
+
+@contextlib.contextmanager
+def cert_breaker():
+    """Every t_certs call inside the block shares one upstream breaker."""
+    token = _CERT_BREAKER.set({})
+    try:
+        yield
+    finally:
+        _CERT_BREAKER.reset(token)
+
+
+def t_certs(store, domain: str, timeout: int = 0, breaker: dict | None = None) -> dict:
     """CT lookup via crt.sh, falling back to CertSpotter.
 
     The result names the upstream that actually answered (`upstream`): a
     CertSpotter fallback must not be reported as crt.sh evidence.
     `ok=False` means BOTH upstreams were unreachable -- the caller records
     the stage as failed instead of mistaking it for "no certificates".
+
+    `breaker` (one dict per stage, upstream -> consecutive failed seeds) stops
+    a dead upstream from being asked for every seed: after one failure the
+    next seed gets a single attempt, after two in a row the upstream is
+    skipped for the rest of the stage. The seeds it skipped stay failed, so
+    the stage is not checkpointed and the next run asks again.
     """
     raw = domain
     domain = core.canon_domain(domain)
@@ -839,27 +1102,41 @@ def t_certs(store, domain: str, timeout: int = 0) -> dict:
         # transient failures (429/502/dropped tunnel) get bounded retries;
         # `attempts` stays small so a dead source cannot eat the run budget
         attempts = 1 + max(0, int((core.CFG.get("limits") or {}).get("source_retries") or 0))
-        core.throttle("crtsh")
-        data = core.fetch_with_retry(
-            core.curl_json,
-            "https://crt.sh/?q=%25." + domain + "&output=json",
-            headers={"Accept": "application/json"}, timeout=timeout,
-            attempts=attempts)
+        brk = breaker if breaker is not None else _CERT_BREAKER.get()
+        if brk is None:
+            brk = {}                        # a standalone call: no shared state
+
+        def _ask(name: str, bucket: str, url: str):
+            failed_before = int(brk.get(name, 0))
+            if failed_before >= 2:
+                return None, True           # open: skipped, not asked
+            core.throttle(bucket)
+            got = core.fetch_with_retry(
+                core.curl_json, url, headers={"Accept": "application/json"},
+                timeout=timeout, attempts=(1 if failed_before else attempts))
+            brk[name] = 0 if got is not None else failed_before + 1
+            if got is None and brk[name] == 2:
+                core.log("certs: " + name + " failed on two seeds in a row; skipping "
+                         "it for the rest of this stage (gap, retried next run)")
+            return got, False
+
+        data, skipped_crt = _ask("crt.sh", "crtsh",
+                                 "https://crt.sh/?q=%25." + domain + "&output=json")
         if data is not None:
             ok = True
         else:
-            core.throttle("certspotter")
-            data = core.fetch_with_retry(
-                core.curl_json,
+            data, skipped_cs = _ask(
+                "certspotter", "certspotter",
                 "https://api.certspotter.com/v1/issuances?domain=" + domain +
-                "&include_subdomains=true&expand=dns_names",
-                headers={"Accept": "application/json"}, timeout=timeout,
-                attempts=attempts)
+                "&include_subdomains=true&expand=dns_names")
             if data is not None:
                 ok = True
                 upstream = "certspotter"
             else:
                 data = []
+                if skipped_crt and skipped_cs:
+                    core.log("certs: both CT upstreams are down this stage; " +
+                             domain + " not asked")
         # never cache a failed fetch as "no certificates"
         if ok:
             core.CACHE.put("certs", cache_key,
@@ -2324,7 +2601,10 @@ def t_ports(store, ips: list[str], top_ports: int = 1000, timeout: int = 0,
             "truncated": total > len(rows), "lines": lines, "rc": rc, "ok": rc == 0,
             "cert_ports": cert_ports, "cert_in_scope": cert_in_scope,
             "cert_related": cert_related, "tls_grab_failed": tls_failed,
-            "skipped_private": skipped_private}
+            "skipped_private": skipped_private,
+            # naabu says why it gave up only on stderr ("invalid top ports
+            # option", a missing capture driver, ...): keep the tail
+            "error": (err or "").strip()[-300:]}
 
 
 # ---------------------------------------------------------------- 9. vhost collision
@@ -3527,6 +3807,17 @@ def doctor() -> dict:
     keys = {k: bool(api_key_or_empty(k)) for k in ["fofa", "quake", "hunter", "shodan",
                                                    "chaos", "securitytrails", "virustotal",
                                                    "urlscan"]}
+    # ENScan's config shape (path / version / whether a Cookie is set -- never
+    # the Cookie). Read where the binary reads it; bin/config.yaml is the
+    # legacy place a run copies from.
+    try:
+        _cfg_path = Path(core.tool("enscan")).parent / "config.yaml"
+        enscan_config = enscan_config_status(_cfg_path)
+    except core.ToolMissing:
+        enscan_config = {"path": None, "state": "tool_missing"}
+    enscan_config["legacy_bin_config"] = (core.BIN / "config.yaml").is_file()
+    if enscan_config["state"] not in ("ok", "tool_missing"):
+        enscan_config["hint"] = _ENSCAN_CONFIG_HINTS.get(enscan_config["state"], "")
     missing = [n for n, v in report.items() if not v.get("present")]
     # Every resolvable tool lives in bin/<platform>/ now: core.tool() has no
     # PATH fallback, so "outside bin" cannot happen. Kept in the output
@@ -3558,6 +3849,7 @@ def doctor() -> dict:
             "skill_version": core.skill_version(),
             "environment": env,
             "tools": report, "api_keys": keys,
+            "enscan_config": enscan_config,
             "fofa_gateway": gw,
             "tools_summary": {
                 "total": len(names),

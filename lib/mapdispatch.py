@@ -26,6 +26,8 @@ what the offline tests fake.
 """
 from __future__ import annotations
 
+import time
+
 from . import core
 from . import mapping
 from . import metered
@@ -387,6 +389,30 @@ def engine_credit(engine: str, timeout: int = 15) -> int | None:
         return None
 
 
+def _limits() -> dict:
+    return core.CFG.get("limits") or {}
+
+
+def _gateway_max_rows() -> int:
+    """Largest answer the FOFA relay accepts in one question."""
+    return max(1, int(_limits().get("fofa_gateway_max_rows") or 2000))
+
+
+def _rate_retries() -> int:
+    """Extra attempts after a rate-limit answer (0 disables the wait)."""
+    v = _limits().get("mapping_rate_retries")
+    return max(0, int(1 if v is None else v))
+
+
+def _rate_wait_seconds() -> float:
+    """How long a rate-limited engine is left alone: one per-minute window."""
+    return max(1.0, float(_limits().get("mapping_rate_wait_sec") or 60))
+
+
+def _rate_wait(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def ask(store, run_id: str, engine: str, kind: str, value: str,
         *, requested_engines: str | None = None, remap: bool = False,
         timeout: int = 0, ledger=None, limit: int | None = None) -> dict:
@@ -410,7 +436,9 @@ def ask(store, run_id: str, engine: str, kind: str, value: str,
                 "reason": state + " earlier in this task: " + why}
     q = mapping.question(engine, kind, value, query)
     prior = mapping.lookup(store, q)
-    if prior and not remap:
+    # A rate-limited question was never answered: it is asked again, not
+    # reused (every other recorded outcome is reused until --remap).
+    if prior and not remap and prior["status"] != metered.ST_RATE:
         cached = mapping.results(store, q)
         return {"engine": engine, "kind": kind, "value": q["value"],
                 "status": prior["status"], "rows": int(prior["rows"] or 0),
@@ -419,42 +447,58 @@ def ask(store, run_id: str, engine: str, kind: str, value: str,
                 "reason": "already asked in this task"}
 
     cap = mapping_limit(engine) if limit is None else int(limit)
+    gateway = _gateway_available(engine)
+    if gateway and cap > _gateway_max_rows():
+        # the relay refuses an oversized answer outright ("超过最大值2000"):
+        # ask its maximum and let `truncated` say there may be more
+        core.log("mapping: the fofa relay answers at most " +
+                 str(_gateway_max_rows()) + " rows; asking that instead of " + str(cap))
+        cap = _gateway_max_rows()
     core.log("mapping: " + engine + " " + kind + " " + q["value"] +
              " (limit " + str(cap) + ")")
-    core.throttle(engine)
-    core.mapping_wait()
     # Measuring the spend means TWO extra round trips per dispatch (a balance
     # read before and after). That is cheap but not free of rate-limit budget,
     # so it is OFF unless the operator asks: `limits.measure_credits: true`.
     # The page count is still estimated from the limit and reported either way.
     measure = bool((core.CFG.get("limits") or {}).get("measure_credits"))
     credit_before = engine_credit(engine, timeout=min(15, timeout or 15)) if measure else None
-    rc, err = 0, ""
-    if _gateway_available(engine):
-        # A relay AK is only valid at the relay and needs no email: uncover
-        # cannot carry it, so the gateway is asked directly.
-        res = core.fofa_query(query, fields="host,ip,domain,link,title",
-                              size=max(1, cap), timeout=timeout or 60)
-        if not res.get("ok"):
-            err = str(res.get("error") or "gateway error")
-            rc = 1
-            got = []
+    attempts = 1 + _rate_retries()
+    for attempt in range(attempts):
+        # the relay keeps its own pace (10/min seen live), the engines theirs
+        core.throttle("fofa-gateway" if gateway else engine)
+        core.mapping_wait()
+        rc, err = 0, ""
+        if gateway:
+            # A relay AK is only valid at the relay and needs no email: uncover
+            # cannot carry it, so the gateway is asked directly.
+            res = core.fofa_query(query, fields="host,ip,domain,link,title",
+                                  size=max(1, cap), timeout=timeout or 60)
+            if not res.get("ok"):
+                err = str(res.get("error") or "gateway error")
+                rc = 1
+                got = []
+            else:
+                got = _rows_from_gateway(res)
         else:
-            got = _rows_from_gateway(res)
-    else:
-        cmd = [core.tool("uncover"), "-q", query, "-e", engine,
-               "-json", "-silent", "-limit", str(max(1, cap))]
-        # only the engine being asked gets its credential: uncover otherwise
-        # runs with every configured engine key in its environment
-        rc, out, err = core.run(cmd, timeout=timeout,
-                                env=core.tool_env("uncover", [engine]))
-        got = _parse_uncover_rows(out)
-    n = len(got)
+            cmd = [core.tool("uncover"), "-q", query, "-e", engine,
+                   "-json", "-silent", "-limit", str(max(1, cap))]
+            # only the engine being asked gets its credential: uncover otherwise
+            # runs with every configured engine key in its environment
+            rc, out, err = core.run(cmd, timeout=timeout,
+                                    env=core.tool_env("uncover", [engine]))
+            got = _parse_uncover_rows(out)
+        n = len(got)
+        # classify from the wire: quota/auth hints in stderr win over "zero
+        # rows", because uncover reports an upstream error as rc=0, no body
+        status = metered.status_of("", rc=rc, count=n, error=(err or ""))
+        if status != metered.ST_RATE or attempt + 1 >= attempts:
+            break
+        wait = _rate_wait_seconds()
+        core.log("mapping: " + engine + " is rate-limited (" + (err or "")[:80] +
+                 "); waiting " + str(int(wait)) + "s, then asking again")
+        _rate_wait(wait)
     # a page that fills the ceiling may hide more rows: say so, never guess
     truncated = n >= cap
-    # classify from the wire: quota/auth hints in stderr win over "zero rows",
-    # because uncover reports an upstream error as rc=0 with an empty body
-    status = metered.status_of("", rc=rc, count=n, error=(err or ""))
     # uncover answers rc=0 with no rows for an upstream it could not query
     # ("Requires membership or higher", "no keys"), with no message at all.
     # A zero is therefore NOT proof of an empty result unless the credential is

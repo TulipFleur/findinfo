@@ -92,6 +92,10 @@ MODULES = [
     "tests.test_seed_expansion",
     "tests.test_wait_cursor",
     "tests.test_pipeline_module",
+    "tests.test_enscan_report",
+    "tests.test_rate_limit",
+    "tests.test_cert_budget",
+    "tests.test_usability",
 ]
 
 

@@ -42,9 +42,17 @@ ST_QUOTA = "quota"                 # ceiling reached (quota exhausted)
 ST_AUTH = "auth"                   # credential rejected -- never retry blind
 ST_FAILED = "failed"               # transport/tool failure, retry may help
 ST_UNCERTAIN = "uncertain"         # dispatch happened, outcome/billing unknown
+ST_RATE = "rate_limited"           # asked too fast: answers nothing, ask again
 
 _ALL = (ST_OK, ST_EMPTY, ST_TRUNCATED, ST_QUOTA, ST_AUTH, ST_FAILED,
-        ST_UNCERTAIN)
+        ST_UNCERTAIN, ST_RATE)
+
+# A provider saying "too fast" (the FOFA relay: "请求过于频繁，当前限额 10 次/
+# 分钟"). Checked BEFORE quota: "rate limit" contains "limit", and filing a
+# per-minute throttle as an exhausted quota (or a failure the ledger reuses
+# forever) loses every question that hit it.
+_RATE_HINTS = ("频繁", "过快", "次/分钟", "次每分钟", "too many requests",
+               "rate limit", "ratelimit", "rate-limit", "slow down", "429")
 
 # Count units. A provider HTTP request we make ourselves and one native-tool
 # process invocation are DIFFERENT observable facts; neither is a price.
@@ -60,6 +68,8 @@ def status_of(outcome: str, rc=None, count: int | None = None,
     err = (error or "").lower()
     if oc in _ALL:
         return oc
+    if rc == 429 or any(k in err for k in _RATE_HINTS):
+        return ST_RATE
     if "quota" in err or "exceed" in err or "limit" in err:
         return ST_QUOTA
     # A credential the provider refuses is a SKIP, not a failure: retrying it

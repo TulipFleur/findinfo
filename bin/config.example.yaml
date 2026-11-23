@@ -1,16 +1,32 @@
-# ENScan_GO 配置模板
-# 用法：复制为 bin/config.yaml 后填入 Cookie
-#   cp bin/config.example.yaml bin/config.yaml
+# ENScan_GO 配置模板，与随附 enscan 二进制内嵌的默认配置同结构（version 0.7）
+#
+# 用法：复制到 enscan 可执行文件旁边，再填入 Cookie。ENScan 只读与 exe 同目录的 config.yaml：
+#   Windows:  copy bin\config.example.yaml bin\windows\config.yaml
+#   Linux:    cp bin/config.example.yaml bin/linux/config.yaml
+# 旧位置 bin/config.yaml 也能用：运行时如果平台目录下没有配置，findinfo 会把它复制过去。
+# `python findinfo.py doctor` 的 enscan_config 一项会报告位置、版本和 Cookie 是否已填（不输出 Cookie）。
+#
+# version 必须写成数字 0.7：写成字符串 "V0.7" 会报 cannot unmarshal !!str into float64，
+# 不写则按 V0.0 处理并拒绝运行。不要用 `enscan -v` 生成配置，它会写出 0 字节的空文件。
 #
 # Cookie 获取：
-#   aiqicha（爱企查）: 登录 https://aiqicha.baidu.com → F12 → Network → 任意请求的 Cookie 头整体复制
-#   qcc（企查查）、tianyancha（天眼查）、qimai（七麦）: 同理
+#   aiqicha（爱企查）：登录 https://aiqicha.baidu.com → F12 → Network → 任意请求的 Cookie 头整体复制
+#   tianyancha（天眼查）、qimai（七麦）等：同理
 #
-# bin/config.yaml 已被 .gitignore 忽略，不会被提交，也不会被 --copy 复制到其他位置。
-# 未填写时 entity 阶段会返回空结果并在 stderr 提示。
+# 两个位置都被 .gitignore 忽略，不会提交，也不会打进发布包。未填写时 entity 阶段会在 stderr 提示。
 
+version: 0.7
+user_agent: ""
+app:
+  miit_api: ''
+api:
+  api: ':31000'
+  mcp: 'http://localhost:8080'
 cookies:
-  aiqicha: ""
-  qcc: ""
-  tianyancha: ""
-  qimai: ""
+  aiqicha: ''
+  tianyancha: ''
+  tycid: ''
+  auth_token: ''
+  tyc_api_token: ''
+  risk_bird: ''
+  qimai: ''

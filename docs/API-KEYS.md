@@ -26,7 +26,7 @@
 
 ## 2. Special case: the ENScan Cookie
 
-ENScan does not use API keys; it uses a browser Cookie. The location is fixed at **`bin/config.yaml`** (the program reads next to the exe):
+ENScan does not use API keys; it uses a browser Cookie. The bundled binary reads **`config.yaml` next to itself**, i.e. `bin/<platform>/config.yaml` (`bin/windows/config.yaml` on Windows). A `bin/config.yaml` still works: when the platform file is missing, a run copies it there first. The file must start with `version: 0.7` (a number: `"V0.7"` fails with `cannot unmarshal !!str into float64`, no version reads as V0.0); copy `bin/config.example.yaml`, which has the binary's own layout, rather than `enscan -v` (it writes a 0-byte file). `doctor` reports the file's `state` (`ok`/`missing`/`empty`/`version_mismatch`/`no_cookie`) under `enscan_config`, never the Cookie:
 
 ```yaml
 cookies:

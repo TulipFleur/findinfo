@@ -812,6 +812,13 @@ def worker_main(ref) -> int:
         upd["coverage"] = {"complete": False,
                            "reason": "no_summary_for_attempt",
                            "attempt": int(spec.get("attempt") or 1)}
+        # The pipeline records WHY it stopped (last_error) before it exits;
+        # carry that into the result an agent reads, instead of leaving only
+        # "no summary" -- the reason used to be visible in status.json alone.
+        if not cancelled:
+            _le = (read_state(rd) or {}).get("last_error") or {}
+            if isinstance(_le, dict) and _le.get("message"):
+                upd["result"]["error"] = str(_le["message"])[:300]
     if err:
         upd["last_error"] = {"type": "unexpected", "message": err.splitlines()[-1][:300],
                              "traceback_tail": err}

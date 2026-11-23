@@ -10,6 +10,7 @@ module reaches core/tools/work/... through the module object at call time.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -785,7 +786,12 @@ def _stage_entity(ctx: RunContext) -> None:
             # shape -- table seen, JSON missing -- and let the stage
             # record a coverage gap instead of a red failure.
             msg = ("enscan rc=" + str(r.get("rc")) + " no output files" +
-                   (" (report table printed, JSON missing)" if r.get("table_only") else ""))
+                   (" (report table printed, JSON missing)" if r.get("table_only") else "") +
+                   # "没有找到配置文件" and a version mismatch both end here:
+                   # name the config problem instead of a bare exit code
+                   ((" (config " + str(r.get("config_state")) + ": " +
+                     str(r.get("config_path") or "") + ")")
+                    if r.get("config_state") not in (None, "ok") else ""))
             partial = {"companies": 0, "icp": 0, "domains": 0,
                        "table_only": bool(r.get("table_only"))}
             if r.get("subjects"):
@@ -833,7 +839,11 @@ def _stage_entity(ctx: RunContext) -> None:
         args, _entity,
         lambda r: {"companies": len(r.get("companies", [])),
                    "icp": len(r.get("icp", [])),
-                   "domains": len(r.get("domains", []))},
+                   "domains": len(r.get("domains", []))} |
+        # a legal name that does not contain the brand was accepted: say why
+        ({"anchor_basis": "brand_evidence",
+          "brand_evidence": list(r.get("brand_evidence") or [])[:5]}
+         if r.get("anchor_basis") == "brand_evidence" else {}),
         resume=lambda: {"companies": [], "icp": [], "domains": []})
     # Persist the APPROVED subject references for this run: the seed
     # step below, a resumed attempt and the durable anchor all read
@@ -894,41 +904,52 @@ def _stage_entity(ctx: RunContext) -> None:
                       approved_company_names=approved_names)
 
 
+def check_user_domains(values) -> list:
+    """The canonical seeds for the caller's --domain values, or a refusal.
+
+    Shared by the run and by the background launcher, so a bad value is
+    refused before a worker exists instead of failing inside it.
+    """
+    out = []
+    # User-typed input: canon_user_domain validates INTENT (private
+    # TLDs like .local, bare IPs, IDN -> punycode are all legitimate
+    # targets). The strict canon_domain de-noiser used to sit here and
+    # silently threw 127.0.0.1:18765 / *.test / dev.corp.local away.
+    for d in values or []:
+        # An IP:port / endpoint target is NOT silently reduced to its
+        # host: the current pipeline cannot carry an explicit port
+        # through to a collection stage, and dropping the port then
+        # reporting "no seeds" hides what the caller actually asked
+        # for (F12). Report the limit and stop.
+        _endpoint_of = getattr(tools, "endpoint_of", None)
+        if _endpoint_of is not None:
+            _ip, _port = _endpoint_of(d)
+        else:
+            _ip, _port = None, None
+        if _ip and _port:
+            raise core.FindInfoError(
+                "unsupported_target_kind: '" + str(d) + "' is an "
+                "IP:port endpoint target; this build's run path has no "
+                "endpoint collection stage (the port would be dropped "
+                "silently). Pass the bare IP '" + str(_ip) + "' or a "
+                "domain instead, and probe the port with the disabled "
+                "active stages once supported.")
+        cd = core.canon_user_domain(d)
+        if not cd:
+            raise core.FindInfoError(
+                "invalid domain: " + str(d) +
+                " (user input is never dropped silently; fix the value "
+                "or drop the flag explicitly)")
+        out.append(cd)
+    return out
+
+
 def _collect_seed_domains(ctx: RunContext) -> None:
     """Seeds from the caller's --domain values, then from the approved subjects."""
     args, store, summary = ctx.args, ctx.store, ctx.summary
     domains, icp_codes = ctx.domains, ctx.icp_codes
     if args.domain:
-        # User-typed input: canon_user_domain validates INTENT (private
-        # TLDs like .local, bare IPs, IDN -> punycode are all legitimate
-        # targets). The strict canon_domain de-noiser used to sit here and
-        # silently threw 127.0.0.1:18765 / *.test / dev.corp.local away.
-        for d in args.domain:
-            # An IP:port / endpoint target is NOT silently reduced to its
-            # host: the current pipeline cannot carry an explicit port
-            # through to a collection stage, and dropping the port then
-            # reporting "no seeds" hides what the caller actually asked
-            # for (F12). Report the limit and stop.
-            _endpoint_of = getattr(tools, "endpoint_of", None)
-            if _endpoint_of is not None:
-                _ip, _port = _endpoint_of(d)
-            else:
-                _ip, _port = None, None
-            if _ip and _port:
-                raise core.FindInfoError(
-                    "unsupported_target_kind: '" + str(d) + "' is an "
-                    "IP:port endpoint target; this build's run path has no "
-                    "endpoint collection stage (the port would be dropped "
-                    "silently). Pass the bare IP '" + str(_ip) + "' or a "
-                    "domain instead, and probe the port with the disabled "
-                    "active stages once supported.")
-            cd = core.canon_user_domain(d)
-            if not cd:
-                raise core.FindInfoError(
-                    "invalid domain: " + str(d) +
-                    " (user input is never dropped silently; fix the value "
-                    "or drop the flag explicitly)")
-            domains.append(cd)
+        domains.extend(check_user_domains(args.domain))
     if args.name:
         # Seeds come from the APPROVED SUBJECT's assets, looked up through
         # the subject reference -- never by parent == the search string.
@@ -1147,11 +1168,16 @@ def _stage_certs(ctx: RunContext) -> None:
     def _certs():
         total = 0
         failed: list = []
-        for d in seeds:
-            r = tools.t_certs(store, d, timeout=tool_timeout)
-            total += r["count"]
-            if not r.get("ok", True):
-                failed.append(d)
+        # one breaker per stage: an upstream that failed two seeds in a row
+        # is not asked for the rest (the skipped seeds stay failed: retried).
+        # A collector module without it (a test's fake tools) just runs.
+        _breaker = getattr(tools, "cert_breaker", None)
+        with (_breaker() if _breaker else contextlib.nullcontext()):
+            for d in seeds:
+                r = tools.t_certs(store, d, timeout=tool_timeout)
+                total += r["count"]
+                if not r.get("ok", True):
+                    failed.append(d)
         res = {"found": total, "failed_seeds": failed}
         if failed:
             raise core.StageError(
@@ -1494,7 +1520,9 @@ def _stage_ports(ctx: RunContext) -> None:
                            timeout=tool_timeout)
         res = {"open": pr["count"]}
         if not pr.get("ok", True):
-            raise core.StageError("naabu rc=" + str(pr.get("rc")), result=res)
+            _why = (str(pr.get("error") or "").strip().splitlines() or [""])[-1]
+            raise core.StageError("naabu rc=" + str(pr.get("rc")) +
+                                  ((": " + _why[:200]) if _why else ""), result=res)
         return res
     _stage(store, run_dir, summary, "ports",
            {"ips": cand_ips, "top_ports": args.top_ports, "round": round_no},
@@ -2105,6 +2133,9 @@ def _run_pipeline(args) -> int:
         _run_rounds(ctx)
         return _finish_run(ctx)
     except Exception as exc:
+        # stderr is what a waiting agent reads first: name the reason there
+        # too, not only in status.json
+        core.log("run failed: " + type(exc).__name__ + ": " + str(exc)[:300])
         _write_status(ctx.run_dir, state="failed", error=repr(exc)[:500],
                       last_error={"type": type(exc).__name__, "message": str(exc)[:300]})
         raise

@@ -209,6 +209,7 @@ def coverage(store, task: str | None = None) -> dict:
             "failed": by.get(metered.ST_FAILED, 0),
             "quota": by.get(metered.ST_QUOTA, 0),
             "auth": by.get(metered.ST_AUTH, 0),
+            "rate_limited": by.get(metered.ST_RATE, 0),
             "unconfirmed": by.get(metered.ST_UNCERTAIN, 0),
             "total": asked,
         }

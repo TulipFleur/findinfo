@@ -5,6 +5,41 @@
 
 每条都标注了对应的提交，可用 `git show <短哈希>` 核对。
 
+## [Unreleased]
+
+### 一次真实运行暴露的问题（2026-11-23 报告）
+
+- **ENScan 报告按真实结构解析**。一份 aqc 报告就是一家被查公司：`enterprise_info` 是主体，
+  icp / app / wx_app / wechat / copyright 是它自己的资产，invest / partner 等是别的公司。
+  过去每条带 `name` 的记录（APP、公众号、软著）都被当成公司，一份真实报告解析出 82 个
+  "主体"，`company_name` 为空的 ICP 表因此谁都不归：用全称锚定成功，种子域名却是 0。
+  现在 16 个备案域名、备案号和 APP 都归到被查公司；域名只取备案的 `domain`，不再把
+  应用商店链接（apps.apple.com 等）当成公司域名——4 个字以上的 APP 名过去还可能
+  通过名称门禁，把商店域名带进主动范围。
+- **简称按自身资产锚定**。"滴滴"这样的简称不含于任何法定名称，名称门禁会全部拒绝。
+  若报告里唯一的主体自己有至少 2 个 APP / 备案网站 / 公众号名称含该简称，就锚定它，
+  entity 阶段标注 `anchor_basis: brand_evidence` 并列出 `brand_evidence`；没有这类证据的
+  同名干扰项仍被拒绝。
+- **ENScan 配置位置与模板**。ENScan 读取与可执行文件同目录的 `config.yaml`
+  （`bin/<平台>/config.yaml`），文档与日志却一直写 `bin/config.yaml`。现在 ENScan 在 exe
+  目录运行；只有 `bin/config.yaml` 时先复制过去。`bin/config.example.yaml` 改为与随附二进制
+  内嵌模板同结构（`version: 0.7` 为数字，含 `user_agent` / `app` / `api` / `cookies`）。
+  `doctor` 新增 `enscan_config`（位置、版本、Cookie 是否已填，不输出 Cookie）；配置缺失或
+  版本不符时，entity 的阶段错误会写明。
+- **测绘限流单独成态**。"请求过于频繁，当前限额 10 次/分钟"、429、rate limit 记为
+  `rate_limited`（先于额度判断），不再记成失败：等一个窗口（`limits.mapping_rate_wait_sec`，
+  默认 60 秒）后重问一次，仍被限流的问题下次运行自动重问，无需 `--remap`，也不会封禁引擎。
+  FOFA 中转按自己的节奏发问（`limits.fofa_gateway_per_minute`，默认 10），单次行数不超过
+  `limits.fofa_gateway_max_rows`（默认 2000）。
+- **certs 不再因上游不通耗掉一小时**。`--tool-timeout 0` 过去被换算成 `--max-time 0` 加
+  15 秒进程上限：慢但可用的 crt.sh 回答全部丢失，不通时每次尝试都耗满 15 秒。现在 0 即
+  默认 60 秒，另加连接超时（`limits.http_connect_timeout`，默认 15 秒）。同一阶段里某个
+  上游连续两个种子失败后不再询问；跳过的种子仍记为失败，阶段不写检查点，下次运行重试。
+- **易用性**。`--domain a.com,b.com` 等同于重复传参；非法种子在后台任务启动前就被拒绝
+  （退出码 2）；运行失败的原因写入 stderr，worker 结果带 `result.error`；`--top-ports`
+  只接受 naabu 的预设 100 / 1000；naabu 失败时阶段错误附带它的 stderr。
+- changelog 补引见 `a688189`、`c2ec2cf`。
+
 ## [0.9.0] - 2026-11-22
 
 版本号提升与本节切分见 `97d9b55`。

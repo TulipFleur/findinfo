@@ -1264,7 +1264,15 @@ CURL = "curl"
 
 
 def curl(args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    # 0 is "the default", as --tool-timeout 0 is documented. It used to reach
+    # curl as `--max-time 0` (no limit) while the process was killed after
+    # 0 + 15 s: every answer slower than 15 s (crt.sh on a large domain) was
+    # lost, and a dead upstream still cost the full 15 s per try. The connect
+    # timeout makes a black-holed host fail fast without cutting a slow body.
+    timeout = int(timeout) if timeout and int(timeout) > 0 else 60
+    connect = int((CFG.get("limits") or {}).get("http_connect_timeout") or 15)
     base = [CURL, "-sS", "-L", "--max-time", str(timeout),
+            "--connect-timeout", str(max(1, min(connect, timeout))),
             "--retry", "2", "--retry-delay", "2",
             "-A", CFG.get("http", {}).get("user_agent", "findinfo")]
     # Windows schannel aborts with CRYPT_E_REVOCATION_OFFLINE (0x80092013) when
@@ -2011,6 +2019,11 @@ _BUCKETS: dict[str, TokenBucket] = {
 
 def throttle(name: str) -> None:
     b = _BUCKETS.get(name)
+    if b is None and name == "fofa-gateway":
+        # A FOFA relay publishes its own pace (the one seen in a real run:
+        # 10 questions a minute); asking faster only earns "请求过于频繁".
+        per_min = float((CFG.get("limits") or {}).get("fofa_gateway_per_minute") or 10)
+        b = _BUCKETS[name] = TokenBucket(per_min / 60.0, 1)
     if b:
         b.acquire()
 

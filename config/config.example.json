@@ -46,7 +46,12 @@
     "http_concurrency": 50,
     "per_host_rps": 5,
     "vhost_threads": 20,
-    "mapping_interval_ms": 1500
+    "mapping_interval_ms": 1500,
+    "mapping_rate_wait_sec": 60,
+    "mapping_rate_retries": 1,
+    "fofa_gateway_per_minute": 10,
+    "fofa_gateway_max_rows": 2000,
+    "http_connect_timeout": 15
   },
   "paths": {
     "resolvers": "",

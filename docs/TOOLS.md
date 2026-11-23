@@ -92,7 +92,8 @@ python findinfo.py entity --name "Example Corp" --invest 51 --deep 2
 }
 ```
 
-**Prerequisite**: `bin/config.yaml` must carry `cookies.aiqicha`. On failure stderr says the Cookie is not configured.
+**Prerequisite**: the config next to the binary (`bin/<platform>/config.yaml`; a `bin/config.yaml` is copied there) must have `version: 0.7` and `cookies.aiqicha`. A missing or mismatched config is named in the stage error (`config missing: <path>`); `doctor` shows it under `enscan_config`.
+**Brands**: a short brand that no legal name contains ("滴滴" vs 北京小桔科技集团有限公司) is anchored only when the report's company owns at least two apps / filed websites / WeChat accounts whose names contain it; the stage then says `anchor_basis: brand_evidence` and lists them in `brand_evidence`.
 **Note**: eyeball `companies` before continuing (same-name noise).
 
 **What lands in the store**: `company` (approved subjects only), `domain`, `icp`, and **`app`** (APP /
@@ -694,14 +695,14 @@ python findinfo.py run --domain example.com --active --ports
 | Parameter | Description |
 |---|---|
 | `--name` | company name (goes through ENScan) |
-| `--domain` | seed domains directly (repeatable; skips ENScan) |
+| `--domain` | seed domains directly (repeatable, or comma-separated `a.com,b.com`; skips ENScan); an invalid value is refused before a background worker starts |
 | `--active` | enable the traffic-generating stages |
 | `--ports` / `--vhost` / `--crawl` / `--brute` | append stages (imply `--active`; `--brute` needs Npcap) |
 | `--max-seed` | seed-domain cap for onepass/certs/subs/brute; default `0` expands all approved seeds, positive N selects the first N; mapping/DNS/probe remain scoped independently |
 | `--no-mapping` | disable paid mapping, including the entity name fallback; preserved in background jobs |
 | `--no-icp` | skip ICP mapping questions while keeping domain mapping |
 | `--remap` | explicitly re-ask stored mapping questions, including name fallback; preserved on worker replay; resume keeps the stored source policy |
-| `--top-ports` | port-scan range (default 1000) |
+| `--top-ports` | naabu preset: `100` or `1000` (default 1000); naabu refuses other numbers |
 | `--max-vhost-ips` | cap on candidate IPs to collide (default 10) |
 | `--dry-run` | compile the plan only: `run_id: null`, no db/home/process/credential, works with `--background`/`--resume` read-only |
 
