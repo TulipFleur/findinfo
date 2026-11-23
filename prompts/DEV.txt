@@ -34,6 +34,11 @@
    需要真实验证时另开任务、先获授权、并把记录放 `runs/REAL-TEST-NOTES.md`
    而不是测试代码里。
 4. 不绕过第三方 API 限速；限速是 `lib/metered.py` 的令牌桶职责，绕过即封 key。
+5. **对外发布不携带具体目标名**（隐私/授权边界）：GitHub Release notes、
+   commit message、公开文档、release 提交说明里**不写**具体挖掘目标
+   （如"滴滴""南开大学"等真实公司/机构名）；对外一律用"一次真实任务/
+   某真实目标"等中性表述。具体目标名只可出现在本地开发记录
+   （`runs/REAL-TEST-NOTES.md`、内部评审文档）里，这些本来就不进发布包。
 
 ## 3. 文档即契约（docs 是接口的一部分）
 
@@ -124,5 +129,6 @@
 - [ ] agent 可见行为变化已同步文档，`test_docs_commands` 通过
 - [ ] SKILL.md ≤15KB / AGENT.txt ≤12KB / description ≤1024 字符
 - [ ] 无密钥、无真实目标流量、无新增进程内绕锁
+- [ ] 对外文本（Release notes/commit/公开文档）不含具体目标名，只说"一次真实任务"
 - [ ] `git status` 干净（除计划内改动）；commit 说明写清"改了什么/为什么/怎么验证"
 - [ ] 新文件归对了开发面/使用面（`--dry-run` 确认）
