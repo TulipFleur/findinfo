@@ -212,8 +212,10 @@ def test_engine_without_key_is_skipped_with_a_reason():
 
 def test_engine_without_query_syntax_is_never_dispatched():
     s = _store()
-    _key(core, "zoomeye", "test-zoomeye-key")
-    usable, skipped = mapdispatch.engines_for("domain", "zoomeye")
+    # censys is the engine whose syntax is deliberately not configured
+    # (docs/MAPPING-SYNTAX.md); zoomeye/daydaymap now carry templates.
+    _key(core, "censys", "test-censys-token")
+    usable, skipped = mapdispatch.engines_for("domain", "censys")
     assert usable == [], ("no domain syntax known -> must not be asked", usable)
     assert any("syntax" in x["reason"] for x in skipped), skipped
     s.close()

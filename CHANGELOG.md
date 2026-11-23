@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-23
+
+版本号提升与本节切分见 `v1.0.0`。0.9.0 之后仓库只做三件事：发布包只留 agent 需要的文档、
+作业循环收敛为一份、一次真实滴滴任务暴露的缺陷全部修复（ENScan 报告结构、简称锚定、
+ENScan 配置位置、测绘限流、certs 超时、CLI 易用性）。
+
 ### 发布包只装 agent 需要的文档
 
 - **评审、方案和带日期的快照不进发布包**。`scripts/shipped.py` 新增 `is_dev_doc`：REVIEW-\*、
@@ -23,6 +29,11 @@
 - **SKILL.md 的判读细节移到 DATA-MODEL.md**：累计计数、复用答案的观测时间、JS 包与 HTML 的区别
   进入 §3 / §4；入口只留“`work_queue.outstanding > 0` 不算完成”和“truncated / known=false 不等于
   完整”两句并指向 DATA-MODEL。§2 的测绘语法链接改指 `docs/MAPPING-QUERIES.md`。
+- **开发会话约束固定成文**（`3ffd91f`）。新增 `prompts/DEV.txt`：开发/测试的固定提示词——测试
+  唯一标准（`python -m tests` 全绿、新测试登记 MODULES、禁联网）、零密钥/零真实目标硬边界、
+  文档即契约（预算上限 SKILL.md ≤15 KB / AGENT.txt ≤12 KB / description ≤1024）、架构分层与
+  ENScan 串行等不变量、提交纪律与收尾自检清单。它登记在 `scripts/shipped.py` 的 `DEV_FILES`，
+  永不进发布包；`test_shipped_manifest` 加了防漏断言，未来改清单漏掉它测试立刻红。
 
 ### 一次真实运行暴露的问题（2026-11-23 报告，`3e2abdd`）
 
@@ -55,7 +66,7 @@
 - **易用性**。`--domain a.com,b.com` 等同于重复传参；非法种子在后台任务启动前就被拒绝
   （退出码 2）；运行失败的原因写入 stderr，worker 结果带 `result.error`；`--top-ports`
   只接受 naabu 的预设 100 / 1000；naabu 失败时阶段错误附带它的 stderr。
-- changelog 补引见 `a688189`、`c2ec2cf`。
+- changelog 补引见 `a688189`、`c2ec2cf`；版本收口为 1.0.0 见 `v1.0.0`。
 
 ## [0.9.0] - 2026-11-22
 
@@ -118,6 +129,21 @@
   会往当前目录写 `config.yaml`，`cdncheck/chaos/dnsx/httpx/katana/naabu/subfinder/uncover` 八个目录
   被误提交（`subfinder` 另含 `provider-config.yaml`），内容无任何密钥；`%SystemDrive%/` 是 shell 把
   未展开的环境变量当字面路径所建。两者均已忽略并在规则旁注明原因。
+
+### 测绘平台语法总表与两个新引擎
+
+- **新增 `docs/MAPPING-SYNTAX.md`**：19 个字段（IP/C 段/host/domain/port/title/body/os/app/
+  protocol/icp/country/region/city/icon_hash/server/status_code）× 8 个平台（FOFA/Hunter/Quake/
+  ZoomEye/DayDayMap/Shodan/Censys/Zero）的语法对照，含逻辑组合写法与三处易错点（Shodan 冒号不带
+  引号、Censys v3 与 v2 字段名不同、备案字段只有 5 个平台有）。出处为随包 uncover 的 agent 源码。
+- **ZoomEye 与 DayDayMap 接入**。两者此前没有查询模板，因此从不被派发。现补：
+  `domain="{value}"`（两者）、`icp.number="{value}"`（DayDayMap）。
+- **DayDayMap 的凭据不在环境变量里**。uncover 从 `provider-config.yaml` 的 `daydaymap` 字段读取
+  （`sources/provider.go:129`），注入环境变量对它无效。新增 `core.provider_config_path()` /
+  `core.provider_engine_keys()` 与 `PROVIDER_FILE_ENGINES`：这类引擎的 `engine_has_key` 只看配置
+  文件，派发时补 `-pc <路径>`，避免「以为有 key 实则静默 0 条」。
+- DayDayMap 是唯一单页可达 10000 行的引擎（`MaxSize = 10000`，且 `pageSize = query.Limit`），
+  其余引擎固定 100 行/页。
 
 ### 三次采集：域名 / 证书 / 备案号
 

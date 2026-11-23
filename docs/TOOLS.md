@@ -191,7 +191,8 @@ page that fills the ceiling is `truncated`.
 | 3 | filings → domains/IPs | `map --icp "京ICP备…"` or `entity` | uncover / ENScan |
 
 uncover's `Result` is `timestamp/source/ip/port/host/url` only — certificates and filing numbers are cut off at that
-layer, so they cannot come from `map`. See [docs/MAPPING-QUERIES.md](MAPPING-QUERIES.md) §3.5.
+layer, so they cannot come from `map`. See [docs/MAPPING-QUERIES.md](MAPPING-QUERIES.md) §3.5 and the full
+field matrix in [docs/MAPPING-SYNTAX.md](MAPPING-SYNTAX.md) (19 fields x 8 platforms).
 
 ---
 

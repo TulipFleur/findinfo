@@ -70,10 +70,13 @@ def test_a_template_without_the_placeholder_is_rejected():
 
 
 def test_an_engine_with_no_template_is_never_asked():
-    """censys/zoomeye have no domain template: they must not be dispatched."""
-    for engine in ("censys", "zoomeye"):
-        assert core.uncover_query("domain", engine, "x.example.com") is None
-    usable, skipped = mapdispatch.engines_for("domain", "censys,zoomeye")
+    """censys has no domain template here: it must not be dispatched.
+
+    zoomeye/daydaymap DO have one now (docs/MAPPING-SYNTAX.md); censys keeps
+    being the example of "syntax not verified, so never ask".
+    """
+    assert core.uncover_query("domain", "censys", "x.example.com") is None
+    usable, skipped = mapdispatch.engines_for("domain", "censys")
     assert usable == [], usable
     assert all("syntax" in s["reason"] for s in skipped), skipped
 
@@ -469,3 +472,44 @@ def test_a_name_cannot_break_out_of_the_quoted_term():
         s.close()
     q = seen[0][seen[0].index("-q") + 1]
     assert q.count('"') == 2, ("exactly the two template quotes", q)
+
+
+# ---------------------------------------------------- the platform syntax table
+def test_zoomeye_and_daydaymap_have_their_own_syntax():
+    """docs/MAPPING-SYNTAX.md is the field matrix; these two were missing.
+
+    Each platform spells the same field differently (fofa `domain="x"`, quake
+    `domain:"x"`, shodan `hostname:x`). An engine with no template is never
+    dispatched, so adding the syntax is what makes it usable at all.
+    """
+    fresh_core()
+    assert core.uncover_query("domain", "zoomeye", "example.com") == \
+        'domain="example.com"'
+    assert core.uncover_query("domain", "daydaymap", "example.com") == \
+        'domain="example.com"'
+    assert core.uncover_query("icp", "daydaymap", "京ICP备1号") == \
+        'icp.number="京ICP备1号"'
+    # an engine with no ICP field must still answer None, not a bad query
+    assert core.uncover_query("icp", "shodan", "京ICP备1号") is None
+
+
+def test_a_provider_file_engine_is_not_trusted_from_an_env_var():
+    """uncover reads daydaymap's key from provider-config.yaml, not the env.
+
+    Reporting "has key" from an environment variable would dispatch a query
+    that cannot authenticate, and uncover reports that as rc=0/no rows -- a
+    silent zero that reads as "no assets".
+    """
+    core_ = fresh_core()
+    assert "daydaymap" in core_.PROVIDER_FILE_ENGINES
+    # no provider file -> no key, even if an env var is present
+    core_.CFG.setdefault("apis", {}).setdefault("daydaymap", {})["key"] = "env-key"
+    assert core_.engine_has_key("daydaymap") is False
+    # a provider file with the engine listed -> usable
+    p = core_.provider_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("daydaymap:\n  - file-key\n", encoding="utf-8")
+    try:
+        assert core_.engine_has_key("daydaymap") is True
+    finally:
+        p.unlink()

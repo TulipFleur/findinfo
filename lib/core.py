@@ -575,10 +575,16 @@ UNCOVER_ENGINE_KEYS = {
     "shodan": "shodan",
     "censys": "censys",
     "zoomeye": "zoomeye",
+    "daydaymap": "daydaymap",
     "securitytrails": "securitytrails",
     "virustotal": "virustotal",
     "chaos": "chaos",
 }
+
+# Engines whose credential uncover reads from provider-config.yaml instead
+# of the environment (sources/provider.go). Injected env vars are silently
+# ignored for these, so tool_env() reports them as needing a provider file.
+PROVIDER_FILE_ENGINES = frozenset(("daydaymap",))
 
 
 def engine_has_key(engine: str) -> bool:
@@ -595,7 +601,59 @@ def engine_has_key(engine: str) -> bool:
         # without the org id is still a usable credential (uncover falls back
         # to the token's own organization), but neither means "no key".
         return bool(api_key("censys"))
+    if name in PROVIDER_FILE_ENGINES:
+        # These are NOT read from the environment: uncover loads them from
+        # provider-config.yaml (sources/provider.go). Reporting "has key"
+        # from an env var would dispatch a query that cannot authenticate.
+        return bool(provider_engine_keys().get(name))
     return bool(api_key(name))
+
+
+def provider_config_path() -> Path:
+    """provider-config.yaml as uncover resolves it (cwd, then config dir).
+
+    uncover looks for ./provider-config.yaml and $HOME/.config/uncover/.
+    findinfo runs tools with cwd=bin/, so the file it actually reads is
+    bin/provider-config.yaml; CONF_DIR is where the operator edits it.
+    """
+    for cand in (CONF_DIR / "provider-config.yaml",
+                 BIN / "provider-config.yaml",
+                 Path.home() / ".config" / "uncover" / "provider-config.yaml"):
+        if cand.exists():
+            return cand
+    return CONF_DIR / "provider-config.yaml"
+
+
+def provider_engine_keys() -> dict:
+    """{engine: key} read from provider-config.yaml, for engines that need it.
+
+    Only presence matters to the dispatcher: whether the value is accepted
+    is the provider's answer, recorded in the task ledger like any other.
+    A malformed file returns {} rather than raising -- a bad optional config
+    must not break a run that does not use it.
+    """
+    p = provider_config_path()
+    if not p.exists():
+        return {}
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    out: dict = {}
+    engine = ""
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "	")) and ":" in line:
+            engine = line.split(":", 1)[0].strip().lower()
+            continue
+        item = line.strip()
+        if engine and item.startswith("-"):
+            val = item[1:].strip().strip(chr(34) + chr(39)).strip()
+            if val:
+                out.setdefault(engine, val)
+    return out
 
 
 # uncover hands `-q` to every engine VERBATIM -- it does not translate between
@@ -616,16 +674,22 @@ def engine_has_key(engine: str) -> bool:
 # template is never asked (a guessed syntax yields a silent zero).
 # Overridable via config `mapping.queries.<kind>.<engine>`; a template MUST
 # contain the placeholder `{value}` (validated on load).
+# Per-engine syntax, from the bundled uncover agents (docs/MAPPING-SYNTAX.md
+# holds the full field matrix with the same sources). An engine absent here is
+# never dispatched: a guessed syntax yields a silent zero.
 _DEFAULT_DOMAIN_QUERY = {
     "fofa": 'domain="{value}"',
     "quake": 'domain:"{value}"',
     "hunter": 'domain="{value}"',
     "shodan": 'hostname:"{value}"',
+    "zoomeye": 'domain="{value}"',
+    "daydaymap": 'domain="{value}"',
 }
 _DEFAULT_ICP_QUERY = {
     "fofa": 'icp="{value}"',
     "quake": 'icp:"{value}"',
     "hunter": 'icp.number="{value}"',
+    "daydaymap": 'icp.number="{value}"',
 }
 
 

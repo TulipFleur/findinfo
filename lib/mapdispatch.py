@@ -482,6 +482,11 @@ def ask(store, run_id: str, engine: str, kind: str, value: str,
         else:
             cmd = [core.tool("uncover"), "-q", query, "-e", engine,
                    "-json", "-silent", "-limit", str(max(1, cap))]
+            # An engine whose key uncover reads from provider-config.yaml
+            # (daydaymap) cannot be authenticated by an env var; point it
+            # at the configured file explicitly instead of failing silently.
+            if engine in core.PROVIDER_FILE_ENGINES:
+                cmd += ["-pc", str(core.provider_config_path())]
             # only the engine being asked gets its credential: uncover otherwise
             # runs with every configured engine key in its environment
             rc, out, err = core.run(cmd, timeout=timeout,
@@ -691,6 +696,8 @@ def check_engines(domain: str, engines: str | None = None,
         else:
             cmd = [core.tool("uncover"), "-q", query, "-e", engine,
                    "-json", "-silent", "-limit", "1"]
+            if engine in core.PROVIDER_FILE_ENGINES:
+                cmd += ["-pc", str(core.provider_config_path())]
             rc, body, err = core.run(cmd, timeout=timeout,
                                      env=core.tool_env("uncover", [engine]))
             rows = _parse_uncover_rows(body)
