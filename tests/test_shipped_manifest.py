@@ -156,6 +156,11 @@ DEV_ONLY_DOCS = (
 )
 
 
+# The dev-session constraints prompt: the file a developing agent follows is
+# not a file a consuming agent should ever see in its bundle.
+DEV_ONLY_PROMPTS = ("prompts/DEV.txt",)
+
+
 def test_reviews_plans_and_dated_docs_never_ship():
     sh = _shipped()
     import re
@@ -163,6 +168,8 @@ def test_reviews_plans_and_dated_docs_never_ship():
         files = set(sh.shipped_files(platform, ROOT))
         leaked = [d for d in DEV_ONLY_DOCS if d in files]
         assert not leaked, platform + " ships developer docs " + repr(leaked)
+        leaked_prompts = [d for d in DEV_ONLY_PROMPTS if d in files]
+        assert not leaked_prompts, platform + " ships dev prompts " + repr(leaked_prompts)
         dated = [f for f in files if f.startswith("docs/")
                  and re.search(r"\d{4}-\d{2}-\d{2}", f)]
         assert not dated, platform + " ships dated docs " + repr(dated)

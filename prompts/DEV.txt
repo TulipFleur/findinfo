@@ -1,0 +1,128 @@
+# findinfo 开发/测试固定提示词（DEV.txt）
+
+你正在 findinfo 源码仓库里做**开发、修复或测试**。本文件是每次开发会话的
+固定约束，与目标无关，逐条遵守；本文件的规则不适用于"使用这个 skill 采资产"的会话。
+
+仓库根：`E:\AI\skills\findinfo`。当前主线：`master`（本地为主，远程可落后）。
+
+## 0. 身份与目标
+
+你在改一个**给 agent 用的资产侦察 skill**，不是给人用的 CLI。一切改动以
+"agent 能否正确理解并执行"为验收标准，第二才是覆盖率/性能。
+
+## 1. 测试是唯一的完成标准
+
+1. **改完必跑**：`python -m tests`（Windows/Linux 均需通过，Python ≥3.10）。
+   全绿才算完成；有失败先修测试再动业务代码。
+2. **新功能必须带测试**：加一个功能 = 加至少一个 `tests/test_*.py` 用例，
+   并登记进 `tests/__main__.py` 的 `MODULES` 列表——不在列表里的测试等于不存在。
+3. **测试不许联网**：所有收集器用 fake/合成适配器模拟（参考
+   `tests/fake_pipeline.py`、`test_batch_*` 的写法）。不发真实 DNS、不碰
+   测绘配额、不读真实凭据。
+4. **不许为过测试而注释掉断言**。测试失败 = 要么实现错、要么测试的预期错；
+   判断清楚后改对的那一边，并在提交说明里写明。
+5. 一次性脚本验证不算测试；临时验证代码要么删掉、要么沉淀成可重复用例。
+
+## 2. 零密钥 / 零真实目标（硬边界）
+
+1. 仓库里**永不出现**真实 Cookie/API key/token。密钥只活在
+   `bin/config.yaml`（ENScan Cookie）与 `config/.env`——两者都在
+   `scripts/shipped.py` 的 `SECRETS` 排除清单里，提交前自查。
+2. 只有 `.example` 模板可提交。测试里的"美团/示例公司"等数据一律是合成的，
+   注释里写明。
+3. 开发期不对任何真实目标发起主动流量（probe/ports/vhost/crawl/brute）；
+   需要真实验证时另开任务、先获授权、并把记录放 `runs/REAL-TEST-NOTES.md`
+   而不是测试代码里。
+4. 不绕过第三方 API 限速；限速是 `lib/metered.py` 的令牌桶职责，绕过即封 key。
+
+## 3. 文档即契约（docs 是接口的一部分）
+
+这个仓库的特殊性：**SKILL.md 和 docs/ 是 agent 的 API**。改代码不改文档 =
+半成品；文档说错的命令比缺功能更糟（agent 会照做）。
+
+1. **改行为必须同步改文档**：命令参数、输出 JSON 字段、退出码、coverage
+   语义——任何 agent 可见的变化，同步更新 `SKILL.md` / `docs/TOOLS.md` /
+   `docs/DATA-MODEL.md` / `docs/TROUBLESHOOTING.md`。
+2. **`tests/test_docs_commands.py` 会机器校验文档与 argparse 的一致性**
+   （每个文档命令都真实可解析、无 nohup/&/no 禁词、预算不超限）。
+   改文档必须过这组测试，它就是防漂移的护栏。
+3. **入口预算是硬约束**：SKILL.md ≤ 15 KB、prompts/AGENT.txt ≤ 12 KB、
+   frontmatter description ≤ 1024 字符。超了就把细节挪进 docs/ 留链接，
+   不许放宽预算。
+4. **一条规则只在一处展开**：作业循环的 step-by-step 只在
+   `prompts/AGENT.txt`；命令细节只在 `docs/TOOLS.md`；coverage/数据语义
+   只在 `docs/DATA-MODEL.md`。其他文件只留一句要点 + 指针。发现同一规则
+   在两处展开 = 重构合并，别再抄第三份。
+5. **过程文档不进发布包**：带日期、带 commit 哈希、带评分的评审/方案文档
+   只留仓库，`scripts/shipped.py` 的 `is_dev_doc` 规则会排除它们；新写
+   这类文档时确认名字落在排除模式里（REVIEW*/带日期的文件名）。
+
+## 4. 架构约束（改哪里、不改哪里）
+
+1. **分层不许穿**：`findinfo.py`（CLI）→ `lib/pipeline.py`（调度，
+   StageRegistry/RunContext）→ `lib/tools.py`（阶段实现，全部返回结构化
+   数据）。外部工具只由 `lib/core.py` 的 `core.tool()` 解析，**只看
+   `<skill>/bin/<platform>/`，无 PATH 回退**——这是 doctor 契约，别加回退。
+2. **所有外部调用返回结构化结果**（成功/失败/原因），不靠裸文本猜。
+   新适配器照 `lib/tools.py` 里现有阶段的模式写。
+3. **`run` 的三个终态**：completed/failed/cancelled，没有 done；exit 5 =
+   "有阶段失败但结果可用"。状态机改了必须同步 `docs/TROUBLESHOOTING.md`。
+4. **长命令一律后台**：`run`/`entity`/`crawl`/`probe`/`ports`/`vhost`/
+   `brute`/`subs` 永远 `--background` + `wait --timeout`，这是 SKILL.md §5
+   的最高优先级规则；破坏它的文档措辞或实现都算 bug。
+5. **ENScan 全局串行**（进程内互斥 + 跨进程文件锁）：任何绕过会封 Cookie，
+   不许加并发。
+6. **检查点/恢复语义**：同命令重发跳过已完成工作；usable engines 参与
+   stage input hash（补 key 后重跑会真正执行新引擎）——改动时保持这两条。
+7. 范围隔离：store 读取必须 `--scope`/`--domain`；`--task` 隔离资产图。
+   改动不许引入"未加范围就读全库"的路径。
+
+## 5. 提交纪律
+
+1. **小步提交**：一个逻辑改动一个 commit，说明写清楚"改了什么、为什么、
+   验证方式（哪个测试）"。中英不混；仓库当前以英文为主，commit message
+   用英文。
+2. **提交前自查四件事**：`python -m tests` 全绿；`git status` 无计划外
+   文件（尤其 `.env`/`bin/config.yaml`/临时脚本）；文档同步了；新测试已
+   登记 MODULES。
+3. 不提交 `__pycache__`、`data/`、`runs/`、`cache/`、`_rel/`——这些是
+   运行态/产物，`.gitignore` 已管住，别用 `git add -f` 绕。
+4. 版本号在 `VERSION`；release 由 `scripts/build-release.py` 打包，
+   **打包脚本只决定"什么进目录"**；打 tag、建 GitHub Release、传 zip 是
+   人的活，别自作主张。
+5. CHANGELOG.md 按现有格式补条目；它是开发侧历史，不进发布包。
+
+## 6. 发布物纯净度（build-release 自检会机器验证）
+
+发布包 = git 跟踪文件 + 当前平台 bin/<platform>/* − 开发材料 − 过程文档 −
+平台不相关文件 − 密钥。`test_shipped_manifest` 和 build 后的 self-check
+（解包到临时目录跑 doctor）会验证；你的职责是新增文件时想清楚它属于哪类：
+
+- **会进包**（agent 使用面）：SKILL.md、docs/ 使用文档、lib/、findinfo.py、
+  wordlists/、bin/<platform>/、prompts/AGENT.txt
+- **不进包**（开发面）：tests/、agent-records/、rust/、scripts/ 构建脚本、
+  本文件（prompts/DEV.txt）、评审/带日期文档、CHANGELOG.md
+
+拿不准就跑 `python scripts/build-release.py --dry-run` 看清单。
+
+## 7. 遇到问题时的行为
+
+1. **先看测试怎么读**：`tests/` 是行为规范，测试名就是验收条目名。
+2. **不投机**：没有"临时先这样"的代码；每个 workaround 至少留一行注释说明
+   为什么非这样不可。
+3. **诚实陈述边界**：验证了什么、没验证什么，写进提交说明或
+   `docs/DEVELOPMENT.md` §3 的边界清单；不承诺测试没覆盖的行为。
+4. **不要自动推送**：push 由用户决定（本地 master 领先远程是常态）。
+5. 改 `scripts/shipped.py`（发布清单）或 `tests/__main__.py`（测试注册）时
+   保持它们各自"唯一规则源"的地位：shipped.py 是打包规则唯一源，
+   __main__.py 是测试清单唯一源。
+
+## 8. 快速自检清单（每次改动收尾过一遍）
+
+- [ ] `python -m tests` 全绿
+- [ ] 新测试在 `MODULES` 里注册
+- [ ] agent 可见行为变化已同步文档，`test_docs_commands` 通过
+- [ ] SKILL.md ≤15KB / AGENT.txt ≤12KB / description ≤1024 字符
+- [ ] 无密钥、无真实目标流量、无新增进程内绕锁
+- [ ] `git status` 干净（除计划内改动）；commit 说明写清"改了什么/为什么/怎么验证"
+- [ ] 新文件归对了开发面/使用面（`--dry-run` 确认）

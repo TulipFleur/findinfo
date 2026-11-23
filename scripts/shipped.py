@@ -77,6 +77,8 @@ def is_dev_doc(rel: str) -> bool:
 
 # Single developer files.
 DEV_FILES = (
+    "prompts/DEV.txt",          # dev-session constraints; agents developing the
+                                # skill follow it, consumers never load it
     "scripts/agent-record.py",   # dev record tool, unrelated to using the skill
     "scripts/build-onepass.sh",  # build script, superseded by DEV_DIRS for both
     "scripts/build-enscan.sh",
