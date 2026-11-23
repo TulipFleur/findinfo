@@ -16,9 +16,9 @@
 | quake | ✅ domain / icp | `QUAKE_TOKEN` | 100 行/页，100 credit/页 |
 | hunter | ✅ domain / icp | `HUNTER_API_KEY` | 免费账号无 openApi |
 | shodan | ✅ domain | `SHODAN_API_KEY` | 无 ICP 字段 |
-| zoomeye | ❌ 未配 | `ZOOMEYE_API_KEY` | 语法已知，见 §2 |
+| zoomeye | ✅ domain | `ZOOMEYE_API_KEY` | 无 ICP 模板 |
 | censys | ❌ 未配 | `CENSYS_API_TOKEN` + `CENSYS_ORGANIZATION_ID` | v2 语法差异大 |
-| daydaymap | ❌ 未配 | **`provider-config.yaml` 的 `daydaymap`**（非环境变量） | 单页可达 10000 |
+| daydaymap | ✅ domain / icp | **`provider-config.yaml` 的 `daydaymap`**（非环境变量） | 单页可达 10000 |
 | securitytrails / virustotal / chaos | ❌ | 仅 onepass 使用 | — |
 
 ## 2. 字段语法总表
@@ -74,10 +74,10 @@ Shodan  : hostname:example.com -port:443 http.title:"后台"
 
 `lib/core.py::_DEFAULT_DOMAIN_QUERY` / `_DEFAULT_ICP_QUERY`：
 
-| kind | fofa | quake | hunter | shodan |
-|---|---|---|---|---|
-| domain | `domain="{value}"` | `domain:"{value}"` | `domain="{value}"` | `hostname:"{value}"` |
-| icp | `icp="{value}"` | `icp:"{value}"` | `icp.number="{value}"` | —（无模板） |
+| kind | fofa | quake | hunter | shodan | zoomeye | daydaymap |
+|---|---|---|---|---|---|---|
+| domain | `domain="{value}"` | `domain:"{value}"` | `domain="{value}"` | `hostname:"{value}"` | `domain="{value}"` | `domain="{value}"` |
+| icp | `icp="{value}"` | `icp:"{value}"` | `icp.number="{value}"` | —（无模板） | —（无模板） | `icp.number="{value}"` |
 
 覆盖方式（`config/config.json`）：
 

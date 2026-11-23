@@ -44,6 +44,10 @@ When `sources` reads `onepass:crtsh,rapiddns`, do not treat it as "1 source" —
 
 ## 3. Report field conventions (`brief` / `report` / `report.json`)
 
+**Delivery files**: `report` writes `report.html` by default. `--with-md`, `--with-json` and `--with-brief` independently opt into `report.md`, `report.json` and `report.brief.json`; a missing path key means that format was not requested. The Agent reads the `brief` command's bounded stdout JSON (no file), then actually runs `report --run <id>` and links the returned HTML path. A hand-written Markdown summary is not a substitute for the report.
+
+**Full collection and gaps**: a default Agent request selects discovery/DNS/probe/ipagg/ports/vhost/crawl/extract in one background job. Mapping keys/Cookie affect only dependent sources; with trusted domain seeds the available keyless stages continue. Missing credentials are not evidence that later stages ran, and a justified `no_input` must remain distinguishable from a real dispatch. Only an explicit passive-only or single-stage request narrows this workflow; the low-level CLI still has its compatible passive default.
+
 **Scope determination**: without `--match`, the most recent `run`'s target domain is used automatically (`scope.auto=true`);
 with neither, the whole store is covered and a warning is raised. When the store holds cross-engagement leftovers, the report counts records outside the target domain as
 `domains_dropped` / `endpoints_noise`, lists them at the top of the HTML as "quarantined noise", and **excludes them from conclusions**.

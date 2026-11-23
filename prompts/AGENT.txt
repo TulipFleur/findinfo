@@ -4,19 +4,17 @@ How to use: copy "Task" through "One-liner version" into a fresh agent session a
 
 | Placeholder | Meaning | Required |
 |---|---|---|
-| `{{TARGET}}` | Target domain(s), space-separated: `example.com example.org` | required |
+| `{{TARGET}}` | Verified root domain used by the CLI examples; for several roots repeat `--domain` / `--match` (do not pass a bare space-separated list) | required before collection |
 | `{{NAME}}` | Company name; may contain spaces and non-ASCII, **quote it**; leave empty if unsure | optional |
 | `{{TASK}}` | Task name isolating the asset graph; recommend the main domain like `example-com`; non-ASCII allowed | required |
 | `{{RUN_ID}}` | run id returned by `run --background`; **only known at runtime**, do not pre-replace | runtime |
-| `{{AUTHORIZED}}` | The user's authorisation scope for `{{TARGET}}` (e.g. "our own assets, active scanning allowed") | required for active stages |
 
-Goal: first results, then depth — never block. This file is a **workflow template**; capabilities and parameters are defined by `SKILL.md` (the machine entry) and `--help` — on conflict, tell the user. Rules in [SKILL.md](SKILL.md) §5, failures and progression in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+Goal: carry one full collection job through its actual result — never stop at a passive first pass or at “started”. This file is a **workflow template**; capabilities and parameters are defined by `SKILL.md` (the machine entry) and `--help` — on conflict, tell the user. Rules in [SKILL.md](SKILL.md) §5, failures and progression in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ## Task
 
-Map the assets of **{{TARGET}}** (company name: {{NAME}}), producing an asset graph with provenance and confidence plus an endpoint table.
-Passive stages (entity/certs/passive/icp/subs/dns) query third-party sources only and never touch the target.
-Active stages (probe/ports/vhost/crawl/brute) send real traffic — **they require prior authorisation confirmation** (section 1).
+Collect the assets of **{{TARGET}}** (company name: {{NAME}}), producing an asset graph with provenance/confidence, an endpoint table and a real HTML report.
+“Collect XX assets” defaults to passive discovery, DNS, probe, IP aggregation, ports, vhost, crawl and extract. Only an explicit passive-only or single-stage request narrows the plan. Active stages send traffic to the supplied target. Dictionary brute force is optional, outside this default.
 
 ## 0. Locate the skill (30 seconds, mandatory)
 
@@ -32,94 +30,57 @@ python -c "import os,pathlib;c=[os.path.expanduser(p) for p in ('~/.agents/skill
 python findinfo.py --task {{TASK}} doctor
 ```
 
-Three mandatory doctor checks: `tools_summary.all_in_bin == true` (count = `tools_summary.total`), `environment.python_ok == true`, `net_egress.any_reachable == true`. If any fails: stop, report the blocks verbatim, install nothing, force no run.
+Three mandatory doctor checks: `tools_summary.all_in_bin == true` (count = `tools_summary.total`), `environment.python_ok == true`, `environment.net_egress.any_reachable == true`. If any fails: stop, report the blocks verbatim, install nothing, force no run. Missing mapping keys/Cookie are source gaps, not reasons to abandon the available keyless chain.
 
-## 1. Authorisation and scope confirmation (gate for active stages, not skippable)
+## 1. Target and scope
 
-Before **any** active stage (`probe`/`ports`/`vhost`/`crawl`/`brute`, `run --active`), confirm two things in the conversation:
-① Are you authorised to actively scan `{{TARGET}}` (scope: {{AUTHORIZED}})? ② Only these domains, or related companies/subsidiaries too?
+Use the target supplied by the user. Do not routinely ask for authorisation or whether subsidiaries should be included before starting. Add related companies only when the user explicitly names them; related assets found during collection are candidates, not an automatic scope expansion.
 
-- Explicit confirmation → continue and cite the authorisation basis in the delivery.
-- Not confirmed / unsure / no answer → **passive stages only**, and state in the delivery "active stages not run: no authorisation confirmed". Never substitute "it's internal testing anyway" for a confirmation.
+- If a trusted domain is supplied, use it directly. For multiple roots, repeat `--domain` (and `--match` for delivery).
+- If only a company name is supplied, use available entity anchoring. If Cookie/mapping keys are absent or cannot establish an anchor, use available search to verify the official root domain from reliable company evidence, then use that verified domain as `{{TARGET}}`. Never guess a domain or select an ambiguous company. Only when no trustworthy seed can be verified, explain the blocker and request a root domain.
+- Keep the same explicit task/home and run_id in every follow-up command. Missing credentials alone do not shrink the requested stages.
 
 ## 2. Rules
 
 The rules this loop relies on are stated once, in [SKILL.md](SKILL.md): one JSON line on stdout (§0), scope every store read (§1), and the hard rules (§5). Read them there before step 3; they are not paraphrased here, so the two cannot drift apart.
 
-## 3. Fast path (first pass in 5–10 minutes, purely passive)
+## 3. Default full job (one background run)
 
-Results first, depth later. Do not chain everything at once:
-
-```bash
-# 1) certificate transparency (zero target contact, best ROI)
-python findinfo.py --task {{TASK}} certs --domain {{TARGET}} --tool-timeout 120
-
-# 2) multi-source passive aggregation (some sources need no key; missing key = coverage gap, not failure)
-python findinfo.py --task {{TASK}} passive --domain {{TARGET}} --tool-timeout 180
-
-# 3) multi-source passive subdomains
-python findinfo.py --task {{TASK}} subs --domain {{TARGET}} --tool-timeout 180
-
-# 3b) PAID mapping: the ONLY quota-spending step. Returns DOMAINS + IPs only --
-# certificates come from (1) and filings from 4.1; it does not replace them.
-# One question per task: re-running reuses the ledger, `--remap` pays again.
-python findinfo.py --task {{TASK}} map --domain {{TARGET}} --engines fofa,quake,hunter,shodan
-
-# 4) resolve + wildcard filtering (mandatory; skipping it turns 300 rows into 30k fake assets)
-python findinfo.py --task {{TASK}} dns --from-store --scope {{TARGET}} --tool-timeout 300
-
-# 5) look at the first-pass asset graph
-python findinfo.py --task {{TASK}} assets --min-conf 0.7 --limit 50
-```
-
-At this point give the user a **first-pass summary** (domain/resolved/IP counts, high-risk naming), then continue with section 4.
-
-## 4. Full path (keep deepening)
-
-### 4.1 Passive extras (still no target contact)
+Start the full job once. Do not run a separate foreground passive checklist first:
 
 ```bash
-# company anchoring (needs the aiqicha Cookie in bin/config.yaml; otherwise skip and say so)
-python findinfo.py --task {{TASK}} entity --name "{{NAME}}" --invest 51 --deep 2 --tool-timeout 1200
-
-# ICP reverse lookup (needs mapping-platform keys; otherwise skip and say so)
-python findinfo.py --task {{TASK}} icp --from-store --scope {{TARGET}} --tool-timeout 120
+python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --ports --vhost --crawl --background --rounds 3
 ```
 
-### 4.2 Active stages (**pass section 1 authorisation first**)
+Save the returned run_id and follow section 6 until the job finishes. Use progress from this same job for brief updates; a passive summary is not the final delivery. The underlying CLI still defaults to passive when active flags are omitted, for compatibility: never mistake that low-level default for this Agent workflow.
 
-Schedule them together with `run --background` instead of chaining foreground calls:
+## 4. What the full job must cover
 
-```bash
-python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --vhost --crawl --ports --background --rounds 3
+### 4.1 Discovery and credential gaps
+
+The job collects `onepass -> certs -> subs`, then available domain/ICP mapping. Mapping is the quota-spending source; its task ledger reuses answers unless `--remap` explicitly asks again. Entity anchoring needs its Cookie. A domain seed does not need that Cookie.
+
+When a mapping key/Cookie is missing, skip only its dependent source and record the coverage gap. Continue every available keyless stage. Do not switch to passive-only, deliver early, request credentials as a prerequisite, or resume solely because a key is missing. Do not automatically persist `--no-mapping` merely because keys are currently absent; an explicit opt-out is a different source policy.
+
+### 4.2 Verification and expansion
+
+The full job continues in this order:
+
+```text
+dns -> probe -> ipagg -> ports -> vhost -> crawl -> extract
 ```
 
-When topping up a single stage (foreground, `--tool-timeout` mandatory):
+DNS filters wildcard noise; probe records liveness/fingerprints/IPs; ipagg removes CDN collision candidates; ports/vhost find services; crawl/extract expand in-scope Web/JS clues. A stage with no valid input may return `no_input`; report that reason rather than claiming it sent traffic. Missing tools, time/round limits and unavailable sources must remain visible in coverage.
 
-```bash
-# liveness / fingerprint / IP / CDN
-python findinfo.py --task {{TASK}} probe --from-store --scope {{TARGET}} --min-conf 0.7 --tool-timeout 600
+### 4.3 Optional dictionary brute force (active)
 
-# IP aggregation + CDN removal (finds collision candidates: IPs shared by many domains)
-python findinfo.py --task {{TASK}} ipagg --scope {{TARGET}}
-
-# Host-header collision: the best-value step, internal systems hide here
-python findinfo.py --task {{TASK}} vhost --ip <candidate-ip> --from-store --wordlist vhost --domain {{TARGET}} --tool-timeout 900
-
-# crawl + JS/page leak extraction
-python findinfo.py --task {{TASK}} crawl --from-store --domain {{TARGET}} --depth 3 --tool-timeout 1800
-python findinfo.py --task {{TASK}} extract --from-store --domain {{TARGET}} --tool-timeout 600
-```
-
-### 4.3 Dictionary brute force (active stage, needs authorisation)
-
-ksubdomain sends raw DNS packets, needs Npcap; **never without section 1 confirmation**.
+Only add dictionary brute force when it is requested or needed as a stated extension. ksubdomain sends raw DNS packets and needs Npcap. The standalone command is a reference for an explicitly requested single stage, not part of the default foreground flow:
 
 ```bash
 python findinfo.py --task {{TASK}} brute --domain {{TARGET}} --wordlist sub --tool-timeout 900   # add --bandwidth 5m to go bigger
 ```
 
-Lower `--min-conf` = slower but fuller. Ports: `run --ports` or candidate IPs only.
+Keep the user's target scope and the tool's traffic/budget limits.
 
 ## 5. Reflow loop (the heart of "full", do not skip)
 
@@ -129,18 +90,17 @@ Lower `--min-conf` = slower but fuller. Ports: `run --ports` or candidate IPs on
 new domains from extract
   -> dns --from-store --scope {{TARGET}} (resolve + wildcard filter)
   -> probe --from-store --scope {{TARGET}} (new live hosts)
-  -> ipagg -> vhost (new shared IPs)
+  -> ipagg -> ports -> vhost (new shared IPs)
   -> crawl -> extract (next round)
 ```
 
-**Convergence (as implemented — invent no percentages)**: each round compares in-scope domain counts; **stop when this round adds nothing** (`stop_reason = no_new_assets`); `--rounds` **defaults to 1**, more rounds must be explicit.
-Not converged: `coverage.work_queue.outstanding > 0` -> keep going (`partial`/`work_pending` until it drains); `coverage.js_queue` mirrors the same run-scoped queue. A wait timeout is not a failure: call wait again on the SAME run id, never start a second run.
+Read the actual result and coverage for convergence. A stable domain count alone is insufficient: `coverage.work_queue.outstanding > 0` means `partial`/`work_pending`; `coverage.js_queue` mirrors the run-scoped queue. The Agent command explicitly uses 3 rounds; the low-level CLI defaults to 1. If a budget ends with pending work, state the partial result and reason; continue only when recovery or an appropriate budget extension can advance it. A wait timeout is not a failure: call wait again on the SAME run id, never start a second run.
 
 ## 6. Long jobs: background + bounded wait (no nohup)
 
 ```bash
 # 1) start: returns the run_id and result paths immediately
-python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --vhost --crawl --background --rounds 3
+python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --ports --vhost --crawl --background --rounds 3
 
 # 2) bounded wait: 30 seconds max per call, returns early on progress/completion/failure
 python findinfo.py --task {{TASK}} wait --run {{RUN_ID}} --timeout 30
@@ -152,63 +112,43 @@ Reading and progression (full table in [docs/TROUBLESHOOTING.md](docs/TROUBLESHO
 |---|---|
 | `running` (`timed_out` or `changed`) | Wait window ended / progress happened: keep calling `wait` on the same run_id, **do not restart**; on `changed:true` give the user a one-line stage summary |
 | `completed` | Read `result`/`coverage`, go to section 7 delivery |
-| `failed` | Read `coverage.failed_stages` + `last_error`, then `run --resume {{RUN_ID}}` |
+| `failed` | Read `coverage.failed_stages` + `last_error`; resume the same run only when the failure is recoverable |
 | `cancelled` | Report what was collected; do not restart |
 | `interrupted: true` | `reaped_by_host: true` → switch to foreground; `false` → `run --resume` |
 
-- `progress.percent` being **null** means the total is unknown: say "N rows processed", never invent a percentage.
+- `percent` in compact `wait` (or `progress.percent` in `status`) being **null** means the total is unknown: say "N rows processed", never invent a percentage.
 - `reused: true` = an identical run already exists: use its run_id, do not start another. Address jobs **by run_id only**.
 
-## 7. Delivery template
+## 7. Delivery: generate and link the HTML
 
-Fill the table from the asset graph:
-
-```text
-## Target: {{TARGET}}
-## Authorisation: {{AUTHORIZED}} (if unconfirmed write "passive only, no active authorisation")
-## Scale: domains N / live M / IPs K / ports P / internal services V / endpoints E
-
-### 1. Main domains and key subdomains (conf >= 0.7)
-| Domain | Status | Title | Tech | IP | Sources |
-
-### 2. IPs and ports
-| IP | Ports | Reverse domains | CDN |
-
-### 3. Internal services (vhost hits)
-| Host | IP:Port | Status | Title | Evidence |
-
-### 4. Endpoints and leaks
-| Asset | Method | Path template | Params | Source |
-
-### 5. Open items and next steps
-```
-
-**Delivery is two steps** — you read `brief`, humans get `report`; do not assemble tables by hand:
+After the job reaches a terminal state, inspect its verdict and coverage. **Delivery is two steps** — read `brief`, then actually run `report`; do not assemble Markdown tables as a substitute:
 
 ```bash
 # your read API: include --run so coverage gaps reflect THIS run
 python findinfo.py --task {{TASK}} brief --run {{RUN_ID}}
-# human deliverables: md + html (machine files need --with-json/--with-brief)
-python findinfo.py --task {{TASK}} report --match {{TARGET}} --slug "{{TASK}}"
+# human deliverable: HTML only by default, tied to the same run
+python findinfo.py --task {{TASK}} report --run {{RUN_ID}} --match {{TARGET}} --slug "{{TASK}}"
 ```
 
-`coverage.source` is the run id that was read; `known=false` means no run was read (**not** "no gaps"). Truncated arrays report kept/total in `truncated`. Never read `report.json` (600 KB+ on large targets) into context.
+Deliver the actual returned `paths.html` as a clickable file path, with a short statement of the end reason, executed/failed/not-run stages and material gaps. Never invent an artifact path or replace the report with a hand-written `.md` file. Add `--with-md` only when Markdown is explicitly requested; `--with-json` / `--with-brief` remain opt-in. `brief` writes no files.
+
+`coverage.source` is the run id read; `known=false` means no run was read (**not** "no gaps"). Truncated arrays report kept/total in `truncated`. Never read a large `report.json` into context.
 
 ## 8. One-liner version (when only a minimal prompt is wanted)
 
 ```text
-Use the findinfo skill to fully collect the assets of {{TARGET}} (authorisation: {{AUTHORIZED}}).
+Use the findinfo skill to fully collect the assets of {{TARGET}}.
 0) Locate the skill directory (python -c over candidate paths) -> doctor (require tools_summary.all_in_bin=true)
-1) Authorisation gate: confirm with the user that {{TARGET}} is in scope and what the authorisation is;
-   without confirmation run passive stages only and say so in the delivery
-2) Passive first pass: certs / passive / subs / dns --from-store --scope {{TARGET}} / assets
-3) Start the active job (only after authorisation is confirmed): run --domain {{TARGET}} --active --vhost --crawl --background --rounds 3
+1) Use the supplied target without a routine confirmation gate; related companies need explicit user inclusion.
+   Company-only input without usable anchoring -> search to verify its official root domain; never guess; request a seed only if verification fails.
+2) Default means full collection, not a passive first pass; missing mapping keys/Cookie skip only dependent sources.
+3) Start one job: python findinfo.py --task {{TASK}} run --domain {{TARGET}} --active --ports --vhost --crawl --background --rounds 3
    and take the run_id (reused=true means one is already running — use its run_id)
 4) Wait: wait --run <run_id> --timeout 30; a timeout returning running only ends that wait window —
    keep waiting on the same run_id, never restart, never declare completion early
-5) Results: completed -> status --run <run_id> for result/coverage; failed/interrupted -> run --resume <run_id>;
-   budget exhausted -> state the coverage shortfall honestly; missing key = coverage gap, deliver as-is, do not resume
-6) Deliver: python findinfo.py brief --run <run_id> (you read this), python findinfo.py report --match {{TARGET}} for the human md/html;
-   the final statement must state the end reason (complete/partial/failed/cancelled), executed/failed/not-run stages, coverage gaps and artifact paths.
-When tools/Cookies/keys are missing, skip and report honestly; never install things yourself. Parse only the single JSON line on stdout; do not cat large files.
+5) Results: completed -> status --run <run_id> for result/coverage; failed/interrupted -> inspect before recovery;
+   budget exhausted -> state the shortfall; missing key alone never ends the available keyless chain or justifies a retry.
+6) Deliver: python findinfo.py --task {{TASK}} brief --run <run_id> (you read this), then python findinfo.py --task {{TASK}} report --run <run_id> --match {{TARGET}};
+   return the actual HTML path and the end reason/stage gaps. HTML is the only default report file; Markdown/machine files need explicit opt-in.
+Only an explicit passive-only/single-stage request narrows the workflow. A justified no_input is not executed traffic. Never install tools yourself. Parse the single JSON line on stdout; do not cat large files or hand-write a Markdown report.
 ```

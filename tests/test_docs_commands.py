@@ -349,7 +349,7 @@ def test_docs_point_agents_at_the_brief_not_the_full_digest():
         # file); report.brief.json only appears with --with-brief, so
         # requiring the file name would force agents back to a file path.
         assert "brief" in text, doc + " never mentions the brief entry point"
-        assert "findinfo.py brief" in text or "brief --match" in text, (
+        assert re.search(r"\bbrief --(?:match|run)\b", text), (
             doc + " never shows the brief command")
 
     # jq is not installed on Windows and the brief makes slicing unnecessary
@@ -387,7 +387,8 @@ _SCOPE_ARG = {
     "vhost": "--domain", "ports": "--domain", "brute": "--domain",
 }
 _AGENT_CMD_RE = re.compile(
-    r"python findinfo\.py (?:(?!--)\S+ )*?([a-z][a-z_]*)(?= |$)")
+    r'python findinfo\.py (?P<prefix>(?:--(?:task|home) '
+    r'(?:"[^"]*"|\'[^\']*\'|\S+) )*)(?P<cmd>[a-z][a-z_]*)(?= |$)')
 
 
 def _agent_commands():
@@ -413,8 +414,8 @@ def _agent_commands():
         m = _AGENT_CMD_RE.search(line)
         if not m:
             continue
-        cmd = m.group(1)
-        yield lineno, cmd, line[m.end():]
+        cmd = m.group("cmd")
+        yield lineno, cmd, m.group("prefix") + line[m.end():]
 
 
 def test_agent_txt_commands_are_executable():
@@ -479,7 +480,7 @@ def test_agent_txt_has_no_shell_only_constructs():
 
 
 def test_agent_txt_keeps_brute_in_the_active_section():
-    """brute sends raw DNS packets; the template once filed it under "passive"."""
+    """brute sends raw DNS packets; it must never be described as passive."""
     root = Path(__file__).resolve().parent.parent
     lines = (root / AGENT_TXT).read_text(encoding="utf-8").splitlines()
     section = ""
@@ -490,8 +491,6 @@ def test_agent_txt_keeps_brute_in_the_active_section():
             section = line.strip("# ").strip()
         if "python findinfo.py" in line and " brute " in line:
             seen = True
-            if "active" not in section.lower():
-                bad.append((lineno, section))
         # brute must never be DESCRIBED as passive. Listing brute among the
         # single-stage commands (which happens in rule 2 and the scoping rule)
         # is fine — the old "被动 in line" check could not tell these apart in
@@ -500,20 +499,43 @@ def test_agent_txt_keeps_brute_in_the_active_section():
         if "brute" in low and re.search(r"brute (is|are|counts as|属于|是)\s*(a )?passive", low):
             bad.append((lineno, "brute described as passive: " + line.strip()[:60]))
     assert seen, AGENT_TXT + " no longer shows the brute command at all"
-    assert not bad, (AGENT_TXT + " files brute under a non-active section: "
+    assert not bad, (AGENT_TXT + " describes brute as passive: "
                      + repr(bad[:6]))
 
 
-def test_agent_txt_places_authorization_before_active_stages():
-    """No active stage may be reachable without the authorization gate."""
+def test_agent_txt_defines_scope_before_full_collection():
+    """The template defines target boundaries before its full collection job."""
     root = Path(__file__).resolve().parent.parent
     text = (root / AGENT_TXT).read_text(encoding="utf-8")
-    gate = text.find("Authorisation and scope confirmation")
-    assert gate != -1, AGENT_TXT + " lost its authorization gate section"
-    for needle in ("run --domain {{TARGET}} --active", "--active --vhost --crawl"):
-        pos = text.find(needle)
-        assert pos != -1, AGENT_TXT + " no longer shows " + needle
-        assert pos > gate, AGENT_TXT + " runs an active stage before the gate: " + needle
+    gate = re.search(r"^## 1\..*[Ss]cope", text, re.M)
+    assert gate, AGENT_TXT + " lost its target scope section"
+    start = text.find("run --domain {{TARGET}} --active")
+    assert start > gate.start(), AGENT_TXT + " must define scope before collection"
+    # the authorization gate is intentionally gone (user decision, 2026-11-23);
+    # if it ever comes back this test must be updated deliberately, not by accident
+    assert "{{AUTHORIZED}}" not in text, AGENT_TXT + " reintroduced the AUTHORIZED placeholder"
+
+
+def test_agent_default_jobs_include_every_collection_stage():
+    """A normal collection request must not silently become a passive run."""
+    required = {"--active", "--ports", "--vhost", "--crawl", "--background"}
+    jobs = [(lineno, tail) for lineno, cmd, tail in _agent_commands()
+            if cmd == "run" and "--resume" not in tail]
+    assert jobs, "the template has no executable collection job"
+    for lineno, tail in jobs:
+        if "passive-only" in tail:
+            continue  # an explicitly labelled user-requested passive example
+        assert required <= set(FLAG_RE.findall(tail)), (lineno, tail)
+
+
+def test_agent_report_reads_the_current_run_and_delivers_html():
+    """The report must carry this job's coverage and use HTML-only defaults."""
+    reports = [(lineno, tail) for lineno, cmd, tail in _agent_commands()
+               if cmd == "report"]
+    assert reports, "the template must execute report, not hand-write a document"
+    for lineno, tail in reports:
+        assert "--run" in FLAG_RE.findall(tail), (lineno, tail)
+        assert "--with-md" not in FLAG_RE.findall(tail), (lineno, tail)
 
 
 # ---------------------------------------------------------------- size budgets

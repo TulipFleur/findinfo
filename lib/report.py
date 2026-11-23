@@ -1,8 +1,8 @@
 """Final deliverables: one collection pass, two audiences.
 
-    report.json      machine digest for the agent (bounded, stable schema)
-    report.md        bridge digest (chat / wiki / terminal, greppable)
-    report.html      human dashboard (self-contained, inline SVG, printable)
+    report.html      default human dashboard (self-contained, printable)
+    report.md        optional text digest (chat / wiki / terminal)
+    report.json      optional machine digest for scripts (stable schema)
 
 Why scoping matters here: the asset graph is shared across engagements by
 design (multi-agent merge), and a crawl is allowed to follow links it finds, so
@@ -813,8 +813,8 @@ def build_md(data) -> str:
 
     out.append("---")
     out.append("")
-    out.append("同目录另有 report.html（可视化看板，可直接转发/打印）与 report.json"
-               "（给 Agent 的机器可读版，" + str(data["schema"]) + "）。")
+    out.append("同目录 report.html 为可视化看板，可直接转发/打印。"
+               "report.json 为可选的机器可读版（--with-json，" + str(data["schema"]) + "）。")
     return "\n".join(out)
 
 
@@ -1312,8 +1312,7 @@ def build_html(data) -> str:
         parts.append("</tbody></table></div></section>")
 
     parts.append('<footer>本页由 findinfo report 生成，单文件自包含（无外部 JS/CSS/字体），'
-                 "可直接归档、打印或转发。同目录 report.json 为给 Agent 的机器可读版，"
-                 "report.md 为文字摘要版。资产采用共享库 + 范围过滤：本次已隔离 "
+                 "可直接归档、打印或转发。资产采用共享库 + 范围过滤：本次已隔离 "
                  + str(c["domains_dropped"]) + " 条资产、"
                  + str(c["endpoints_noise"]) + " 条端点。</footer>")
     parts.append("</main>")
@@ -1325,13 +1324,14 @@ def build_html(data) -> str:
 # ---------------------------------------------------------------- write
 def write_bundle(data, out_dir=None, slug=None, json_limit=None,
                  with_json=False, with_brief=False, brief_top=None,
-                 brief_max_bytes=None, coverage=None) -> dict:
-    """Write the human deliverables (md + html); machine files are opt-in.
+                 brief_max_bytes=None, coverage=None, with_md=False) -> dict:
+    """Write the HTML report; Markdown and machine files are opt-in.
 
-    Default output is what people open: report.md and report.html. The agent
+    Default output is what people open: report.html. The agent
     read path is the `brief` command (library query -> stdout, no file), so
     report.brief.json and report.json are only written when a script asks
-    for them (--with-brief / --with-json). json_limit caps digest arrays.
+    for them (--with-brief / --with-json). with_md adds report.md;
+    json_limit caps digest arrays.
     """
     c = data["counts"]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1364,9 +1364,10 @@ def write_bundle(data, out_dir=None, slug=None, json_limit=None,
         p.write_text(json.dumps(digest, ensure_ascii=False, separators=(",", ":")),
                      encoding="utf-8")
         paths["json"] = str(p)
-    p = base / "report.md"
-    p.write_text(build_md(data), encoding="utf-8")
-    paths["md"] = str(p)
+    if with_md:
+        p = base / "report.md"
+        p.write_text(build_md(data), encoding="utf-8")
+        paths["md"] = str(p)
     p = base / "report.html"
     p.write_text(build_html(data), encoding="utf-8")
     paths["html"] = str(p)

@@ -6,6 +6,8 @@ Give it a company name or a domain and it produces an asset graph with provenanc
 
 findinfo has two layers: the **asset collection pipeline** discovers, verifies and expands assets; the **agent job-control loop** starts long jobs, waits in bounded windows, resumes and delivers.
 
+When you ask an Agent to “collect XX assets”, the default is one full job: passive discovery → DNS → probe → IP aggregation → ports → vhost → crawl → extract, followed by an HTML report. The Agent uses `--active --ports --vhost --crawl --background --rounds 3`; only an explicit passive-only or single-stage request narrows it. The low-level CLI still defaults to passive when those switches are omitted, for compatibility.
+
 ### Asset collection pipeline
 
 Initial discovery runs once; verification and expansion then run in rounds, receiving new domains and pending work from the DNS stage.
@@ -20,20 +22,20 @@ flowchart TD
     subgraph Discover["Initial discovery"]
         D --> E["onepass: multi-source passive aggregation"]
         E --> F["certs: certificate transparency"]
-        F --> G["subs: subdomains and mapping platforms"]
+        F --> G["subs: keyless subdomains"]
         G --> H["brute: DNS dictionary · optional"]
-        H --> I["icp: ICP reverse lookup · when ICP input exists"]
+        H --> I["mapping: domain questions + ICP when available<br/>only sources with usable keys"]
     end
 
     I --> J
 
     subgraph Round["Verify and expand: rounds within budget"]
-        J["dns: resolve + wildcard filtering"] --> K{"active stages enabled?"}
+        J["dns: resolve + wildcard filtering"] --> K{"active stages enabled?<br/>yes for the default Agent job"}
         K -->|yes| L["probe: HTTP liveness, fingerprints, endpoints"]
         L --> M["ipagg: shared-IP aggregation, CDN filtering"]
-        M --> N["ports: port discovery · optional"]
-        N --> O["vhost: virtual-host discovery · optional"]
-        O --> P["crawl: page and JS crawling · optional"]
+        M --> N["ports: port discovery"]
+        N --> O["vhost: virtual-host discovery"]
+        O --> P["crawl: page and JS crawling"]
         P --> Q["extract: domains, IPs, endpoints and findings"]
         Q --> R{"new domains or pending JS work<br/>and budget allows?"}
         K -->|no| R
@@ -41,11 +43,11 @@ flowchart TD
     end
 
     R -->|no| S["summarise result / coverage<br/>complete, partial, failed and why"]
-    S --> T["report / assets<br/>reports and asset export"]
+    S --> T["brief → report<br/>HTML delivery; asset export on request"]
 ```
 
 - `entity` runs when the input is a company name; `onepass` can be disabled with `--no-onepass`; ICP reverse lookup needs ICP input and no `--no-icp`.
-- `--brute`, `--ports`, `--vhost`, `--crawl` are opt-in and imply active stages; `extract` follows `crawl`. Skipping an optional node never blocks later stages.
+- The default Agent job enables `--ports --vhost --crawl`; these switches imply active stages. `--brute` is an optional extension; `extract` follows `crawl`. A stage with no valid input reports `no_input` rather than invented execution.
 - Reflow starts at DNS; the earlier discovery stages are not repeated per round. Rounds, time budget and capability limits together decide actual coverage.
 - Arrows show execution order. The asset store holds the full data; stages read their inputs from the store, and stdout display samples are never the downstream input.
 
@@ -79,7 +81,7 @@ flowchart TD
 - A `wait` timeout only ends that wait window; it is never a reason to start another collection.
 - `state=completed` means this execution finished; still check `result/coverage` to distinguish full from partial completion and explain budget, source and stage gaps.
 - Job state and checkpoints persist, so a new session can query and resume. Background processes never wake a finished agent session, and their survival depends on host policy.
-- Delivery includes reports plus an on-demand asset JSONL export, stating target, actual scope, statistics, main evidence and the end reason.
+- Delivery links the real generated HTML path and states the target, actual scope, end reason and material gaps. Markdown and machine report files require opt-in; full asset JSONL export is available on request.
 
 ## Execution prerequisites (read this first in restricted sandboxes)
 
@@ -123,20 +125,19 @@ run will execute, not a second handwritten copy.
     #    ENScan's Cookie is configured separately:
     cp bin/config.example.yaml bin/config.yaml   # then paste the aiqicha Cookie
 
-    # 3) purely passive mapping (zero target contact; --task isolates the graph)
-    python findinfo.py --task mycorp run --name "My Corp"
+    # 3) default full Agent job; --task isolates the graph
+    python findinfo.py --task mycorp run --domain example.com --active --ports --vhost --crawl --background --rounds 3
 
-    # 4) active stages
-    python findinfo.py run --name "My Corp" --active --vhost --crawl
+    # 4) bounded waits: repeat on the same run_id until terminal, then inspect coverage
+    python findinfo.py --task mycorp wait --run <run_id> --timeout 30
+    python findinfo.py --task mycorp status --run <run_id>
 
-    # 5) long jobs: background + bounded wait (no nohup, no blocking)
-    python findinfo.py run --domain example.com --active --vhost --crawl --background
-    python findinfo.py wait  --run <run_id> --timeout 30
-    python findinfo.py status --run <run_id>
+    # 5) delivery: agents read brief on stdout; humans receive the generated HTML
+    python findinfo.py --task mycorp brief --run <run_id>
+    python findinfo.py --task mycorp report --run <run_id> --match example.com
 
-    # 6) delivery: agents read `brief` (one JSON line on stdout), humans get html/md
-    python findinfo.py brief --match example.com
-    python findinfo.py report --match example.com
+    # 6) only when the user explicitly requests passive-only (compatible CLI default)
+    python findinfo.py --task passive-project run --domain example.com --background
 
     # 7) export the full set (feed downstream scanners)
     python findinfo.py assets --export runs/assets.jsonl
@@ -151,14 +152,14 @@ run will execute, not a second handwritten copy.
 findinfo is built for AI agents. Paste the whole of [`prompts/AGENT.txt`](prompts/AGENT.txt) as the prompt (replace its placeholders).
 Workflow, hard rules, result reading and the delivery template all live in that one file. Behaviour after loading is governed by [SKILL.md](SKILL.md).
 
+Use a supplied target directly; related companies/subsidiaries enter scope only when the user explicitly includes them. There is no routine authorisation/subsidiary confirmation question in the default workflow. If a company-only request cannot be anchored because Cookie/mapping sources are unavailable, the Agent uses available search to verify an official root domain, never guesses one, and asks for a seed only if verification fails.
+
 ### Which API keys (optional; ~80% works without them)
 
 onepass (inside `onepass` / `certs` / `subs`) has 8 key-free sources, so results come out with no keys at all;
 the ones below only **widen coverage**. Put them in `config/.env` (`cp config/.env.example config/.env`).
 
-**A missing key is not a failure:** keyless mapping engines are recorded as `unavailable` (a coverage gap);
-`uncover` is never run with an empty key. Stages complete normally, `run` ends `complete`/`partial`,
-exit code stays ≠5. After adding a key, re-running the target really re-runs `subs` (the input hash changed) instead of being skipped by old checkpoints.
+**A missing mapping key is a source gap:** engines without a key are recorded as `unavailable`; `uncover` is never run with an empty key. It does not disable the keyless discovery/DNS/probe/ports/vhost/crawl/extract chain or justify delivering after passive discovery. Missing Cookie affects entity anchoring; supplied or independently verified domain seeds keep the rest of the job available. After adding a key, the affected mapping input hash changes so it can execute rather than reuse an unavailable-source checkpoint. A final result still states any source, tool or budget gaps.
 
 | Purpose | Field | Where to get it | Free tier |
 |---|---|---|---|
@@ -205,16 +206,16 @@ details and known pitfalls in [docs/CLIENTS.md](docs/CLIENTS.md).
 
 ### Boundaries of use
 
-`--active`, `--vhost`, `--crawl`, `--brute`, `--ports` are **active stages that send real traffic to the target**.
-Enable them only for targets you are authorised to test; the passive stages (`onepass`/`certs`/`subs`/`icp`/`dns`) never touch the target.
+`--active`, `--vhost`, `--crawl`, `--brute`, `--ports` are **active stages that send real traffic to the target**;
+the passive stages (`onepass`/`certs`/`subs`/`icp`/`dns`) never touch the target.
 
 ## Upgrading from 0.7.x
 
 Two externally visible behaviours changed in 0.8.0:
 
-1. **`report` writes only `report.md` and `report.html` by default.** Add `--with-json` for
-   `report.json`, `--with-brief` for `report.brief.json`; stdout's `paths` no longer has a `json` key.
-   Scripts that read `report.json` should either switch to `report ... --with-json` or use
+1. **`report` now writes only `report.html` by default.** Add `--with-md` for `report.md`, `--with-json` for
+   `report.json`, or `--with-brief` for `report.brief.json`; their `md`/`json`/`brief` path keys appear only when requested.
+   Scripts that read Markdown must add `--with-md`. Scripts that read `report.json` should either switch to `report ... --with-json` or use
    `python findinfo.py brief --run <run_id>` (one JSON line on stdout, no files — the agent read API).
 2. **`icp --from-store` requires a scope**: `python findinfo.py icp --from-store --scope example.com`.
    The ICP table is shared across engagements; without `--scope` the whole table goes to the mapping platforms.

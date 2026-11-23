@@ -1,6 +1,6 @@
 """The brief command: the agent's unified read API over the library.
 
-report is now the human deliverable (md/html only by default); an agent
+report is now the human deliverable (HTML by default); an agent
 gets its data by querying the store directly through `brief`, which prints
 ONE JSON line to stdout and writes no files. These tests pin that split.
 """
@@ -95,8 +95,7 @@ def test_brief_ceiling_is_enforced():
 
 
 def test_report_default_writes_only_human_files():
-    """report is the human deliverable: md + html by default, machine files
-    only behind --with-json / --with-brief."""
+    """HTML is the default; Markdown and machine files need explicit flags."""
     core = fresh_core()
     fi = import_findinfo()
     _seed(core)
@@ -105,7 +104,7 @@ def test_report_default_writes_only_human_files():
                               ep_limit=400, engagement="default", run="",
                               json_limit=0, out=str(out), slug="t",
                               brief_top=20, brief_max_bytes=32768,
-                              with_json=False, with_brief=False,
+                              with_json=False, with_brief=False, with_md=False,
                               print_md=False, print_json=False)
     args._sub = "report"
     buf = io.StringIO()
@@ -113,7 +112,8 @@ def test_report_default_writes_only_human_files():
         fi.cmd_report(args)
     payload = json.loads(buf.getvalue().strip().splitlines()[-1])
     files = sorted(p.name for p in out.iterdir())
-    assert files == ["report.html", "report.md"], files
+    assert files == ["report.html"], files
+    assert "html" in payload["paths"] and "md" not in payload["paths"]
     assert "brief" not in payload["paths"] and "json" not in payload["paths"]
 
     # and the opt-in flags bring the machine files back
@@ -124,8 +124,30 @@ def test_report_default_writes_only_human_files():
     with redirect_stdout(buf2):
         fi.cmd_report(args2)
     files2 = sorted(p.name for p in out2.iterdir())
-    assert files2 == ["report.brief.json", "report.html", "report.json",
-                      "report.md"], files2
+    assert files2 == ["report.brief.json", "report.html", "report.json"], files2
+
+    # Markdown remains available without enabling the machine files.
+    out3 = Path(tempfile.mkdtemp()) / "rep3"
+    args3 = argparse.Namespace(**{**vars(args), "out": str(out3),
+                                  "with_md": True})
+    buf3 = io.StringIO()
+    with redirect_stdout(buf3):
+        fi.cmd_report(args3)
+    payload3 = json.loads(buf3.getvalue().strip().splitlines()[-1])
+    assert sorted(p.name for p in out3.iterdir()) == ["report.html", "report.md"]
+    assert Path(payload3["paths"]["md"]).read_text(encoding="utf-8").strip()
+
+    # Returning Markdown on stdout does not opt into a Markdown file.
+    out4 = Path(tempfile.mkdtemp()) / "rep4"
+    args4 = argparse.Namespace(**{**vars(args), "out": str(out4),
+                                  "print_md": True})
+    buf4 = io.StringIO()
+    with redirect_stdout(buf4):
+        fi.cmd_report(args4)
+    payload4 = json.loads(buf4.getvalue().strip().splitlines()[-1])
+    assert payload4["md"].strip()
+    assert sorted(p.name for p in out4.iterdir()) == ["report.html"]
+    assert "md" not in payload4["paths"]
 
 
 def test_brief_and_report_brief_payload_agree():

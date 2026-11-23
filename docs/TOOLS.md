@@ -6,7 +6,7 @@
 >
 > **Agent invocation discipline**: for commands marked (ACTIVE) or taking >30s (run/entity/crawl/probe/ports/vhost/brute/subs)
 > **long orchestration commands (`run`) must not run in the foreground** — use `run --background` to start in the background + `wait`/`status` bounded polling; hard waiting in the foreground will get killed by the tool timeout.
-> Single-stage commands (`probe`/`crawl`/`vhost`/`ports`/`brute`/`subs`/`entity`) may run in the foreground, but set your own cap with `--tool-timeout`.
+> The default Agent request “collect XX assets” uses one `run --active --ports --vhost --crawl --background --rounds 3`, not a foreground checklist. Single-stage examples below describe explicitly requested stage work; set `--tool-timeout` when invoking such a stage directly.
 > When the host reaps detached processes (`wait` returns `reaped_by_host:true`), all commands can only run in the foreground.
 > For multiple targets use `--task <name>` to isolate the asset graph; `--from-store` with `--scope <main domain>` limits the read range.
 
@@ -686,12 +686,20 @@ Returns `{"runs":[{"run_id","state","stage","alive","target","created","updated"
 
 ## run — the full pipeline
 
+**Agent default**: a natural-language asset collection request selects the full background command below. Given targets do not require a routine authorisation/subsidiary question; related companies require explicit user inclusion. The low-level CLI remains passive without active flags for compatibility, so a bare `run` is not the Agent full-collection default.
+
 ```bash
-python findinfo.py run --name "Example Corp"                          # passive only
-python findinfo.py run --name "Example Corp" --active                  # + liveness
-python findinfo.py run --name "Example Corp" --active --vhost --crawl  # + internal services + leak reflow
-python findinfo.py run --domain example.com --active --ports
+python findinfo.py --task example-com run --domain example.com --active --ports --vhost --crawl --background --rounds 3
+python findinfo.py --task example-corp run --name "Example Corp" --active --ports --vhost --crawl --background --rounds 3
 ```
+
+Only when the user explicitly requests passive-only:
+
+```bash
+python findinfo.py --task passive-project run --domain example.com --background  # user-requested passive-only
+```
+
+Missing mapping keys/Cookie skip only their dependent sources and remain coverage gaps; keep the available keyless discovery/DNS/probe/ports/vhost/crawl/extract stages running. Do not end at a passive summary or resume solely for a missing key. For company-only input without a usable anchor, the Agent uses available search to verify an official root domain, then supplies it with `--domain`; never guess or choose an ambiguous company. Ask for a seed only if verification fails. A stage with no valid input may report `no_input`, which is not a real dispatch.
 
 | Parameter | Description |
 |---|---|
@@ -738,21 +746,20 @@ succeeded bundle is never re-opened, and HTML pages never enter the JS queue.
 ```
 
 
-**Background mode (recommended for long jobs)**
+**Background mode (default Agent collection)**
 
 ```bash
-python findinfo.py --task example-com run --domain example.com --active --vhost --crawl \
-    --background --rounds 3
+python findinfo.py --task example-com run --domain example.com --active --ports --vhost --crawl --background --rounds 3
 ```
 
 ```json
 {"run_id":"20261118-003129-example.com","state":"running","started":true,
  "pid":36532,"reused":false,"dedupe_key":"d7c9acb9fa9f5a62",
- "planned_stages":["certs","subs","icp","dns","probe","ipagg","vhost","crawl","extract"],
+ "planned_stages":["onepass","certs","subs","mapping","dns","probe","ipagg","ports","vhost","crawl","extract"],
  "run_dir":".../runs/20261118-003129-example.com",
  "state_path":".../status.json","result_path":".../summary.jsonl",
  "log_path":".../stdout.log","error_log_path":".../stderr.log",
- "next":"python findinfo.py wait --run 20261118-003129-example.com --timeout 30"}
+ "next":"python findinfo.py --task example-com wait --run 20261118-003129-example.com --timeout 30"}
 ```
 
 - A standalone Python worker process (POSIX `setsid` / Windows `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`)
@@ -805,7 +812,7 @@ once `--time-budget` seconds pass no new round starts; the stop reason lands in 
 
 **Long jobs**: a typical `run` takes 5~40 minutes. Foreground execution blocks; the standard pattern is `--background` + `wait`.
 **Checkpoints**: each finished stage writes a `steps` row (engagement+stage+input hash); the same input auto-skips on re-run (downstream inputs are rebuilt from scoped store queries); `--force-stage` forces a redo.
-**Appending stages**: run passive first, then `--active` / `--crawl` only adds those active stages (completed ones skip via checkpoints).
+**Explicitly narrowed requests**: when the user chose passive-only earlier, a later full request can enable the active switches and reuse completed discovery checkpoints. The normal full request starts with all default switches in one job; it does not require a separate passive run.
 **Failure semantics**: a stage whose tool failed (rc≠0/timeout) records `steps.status=failed` and a summary with `failed:true`; **a re-run retries it automatically**. Partial output is already stored and usable downstream. Exit code 5 means failed stages exist.
 **Scope**: `run`'s active stages only touch `--domain`/entity-anchor seeds; out-of-scope domains found via ICP reverse lookup or JS leaks are stored and reported, never auto-promoted into active stages.
 **Detail cap**: every stage returns at most 500 detail rows with `truncated: true` — a **display** cap; the full data is in the store and downstream stages (probe/crawl/extract) also read the full set (export via `assets --export`);
@@ -839,17 +846,18 @@ python findinfo.py clean --all --vacuum                            # wipe everyt
 passive/subs/icp/dns/probe/ipagg/ports, `--domain X` for vhost/crawl/extract; without one the command exits 2 with
 `scope_required` instead of inheriting the previous target's assets. `--whole-store` is the explicit opt-in.
 
-## report — human deliverables (md / html)
+## report — human deliverables (HTML by default)
 
-Shapes the asset graph into human-facing deliverables. **No store writes, no packets** — a pure SQLite read.
+Shapes the asset graph into human-facing deliverables. It reads SQLite without collecting assets or sending packets, and writes the requested report files. The only default report file is `report.html`.
 Agents read data via the `brief` command (one JSON line on stdout, no files); scripts wanting everything use `assets --export`.
 
 **Scope is judged per asset kind**: domains by suffix; URLs by their parsed hostname; IPs by their owning domain (assets.parent) — a shared IP only means "some in-scope domain resolves to it", not exclusive ownership. **An explicit `--match` with no valid domain among it is a hard error** — never a silent full-store report. Without `--match` the latest run's target is used and a warning is emitted.
 
 ```bash
-python findinfo.py report                                  # scope = the latest run's target
+python findinfo.py --task example-com report --run <run_id> --match example.com --slug example
 python findinfo.py report --match example.com --match example.org --slug example
-python findinfo.py report --print-md                       # also echo the markdown text
+python findinfo.py report --match example.com --with-md     # also write Markdown when requested
+python findinfo.py report --print-md                       # explicitly echo Markdown in the JSON response; does not enable a .md file
 python findinfo.py report --with-json --json-limit 40      # also write report.json (for scripts)
 python findinfo.py report --out ./out --limit 80 --ep-limit 200
 ```
@@ -859,7 +867,7 @@ falls back to `reports/latest.txt` where Windows lacks symlink rights)
 
 | File | Reader | Notes |
 |---|---|---|
-| `report.md` | humans / chat | tiered listing (high-value hosts, internal services, endpoints, leaks, next steps) — **always written** |
+| `report.md` | humans / chat | tiered listing — **written only with `--with-md`** |
 | `report.html` | humans | self-contained dark dashboard, no external JS/CSS/fonts, print styles — **always written** |
 | `report.json` | scripts | full digest + provenance + `charts`; **written only with `--with-json`** |
 | `report.brief.json` | scripts | 32 KB digest; **written only with `--with-brief`** (routine agent reads use the `brief` command) |
@@ -867,13 +875,15 @@ falls back to `reports/latest.txt` where Windows lacks symlink rights)
 | Parameter | Description |
 |---|---|
 | `--match X` | target domain suffixes, repeatable; defaults to the latest `run`'s target |
+| `--run <run_id>` | read this run's coverage; without `--match`, reuse its scope; Agent delivery should pass the collection run id |
 | `--min-conf` | confidence floor for included hosts (default 0.4) |
 | `--limit` / `--ep-limit` | host / endpoint detail caps (default 300 / 400) |
 | `--json-limit` | cap arrays inside `report.json` (0 = no extra truncation) |
 | `--out` / `--slug` | output directory / label |
 | `--engagement` | which run's stage checkpoints to read (`stages` field) |
 | `--with-json` / `--with-brief` | also write the machine files report.json / report.brief.json (off by default) |
-| `--print-md` / `--print-json` | also echo the md text / full digest to stdout |
+| `--with-md` | also write report.md (off by default; HTML alone is the default) |
+| `--print-md` / `--print-json` | explicitly include Markdown / the full digest in the stdout JSON response; neither selects an extra file |
 
 **Output (one JSON line on stdout)**
 
@@ -882,11 +892,13 @@ falls back to `reports/latest.txt` where Windows lacks symlink rights)
   "counts": {"domains_in_scope": 48, "live": 27, "interesting": 12, "internal_services": 4,
              "endpoints_in_scope": 6379, "endpoints_interesting": 153, "leak_domains": 8},
   "scope": {"match": ["example.com"], "auto": false},
-  "paths": {"md": ".../report.md", "html": ".../report.html"},
+  "paths": {"html": ".../report.html", "dir": ".../reports/example"},
   "warnings": ["detected 4 domains resolving into 198.18.0.0/15 (Clash/TUN fake-IP)..."],
   "next_steps": ["disable TUN and re-run dns/probe..."]
 }
 ```
+
+For Agent delivery, read `brief --run <run_id>`, execute `report --run <run_id>`, and link the actual returned `paths.html` with a short verdict/gap statement. Do not hand-write Markdown tables or a `.md` file instead of running `report`. `brief` prints its bounded JSON to stdout and writes no file; report machine files remain opt-in.
 
 **report.json shape**: `schema` / `scope` / `counts` / `hosts[]` (`host`,`ip`,`status`,`title`,`tech`,
 `priority`,`score`,`reasons[]`,`provenance[]`,`discovered_by`,`sensitive[]`,`params[]`) / `endpoints[]` /

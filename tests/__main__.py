@@ -96,6 +96,7 @@ MODULES = [
     "tests.test_rate_limit",
     "tests.test_cert_budget",
     "tests.test_usability",
+    "tests.test_full_collection_workflow",
 ]
 
 

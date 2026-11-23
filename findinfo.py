@@ -1019,7 +1019,7 @@ def cmd_brief(args) -> None:
     same facts as report.brief.json (counts, coverage gaps, top hosts,
     internal services, leaks, next steps) with the same hard byte ceiling,
     but it never writes a file -- stdout is the deliverable. `report` is the
-    human-facing command (md/html); scripts wanting the full digest use
+    human-facing HTML command (Markdown is opt-in); scripts wanting the full digest use
     `assets --export` or `report --with-json`.
     """
     _require_run_task(args)
@@ -1055,7 +1055,7 @@ def cmd_brief(args) -> None:
     except Exception:
         pass
     brief["note"] = ("Unified agent read API: queries the store, writes no "
-                     "files. report produces the human md/html only; full data "
+                     "files. report produces HTML by default; Markdown needs --with-md. Full data "
                      "via assets --export or report --with-json.")
     brief["schema"] = brief.get("schema") or "findinfo.brief/1"
     # Re-fit + re-measure the COMPLETE object with the same encoder emit()
@@ -1065,11 +1065,11 @@ def cmd_brief(args) -> None:
 
 
 def cmd_report(args) -> None:
-    """Render the human deliverables: md + html for people.
+    """Render the human HTML report; Markdown is an explicit extra.
 
     Agent reads happen through `brief` (query the library, stdout only) or
     `assets --export` (full rows for scripts). The machine files
-    (report.json / report.brief.json) are opt-in via --with-json so a human
+    (report.json / report.brief.json) are opt-in via --with-json/--with-brief so a human
     delivery does not write files nobody opens.
 
     Scope is a suffix filter (--match) because the asset store is shared across
@@ -1101,11 +1101,12 @@ def cmd_report(args) -> None:
                                 # should not have to know every new knob
                                 brief_top=getattr(args, "brief_top", None),
                                 brief_max_bytes=getattr(args, "brief_max_bytes", None),
-                                coverage=coverage)
+                                coverage=coverage,
+                                with_md=getattr(args, "with_md", False))
     res = {"counts": data["counts"], "scope": data["scope"],
            "paths": paths, "warnings": data["environment"]["warnings"],
            "next_steps": data["next_steps"][:3],
-           "note": "agents read data via the brief command (one JSON line on stdout); machine files are only written with --with-json/--with-brief"}
+           "note": "HTML is the default report; Markdown requires --with-md. Agents read data via the brief command; machine files require --with-json/--with-brief"}
     if args.print_md:
         res["md"] = report.build_md(data)
     if args.print_json:
@@ -2076,7 +2077,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "and --kind to pick a single sheet")
     as_.set_defaults(func=cmd_assets)
 
-    rp = sub.add_parser("report", help="human deliverables: report.md + report.html (agent reads use `brief`)")
+    rp = sub.add_parser("report", help="HTML report (Markdown is opt-in; agent reads use `brief`)")
     rp.add_argument("--match", action="append",
                     help="scope to these domain suffixes (repeatable); with --run and "
                          "no --match the run's own scope is used")
@@ -2086,11 +2087,13 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--limit", type=int, default=300, help="hosts kept in the digest")
     rp.add_argument("--ep-limit", type=int, default=400, help="endpoints kept in the digest")
     rp.add_argument("--json-limit", type=int, default=0,
-                    help="cap arrays inside report.json (0 = same as the md/html view)")
+                    help="cap arrays inside report.json (0 = same as the HTML view)")
     rp.add_argument("--out", default="", help="output dir (default ~/.findinfo/reports/<stamp>-<slug>)")
     rp.add_argument("--slug", default="", help="label for the default output dir")
     rp.add_argument("--engagement", default="default", help="coverage gaps to read: --run already picks that run, so set this only to read a different one")
     rp.add_argument("--print-md", action="store_true", help="also return the markdown text")
+    rp.add_argument("--with-md", action="store_true",
+                    help="also write report.md (off by default: the human report is HTML)")
     rp.add_argument("--brief-top", type=int, default=20,
                     help="kept in report.brief.json when --with-brief is given "
                          "(default 20; the brief command has its own --top)")

@@ -189,10 +189,11 @@ def test_brief_does_not_change_report_json():
     a = tempfile.mkdtemp()
     b = tempfile.mkdtemp()
     plain = report.write_bundle(data, out_dir=a, with_json=True,
-                                   with_brief=True)
+                                   with_brief=True, with_md=True)
     with_brief = report.write_bundle(data, out_dir=b, with_json=True, with_brief=True,
                                      brief_top=3,
-                                     brief_max_bytes=4096, coverage={"x": 1})
+                                     brief_max_bytes=4096, coverage={"x": 1},
+                                     with_md=True)
     assert Path(plain["json"]).read_bytes() == Path(with_brief["json"]).read_bytes()
     assert Path(plain["md"]).read_bytes() == Path(with_brief["md"]).read_bytes()
     # and the knobs only affect the brief

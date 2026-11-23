@@ -1,4 +1,6 @@
 """P5 acceptance: report scoping, failed stages, clean --kind, passivity."""
+import re
+
 import tests.util  # noqa: F401
 
 from tests.util import fresh_core
@@ -170,3 +172,21 @@ def test_report_keeps_section_numbers_and_explains_missing_vhost():
     assert "vhost" in body, (
         "an empty section 4 must say whether vhost ran; body was " + repr(body[:200]))
     store.close()
+
+
+def test_html_report_is_self_contained_and_has_no_optional_file_claims():
+    """The default deliverable opens without sibling files or remote assets."""
+    core = fresh_core()
+    from lib import report
+    store = core.Store()
+    try:
+        data = report.collect(store, match=["example.com"])
+    finally:
+        store.close()
+    html = report.build_html(data)
+    assert html.startswith("<!DOCTYPE html>"), html[:100]
+    assert "<style>" in html and "<script>" in html
+    assert not re.search(r"<script\b[^>]*\bsrc\s*=", html, re.I)
+    assert not re.search(r"<link\b[^>]*\bhref\s*=", html, re.I)
+    assert not re.search(r"@import\b|url\(\s*['\"]?https?://", html, re.I)
+    assert "report.md" not in html and "report.json" not in html

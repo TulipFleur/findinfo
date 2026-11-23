@@ -513,3 +513,23 @@ def test_a_provider_file_engine_is_not_trusted_from_an_env_var():
         assert core_.engine_has_key("daydaymap") is True
     finally:
         p.unlink()
+
+
+def test_the_syntax_matrix_states_the_templates_the_code_has():
+    """docs/MAPPING-SYNTAX.md section 1 says which engines have a query
+    template. It must agree with lib/core's tables: right after ZoomEye and
+    DayDayMap were wired it still said they had none, and an agent reading the
+    shipped doc would not use them."""
+    import re
+    from pathlib import Path
+    text = (Path(tests.util.ROOT) / "docs" / "MAPPING-SYNTAX.md").read_text(encoding="utf-8")
+    section = text[text.index("## 1."):text.index("## 2.")]
+    rows = re.findall(r"^\| ([a-z]+) \| ([^|]*)\|", section, re.M)
+    rows = [(e, c) for e, c in rows if e not in ("securitytrails",)]
+    assert len(rows) >= 7, rows
+    for engine, cell in rows:
+        claimed = set(re.findall(r"\b(domain|icp)\b", cell)) if "✅" in cell else set()
+        actual = {kind for kind, table in (("domain", core._DEFAULT_DOMAIN_QUERY),
+                                           ("icp", core._DEFAULT_ICP_QUERY))
+                  if engine in table}
+        assert claimed == actual, (engine, cell.strip(), sorted(actual))
